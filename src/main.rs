@@ -1,7 +1,8 @@
 // pyblockMiner — PyBLØCK LOTTO BLAKE2b miner (Bitcoin BLAKE2b, solo lottery). Rust + ratatui TUI.
 // Native SV1 stratum client + work construction + N-GPU grinding via persistent `gpu_grind` daemons
 // (one per GPU, OpenCL kernel compiled once → all GPUs saturated, no per-sweep overhead).
-// You mine to YOUR address → keep 99.1% of every block · PyBLØCK fee 0.9%. Non-custodial.
+// You mine to YOUR mainnet address → keep 99.1% of every block · PyBLØCK pool fee 0.9%. Non-custodial.
+// A small dev donation (default 0.4%, like xmrig) rewards the miner's author — see DEV_DONATION_ADDR.
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -15,6 +16,14 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
+// ── developer donation (like xmrig's donate-level) ──────────────────────────────────────────────
+// Hardcoded, consensus of the project: a small fraction of your hashing mines to the developer's
+// address as a thank-you for the miner. This is SEPARATE from the pool fee (0.9%). Minimum 0.4%,
+// raise it with --donate <pct>. Mechanism: a 2nd stratum connection is authorized to this address;
+// ~donate% of sweeps mine to it, so ~donate% of any blocks you find pay the developer instead.
+const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
+const DONATE_MIN: f64 = 0.4; // percent — floor, cannot go lower
+
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
 const YLW: Color = Color::Rgb(255, 255, 0);
@@ -23,6 +32,15 @@ const MUT: Color = Color::Rgb(130, 154, 130);
 const AMB: Color = Color::Rgb(224, 176, 53);
 const PNK: Color = Color::Rgb(255, 92, 200);
 const BRD: Color = Color::Rgb(35, 60, 35);
+
+// ── address validation: mainnet only (regtest/testnet rewards are unspendable on mainnet) ──
+// Returns "mainnet" (ok to mine), "test" (regtest/testnet → refuse), or "unknown" (unrecognized).
+fn addr_kind(a: &str) -> &'static str {
+    if a.starts_with("bc1") || a.starts_with('1') || a.starts_with('3') { return "mainnet"; }
+    if a.starts_with("bcrt1") || a.starts_with("tb1") || a.starts_with("tpub")
+        || a.starts_with('m') || a.starts_with('n') || a.starts_with('2') { return "test"; }
+    "unknown"
+}
 
 // ── locate gpu_grind + blake2b.cl (env override → next to the binary → repo layout → PATH) ──
 fn gpu_dir() -> String {
@@ -58,6 +76,8 @@ struct Stats {
     connected: bool,
     endpoint: String,
     addr: String,
+    donate: f64,
+    donated: u64,      // blocks found during donation sweeps (paid to the developer)
     diff: f64,
     bits: u32,
     gpu_ghs: Vec<f64>,
@@ -221,66 +241,131 @@ fn send(stream: &mut TcpStream, v: &Value) {
     s.push('\n');
     let _ = stream.write_all(s.as_bytes());
 }
-fn read_msgs(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Vec<Value> {
-    let mut tmp = [0u8; 8192];
-    if let Ok(n) = stream.read(&mut tmp) {
-        if n > 0 { buf.extend_from_slice(&tmp[..n]); }
-    }
-    let mut out = vec![];
-    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-        let line: Vec<u8> = buf.drain(..=pos).collect();
-        if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len().saturating_sub(1)]) {
-            out.push(v);
-        }
-    }
-    out
-}
 
-fn handle_msgs(msgs: Vec<Value>, stats: &Arc<Mutex<Stats>>,
-    en1: &mut Option<String>, en2size: &mut usize, diff: &mut f64,
-    job: &mut Option<Vec<Value>>, pending: &mut HashMap<u64, String>) {
-    for m in msgs {
-        let id = m.get("id").and_then(|v| v.as_u64());
-        let meth = m.get("method").and_then(|v| v.as_str());
-        if id == Some(1) && m.get("result").map_or(false, |r| !r.is_null()) {
-            let r = &m["result"];
-            *en1 = r.get(1).and_then(|v| v.as_str()).map(|s| s.to_string());
-            *en2size = r.get(2).and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-            let mut st = stats.lock().unwrap();
-            st.logline(format!("subscribed · extranonce1={}", en1.clone().unwrap_or_default()));
-        } else if meth == Some("mining.set_difficulty") {
-            *diff = m.get("params").and_then(|p| p.get(0)).and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let mut st = stats.lock().unwrap();
-            st.diff = *diff; st.bits = floor_pot(*diff);
-            st.logline(format!("difficulty set · bits={}", floor_pot(*diff)));
-        } else if meth == Some("mining.notify") {
-            *job = m.get("params").and_then(|v| v.as_array()).cloned();
-        } else if let Some(idv) = id {
-            if let Some(nonce) = pending.remove(&idv) {
-                let mut st = stats.lock().unwrap();
-                if m.get("result") == Some(&Value::Bool(true)) {
-                    st.blocks += 1;
-                    let n = st.blocks;
-                    st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
-                } else if m.get("error").map_or(false, |e| !e.is_null()) {
-                    st.rejected += 1;
-                    let e = m.get("error").map(|v| v.to_string()).unwrap_or_default();
-                    st.logline(format!("✗ rejected ({})  nonce {}", e, nonce));
+// ── one stratum connection (the "you" session and the "dev donation" session are both Conn) ──
+struct Conn {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    en1: Option<String>,
+    en2size: usize,
+    diff: f64,
+    job: Option<Vec<Value>>,
+    en2ctr: u64,
+    pending: HashMap<u64, String>,
+    subid: u64,
+    addr: String,
+    is_dev: bool,
+    idle: Instant,
+}
+impl Conn {
+    fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
+        let mut stream = TcpStream::connect(pool).ok()?;
+        stream.set_nonblocking(true).ok();
+        let sub_ua = if is_dev { "PyBLOCK-GPU/BLAKE2b-donate" } else { "PyBLOCK-GPU/BLAKE2b" };
+        send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":[sub_ua]}));
+        send(&mut stream, &json!({"id":2,"method":"mining.authorize","params":[addr,"x"]}));
+        Some(Conn {
+            stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
+            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev,
+            idle: Instant::now(),
+        })
+    }
+    // pump the socket: parse messages, update job/diff/subscribe/submit-results. Returns false if dead.
+    fn pump(&mut self, stats: &Arc<Mutex<Stats>>) -> bool {
+        let mut tmp = [0u8; 8192];
+        match self.stream.read(&mut tmp) {
+            Ok(0) => return false,                 // peer closed
+            Ok(n) => { self.buf.extend_from_slice(&tmp[..n]); self.idle = Instant::now(); }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+        let mut msgs = vec![];
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len().saturating_sub(1)]) { msgs.push(v); }
+        }
+        for m in msgs {
+            let id = m.get("id").and_then(|v| v.as_u64());
+            let meth = m.get("method").and_then(|v| v.as_str());
+            if id == Some(1) && m.get("result").map_or(false, |r| !r.is_null()) {
+                let r = &m["result"];
+                self.en1 = r.get(1).and_then(|v| v.as_str()).map(|s| s.to_string());
+                self.en2size = r.get(2).and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+                if !self.is_dev {
+                    let e1 = self.en1.clone().unwrap_or_default();
+                    stats.lock().unwrap().logline(format!("subscribed · extranonce1={}", e1));
+                }
+            } else if meth == Some("mining.set_difficulty") {
+                self.diff = m.get("params").and_then(|p| p.get(0)).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                if !self.is_dev {
+                    let bits = floor_pot(self.diff);
+                    let mut st = stats.lock().unwrap();
+                    st.diff = self.diff; st.bits = bits;
+                    st.logline(format!("difficulty set · bits={}", bits));
+                }
+            } else if meth == Some("mining.notify") {
+                self.job = m.get("params").and_then(|v| v.as_array()).cloned();
+            } else if let Some(idv) = id {
+                if let Some(nonce) = self.pending.remove(&idv) {
+                    let mut st = stats.lock().unwrap();
+                    if m.get("result") == Some(&Value::Bool(true)) {
+                        if self.is_dev {
+                            st.donated += 1;
+                            let n = st.donated;
+                            st.logline(format!("💚 donation block (#{}) → developer · thank you! · nonce {}", n, nonce));
+                        } else {
+                            st.blocks += 1;
+                            let n = st.blocks;
+                            st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
+                        }
+                    } else if m.get("error").map_or(false, |e| !e.is_null()) {
+                        st.rejected += 1;
+                        let e = m.get("error").map(|v| v.to_string()).unwrap_or_default();
+                        let who = if self.is_dev { "donation " } else { "" };
+                        st.logline(format!("✗ {}rejected ({})  nonce {}", who, e, nonce));
+                    }
                 }
             }
         }
+        true
+    }
+    // job ready for grinding? returns (extranonce1, job array) when subscribed + a notify arrived.
+    fn ready(&self) -> Option<(String, Vec<Value>)> {
+        match (&self.en1, &self.job) {
+            (Some(a), Some(b)) if b.len() >= 8 => Some((a.clone(), b.clone())),
+            _ => None,
+        }
     }
 }
 
-fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_threads: usize) {
+// build the BLAKE2b work_root for a job/identity and return (prevhash, ntime, version, job_id, en2hex, work_root_hex)
+fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, String, String, String, String) {
+    let prevhash = jobv[1].as_str().unwrap_or("").to_string();
+    let job_id = jobv[0].as_str().unwrap_or("").to_string();
+    let version = jobv[5].as_str().unwrap_or("").to_string();
+    let ntime = jobv[7].as_str().unwrap_or("").to_string();
+    let coinb1 = hex::decode(jobv[2].as_str().unwrap_or("")).unwrap_or_default();
+    let en2_full = conn.en2ctr.to_le_bytes();
+    conn.en2ctr += 1;
+    let mut en2 = en2_full[..conn.en2size.min(8)].to_vec();
+    en2.resize(conn.en2size.max(1), 0);
+    let mut extranonce = hex::decode(en1v).unwrap_or_default();
+    extranonce.extend_from_slice(&en2);
+    extranonce.resize(12, 0);
+    let mut leaf = vec![0u8];
+    leaf.extend_from_slice(&coinb1);
+    leaf.extend_from_slice(&extranonce);
+    let work_root = b2b(&leaf);
+    (prevhash, ntime, version, job_id, hex::encode(&en2), hex::encode(work_root))
+}
+
+fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_threads: usize, donate: f64) {
     // spawn one persistent daemon per GPU (kernel compiled once → all GPUs stay saturated)
     let names = gpu_names();
     let mut daemons: Vec<Daemon> = Vec::new();
     for dev in 0..ngpu {
         let nm = names.get(dev as usize).cloned().unwrap_or_else(|| format!("GPU {}", dev));
-        if let Some(d) = spawn_daemon(dev, nm) {
-            daemons.push(d);
-        }
+        if let Some(d) = spawn_daemon(dev, nm) { daemons.push(d); }
     }
     let mut cpu_rate = 0.05f64;
     { let mut st = stats.lock().unwrap();
@@ -289,62 +374,62 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
       st.gpu_ghs = vec![0.0; st.gpu_names.len()];
       let nworkers = st.gpu_names.len();
       let names_str = st.gpu_names.join(", ");
-      st.logline(format!("{} worker(s) ready: {}", nworkers, names_str)); }
+      st.logline(format!("{} worker(s) ready: {}", nworkers, names_str));
+      st.logline(format!("dev donation {:.1}% → {}", donate, DEV_DONATION_ADDR)); }
+
+    let mut donate_credit = 0.0f64;              // accumulates `donate/100` per sweep; ≥1 → this sweep pays the dev
+    let mut dev_retry = Instant::now();
 
     loop {
-        let mut stream = match TcpStream::connect(&pool) {
-            Ok(s) => s,
-            Err(_) => {
+        let mut user = match Conn::connect(&pool, &addr, false) {
+            Some(c) => c,
+            None => {
                 { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("connection failed — retrying in 3s…".into()); }
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
         };
-        stream.set_nonblocking(true).ok();   // non-blocking reads → the loop grinds continuously (GPUs stay saturated)
-        send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":["PyBLOCK-GPU/BLAKE2b"]}));
-        send(&mut stream, &json!({"id":2,"method":"mining.authorize","params":[addr,"x"]}));
-        { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now()); st.logline(format!("connected to PyBLØCK LOTTO BLAKE2b {}", pool)); }
-
-        let mut buf: Vec<u8> = Vec::new();
-        let mut en1: Option<String> = None;
-        let mut en2size = 8usize;
-        let mut diff = 1f64;
-        let mut job: Option<Vec<Value>> = None;
-        let mut en2ctr = 0u64;
-        let mut pending: HashMap<u64, String> = HashMap::new();
-        let mut subid = 100u64;
-        let mut idle = Instant::now();
+        // best-effort donation session (never blocks mining if it fails)
+        let mut dev: Option<Conn> = Conn::connect(&pool, DEV_DONATION_ADDR, true);
+        { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
+          st.logline(format!("connected to PyBLØCK LOTTO BLAKE2b {}", pool)); }
 
         loop {
-            let msgs = read_msgs(&mut stream, &mut buf);
-            if !msgs.is_empty() { idle = Instant::now(); }
-            handle_msgs(msgs, &stats, &mut en1, &mut en2size, &mut diff, &mut job, &mut pending);
-            if idle.elapsed() > Duration::from_secs(90) {
+            if !user.pump(&stats) {
+                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); }
+                break;
+            }
+            if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
+            if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
+                dev = Conn::connect(&pool, DEV_DONATION_ADDR, true);
+                dev_retry = Instant::now();
+            }
+            if user.idle.elapsed() > Duration::from_secs(90) {
                 { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); }
                 break;
             }
-            let (en1v, jobv) = match (&en1, &job) {
-                (Some(a), Some(b)) if b.len() >= 8 => (a.clone(), b.clone()),
-                _ => { std::thread::sleep(Duration::from_millis(60)); continue; }
+
+            // pick this sweep's identity: dev if its donation quota is due AND its job is ready, else you
+            donate_credit += donate / 100.0;
+            let dev_ready = dev.as_ref().and_then(|d| d.ready()).is_some();
+            let do_donate = donate_credit >= 1.0 && dev_ready;
+
+            let (en1v, jobv, is_dev) = if do_donate {
+                let d = dev.as_ref().unwrap();
+                let (a, b) = d.ready().unwrap();
+                (a, b, true)
+            } else {
+                match user.ready() { Some((a, b)) => (a, b, false), None => { std::thread::sleep(Duration::from_millis(60)); continue; } }
             };
-            let sweep_prevhash = jobv[1].as_str().unwrap_or("").to_string();
-            let job_id = jobv[0].as_str().unwrap_or("").to_string();
-            let version = jobv[5].as_str().unwrap_or("").to_string();
-            let ntime_hex = jobv[7].as_str().unwrap_or("").to_string();
-            let coinb1 = hex::decode(jobv[2].as_str().unwrap_or("")).unwrap_or_default();
-            let en2_full = en2ctr.to_le_bytes();
-            en2ctr += 1;
-            let mut en2 = en2_full[..en2size.min(8)].to_vec();
-            en2.resize(en2size.max(1), 0);
-            let mut extranonce = hex::decode(&en1v).unwrap_or_default();
-            extranonce.extend_from_slice(&en2);
-            extranonce.resize(12, 0);
-            let mut leaf = vec![0u8];
-            leaf.extend_from_slice(&coinb1);
-            leaf.extend_from_slice(&extranonce);
-            let work_root = b2b(&leaf);
+            if is_dev { donate_credit -= 1.0; }
+
+            let diff = if is_dev { dev.as_ref().unwrap().diff } else { user.diff };
             let bits = floor_pot(diff);
-            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &sweep_prevhash, &ntime_hex, &hex::encode(work_root), bits);
+            let (prevhash, ntime, version, job_id, en2hex, work_root) = {
+                let c = if is_dev { dev.as_mut().unwrap() } else { &mut user };
+                build_work(c, &en1v, &jobv)
+            };
+            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &prevhash, &ntime, &work_root, bits);
             {
                 let mut st = stats.lock().unwrap();
                 let mut all = gpu_ghs.clone();
@@ -355,17 +440,21 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
                 st.hr_hist.push_back(hv);
                 while st.hr_hist.len() > 160 { st.hr_hist.pop_front(); }
             }
-            // a new block moves the tip during the grind → our nonces are stale, don't submit (avoids reject spam)
-            let m2 = read_msgs(&mut stream, &mut buf);
-            if !m2.is_empty() { idle = Instant::now(); }
-            handle_msgs(m2, &stats, &mut en1, &mut en2size, &mut diff, &mut job, &mut pending);
-            let cur_prevhash = job.as_ref().and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("");
-            if cur_prevhash == sweep_prevhash {
-                let en2hex = hex::encode(&en2);
+            // pump again — a new block during the grind makes our nonces stale (don't submit → no reject spam)
+            user.pump(&stats);
+            if let Some(d) = dev.as_mut() { d.pump(&stats); }
+            let cur_prev = if is_dev {
+                dev.as_ref().and_then(|d| d.job.as_ref()).and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            } else {
+                user.job.as_ref().and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            if cur_prev == prevhash {
+                let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
                 for nh in nonces {
-                    subid += 1;
-                    pending.insert(subid, nh.clone());
-                    send(&mut stream, &json!({"id":subid,"method":"mining.submit","params":[addr, job_id, en2hex, ntime_hex, nh, version]}));
+                    conn.subid += 1;
+                    let sid = conn.subid;
+                    conn.pending.insert(sid, nh.clone());
+                    send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
                 }
             } else if !nonces.is_empty() {
                 let mut st = stats.lock().unwrap();
@@ -408,8 +497,9 @@ fn ui(f: &mut Frame, st: &Stats) {
         Line::from(vec![
             Span::styled("your address  ", Style::new().fg(MUT)),
             Span::styled(st.addr.clone(), Style::new().fg(CYN)),
-            Span::styled("   you keep 99.1% · ", Style::new().fg(MUT)),
-            Span::styled("PyBLØCK fee 0.9%", Style::new().fg(PNK)),
+            Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
+            Span::styled("pool fee 0.9%", Style::new().fg(PNK)),
+            Span::styled(format!(" · dev donation {:.1}%", st.donate), Style::new().fg(AMB)),
         ]),
     ])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
         .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN))));
@@ -421,7 +511,7 @@ fn ui(f: &mut Frame, st: &Stats) {
         Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len())), row[0]);
     f.render_widget(tile("BLOCKS FOUND", Line::from(
         Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
-        &format!("rejected {}", st.rejected)), row[1]);
+        &format!("rejected {} · donated {}", st.rejected, st.donated)), row[1]);
     f.render_widget(tile("DIFFICULTY", Line::from(
         Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
         &format!("diff {:.0}", st.diff)), row[2]);
@@ -446,7 +536,8 @@ fn ui(f: &mut Frame, st: &Stats) {
 
     let items: Vec<ListItem> = st.log.iter().rev().take(chunks[4].height.saturating_sub(2) as usize).rev()
         .map(|l| {
-            let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("rejected") || l.contains("stale") { AMB } else { MUT };
+            let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB }
+                      else if l.contains("rejected") || l.contains("stale") { AMB } else { MUT };
             ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
         }).collect();
     f.render_widget(List::new(items)
@@ -455,7 +546,7 @@ fn ui(f: &mut Frame, st: &Stats) {
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled(" q ", Style::new().fg(Color::Black).bg(GRN)),
         Span::styled(" quit   ", Style::new().fg(MUT)),
-        Span::styled("REGTEST demo — the coin is not real Bitcoin, no value. Don't trust, verify.", Style::new().fg(MUT)),
+        Span::styled("Until the BLAKE2b hardfork activates on mainnet this is a REGTEST demo (no value). Don't trust, verify.", Style::new().fg(MUT)),
     ])).wrap(Wrap { trim: true }), chunks[5]);
 }
 
@@ -466,6 +557,7 @@ fn main() {
     let mut gpus: Option<u32> = None; // None = auto-detect all GPUs
     let mut cpu_threads: usize = 0;
     let mut use_cpu = false;
+    let mut donate = DONATE_MIN;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -474,15 +566,33 @@ fn main() {
             "--gpus" => { i += 1; if i < args.len() { gpus = args[i].parse().ok(); } }
             "--cpu" => { use_cpu = true; }
             "--cpu-threads" => { i += 1; if i < args.len() { cpu_threads = args[i].parse().unwrap_or(0); use_cpu = true; } }
+            "--donate" => { i += 1; if i < args.len() { donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             _ => {}
         }
         i += 1;
     }
     if addr.is_empty() {
-        eprintln!("usage: pyblockMiner --addr <btc_address> [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N]");
-        eprintln!("tip: generate an address with  python3 tools/genaddr.py");
+        eprintln!("usage: pyblockMiner --addr <mainnet_btc_address> [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N] [--donate PCT]");
+        eprintln!("tip: generate a mainnet address with  python3 tools/genaddr.py");
         std::process::exit(2);
     }
+    // mainnet-only: regtest/testnet rewards are unspendable on the real chain → refuse to mine.
+    match addr_kind(&addr) {
+        "mainnet" => {}
+        "test" => {
+            eprintln!("✗ '{}' looks like a REGTEST/TESTNET address.", addr);
+            eprintln!("  pyblockMiner mines for the mainnet BLAKE2b chain — rewards to a regtest/testnet");
+            eprintln!("  address would be UNSPENDABLE. Use a MAINNET address (bc1… / 1… / 3…).");
+            eprintln!("  generate one with:  python3 tools/genaddr.py");
+            std::process::exit(2);
+        }
+        _ => {
+            eprintln!("✗ '{}' is not a recognized Bitcoin address.", addr);
+            eprintln!("  use a MAINNET address (bc1… / 1… / 3…). generate one with:  python3 tools/genaddr.py");
+            std::process::exit(2);
+        }
+    }
+    if donate < DONATE_MIN { donate = DONATE_MIN; } // floor — thank you 🙏
     let detected = gpu_names().len() as u32;
     let ngpu = gpus.unwrap_or(detected);
     if ngpu == 0 { use_cpu = true; } // no GPU → mine on CPU
@@ -492,11 +602,11 @@ fn main() {
     if !use_cpu { cpu_threads = 0; }
 
     let stats = Arc::new(Mutex::new(Stats::default()));
-    { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); }
+    { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); st.donate = donate; }
     {
         let stats = stats.clone();
         let (p, a) = (pool.clone(), addr.clone());
-        std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads));
+        std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads, donate));
     }
 
     let mut terminal = ratatui::init();
