@@ -86,6 +86,58 @@ fn b2b(data: &[u8]) -> [u8; 32] {
     o.copy_from_slice(h.as_bytes());
     o
 }
+// target = (2^224-1) >> bits as a 32-byte big-endian array (same as gpu_grind's build_target)
+fn target_be(bits: u32) -> [u8; 32] {
+    let mut base = [0u8; 32];
+    for b in base.iter_mut().take(32).skip(4) { *b = 0xff; }
+    let shb = (bits / 8) as usize;
+    let sbit = bits % 8;
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let src = i as isize - shb as isize;
+        let mut acc: u16 = 0;
+        if src >= 0 { acc |= (base[src as usize] as u16) >> sbit; }
+        if src - 1 >= 0 && sbit > 0 { acc |= ((base[(src - 1) as usize] as u16) << (8 - sbit)) & 0xff; }
+        out[i] = acc as u8;
+    }
+    out
+}
+// CPU BLAKE2b grinder (native Rust, multi-threaded). Sweeps [nstart, nstart+span), returns winning nonces.
+fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32, threads: usize, nstart: u64, span: u64) -> Vec<String> {
+    let prevhash = hex::decode(prevhash_hex).unwrap_or_default();
+    let mut ntime8 = hex::decode(ntime_hex).unwrap_or_default(); ntime8.resize(8, 0);
+    let work_root = hex::decode(work_root_hex).unwrap_or_default();
+    if prevhash.len() < 32 || work_root.len() < 32 { return vec![]; }
+    let target = target_be(bits);
+    let threads = threads.max(1);
+    let per = span / threads as u64;
+    let out = Mutex::new(Vec::<String>::new());
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let a = nstart + t as u64 * per;
+            let b = if t == threads - 1 { nstart + span } else { a + per };
+            let (prevhash, ntime8, work_root, target, out) = (&prevhash, &ntime8, &work_root, &target, &out);
+            s.spawn(move || {
+                let mut local = vec![];
+                let mut work = [0u8; 80];
+                work[..32].copy_from_slice(&prevhash[..32]);
+                work[40..48].copy_from_slice(&ntime8[..8]);
+                work[48..80].copy_from_slice(&work_root[..32]);
+                let mut n = a;
+                while n < b && n < (1u64 << 32) {
+                    work[32..36].copy_from_slice(&(n as u32).to_le_bytes());
+                    let h = b2b(&work);
+                    let mut win = true;
+                    for i in 0..32 { if h[i] < target[i] { break; } if h[i] > target[i] { win = false; break; } }
+                    if win { local.push(format!("{:08x}", n)); }
+                    n += 1;
+                }
+                if !local.is_empty() { out.lock().unwrap().extend(local); }
+            });
+        }
+    });
+    out.into_inner().unwrap()
+}
 
 // ── persistent gpu_grind daemon (one per GPU) ──
 struct Daemon {
@@ -108,22 +160,41 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     let stdout = BufReader::new(child.stdout.take()?);
     Some(Daemon { _child: child, stdin, stdout, name, weight: 1.0 })
 }
-// dispatch the same work to all daemons, splitting the nonce space PROPORTIONALLY to each GPU's speed
-// (so a faster GPU gets more nonces → all finish together → all stay saturated). Collect winners + per-GPU GH/s.
-fn grind_daemons(ds: &mut [Daemon], prevhash: &str, ntime: &str, work_root: &str, bits: u32) -> (Vec<String>, Vec<f64>) {
-    let total_w: f64 = ds.iter().map(|d| d.weight.max(0.01)).sum();
+// Grind one job across ALL workers: GPU daemons (via stdin) + optional CPU threads, splitting the nonce
+// space proportionally to each worker's measured speed (so all finish together). GPU-only → sweeps 2^32;
+// CPU-only → sweeps only what the CPU can do per call (rotating extranonce next call).
+// Returns (winners, per-GPU GH/s, CPU GH/s).
+fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
+             prevhash: &str, ntime: &str, work_root: &str, bits: u32) -> (Vec<String>, Vec<f64>, f64) {
+    let secs = 0.35f64;
     let space: u64 = 1u64 << 32;
-    let last = ds.len().saturating_sub(1);
-    let mut cursor = 0u64;
+    let gpu_caps: Vec<u64> = ds.iter().map(|d| ((d.weight * 1e9 * secs) as u64).max(1 << 22)).collect();
+    let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
+    let total: u64 = gpu_caps.iter().sum::<u64>() + cpu_cap;
+    let sweep: u64 = if total == 0 || total >= space { space } else { total };
+
+    // dispatch GPU jobs (they grind in the background while the CPU grinds)
+    let mut cursor: u64 = 0;
     for (i, d) in ds.iter_mut().enumerate() {
-        let nstart = cursor;
-        let span = if i == last { space - nstart } else { ((space as f64) * d.weight.max(0.01) / total_w) as u64 };
-        cursor = (nstart + span).min(space);
-        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", prevhash, ntime, work_root, bits, nstart, span);
+        let span = if total > 0 { (sweep as u128 * gpu_caps[i] as u128 / total as u128) as u64 } else { 0 };
+        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", prevhash, ntime, work_root, bits, cursor, span.max(1));
         let _ = d.stdin.flush();
+        cursor += span;
     }
-    let mut nonces = vec![];
-    let mut ghs = vec![0.0f64; ds.len()];
+    // CPU grinds the remaining range in parallel with the GPUs
+    let mut nonces: Vec<String> = vec![];
+    let mut cpu_ghs = 0.0f64;
+    if cpu_threads > 0 && cursor < sweep {
+        let cpu_span = sweep - cursor;
+        let t0 = Instant::now();
+        let w = cpu_grind(prevhash, ntime, work_root, bits, cpu_threads, cursor, cpu_span);
+        let dt = t0.elapsed().as_secs_f64();
+        cpu_ghs = if dt > 0.0 { cpu_span as f64 / dt / 1e9 } else { 0.0 };
+        if cpu_ghs > 0.0 { *cpu_rate = cpu_ghs; }
+        nonces.extend(w);
+    }
+    // collect GPU winners
+    let mut gpu_ghs = vec![0.0f64; ds.len()];
     for (i, d) in ds.iter_mut().enumerate() {
         loop {
             let mut line = String::new();
@@ -132,8 +203,8 @@ fn grind_daemons(ds: &mut [Daemon], prevhash: &str, ntime: &str, work_root: &str
                 Ok(_) => {
                     let t = line.trim();
                     if let Some(rest) = t.strip_prefix("END ") {
-                        ghs[i] = rest.parse().unwrap_or(0.0);
-                        if ghs[i] > 0.0 { d.weight = ghs[i]; }
+                        gpu_ghs[i] = rest.parse().unwrap_or(0.0);
+                        if gpu_ghs[i] > 0.0 { d.weight = gpu_ghs[i]; }
                         break;
                     } else if !t.is_empty() {
                         nonces.push(t.to_string());
@@ -142,7 +213,7 @@ fn grind_daemons(ds: &mut [Daemon], prevhash: &str, ntime: &str, work_root: &str
             }
         }
     }
-    (nonces, ghs)
+    (nonces, gpu_ghs, cpu_ghs)
 }
 
 fn send(stream: &mut TcpStream, v: &Value) {
@@ -201,7 +272,7 @@ fn handle_msgs(msgs: Vec<Value>, stats: &Arc<Mutex<Stats>>,
     }
 }
 
-fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32) {
+fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_threads: usize) {
     // spawn one persistent daemon per GPU (kernel compiled once → all GPUs stay saturated)
     let names = gpu_names();
     let mut daemons: Vec<Daemon> = Vec::new();
@@ -211,11 +282,14 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32) {
             daemons.push(d);
         }
     }
+    let mut cpu_rate = 0.05f64;
     { let mut st = stats.lock().unwrap();
       st.gpu_names = daemons.iter().map(|d| d.name.clone()).collect();
-      st.gpu_ghs = vec![0.0; daemons.len()];
+      if cpu_threads > 0 { st.gpu_names.push(format!("CPU ({} threads)", cpu_threads)); }
+      st.gpu_ghs = vec![0.0; st.gpu_names.len()];
+      let nworkers = st.gpu_names.len();
       let names_str = st.gpu_names.join(", ");
-      st.logline(format!("{} GPU(s) ready: {}", daemons.len(), names_str)); }
+      st.logline(format!("{} worker(s) ready: {}", nworkers, names_str)); }
 
     loop {
         let mut stream = match TcpStream::connect(&pool) {
@@ -270,11 +344,13 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32) {
             leaf.extend_from_slice(&extranonce);
             let work_root = b2b(&leaf);
             let bits = floor_pot(diff);
-            let (nonces, ghs) = grind_daemons(&mut daemons, &sweep_prevhash, &ntime_hex, &hex::encode(work_root), bits);
+            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &sweep_prevhash, &ntime_hex, &hex::encode(work_root), bits);
             {
                 let mut st = stats.lock().unwrap();
-                if !ghs.is_empty() { st.gpu_ghs = ghs.clone(); }
-                st.hr_total = ghs.iter().sum();
+                let mut all = gpu_ghs.clone();
+                if cpu_threads > 0 { all.push(cpu_ghs); }
+                st.gpu_ghs = all;
+                st.hr_total = st.gpu_ghs.iter().sum();
                 let hv = (st.hr_total * 100.0) as u64;
                 st.hr_hist.push_back(hv);
                 while st.hr_hist.len() > 160 { st.hr_hist.pop_front(); }
@@ -342,7 +418,7 @@ fn ui(f: &mut Frame, st: &Stats) {
     let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(chunks[1]);
     f.render_widget(tile("HASHRATE", Line::from(vec![
         Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
-        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} GPU(s)", st.gpu_ghs.len())), row[0]);
+        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len())), row[0]);
     f.render_widget(tile("BLOCKS FOUND", Line::from(
         Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
         &format!("rejected {}", st.rejected)), row[1]);
@@ -354,14 +430,14 @@ fn ui(f: &mut Frame, st: &Stats) {
     for (i, g) in st.gpu_ghs.iter().enumerate() {
         let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("GPU {}", i));
         glines.push(Line::from(vec![
-            Span::styled(format!(" GPU {} ", i), Style::new().fg(MUT)),
-            Span::styled(format!("{:<24}", name), Style::new().fg(CYN)),
+            Span::styled(format!(" {:>2}  ", i), Style::new().fg(MUT)),
+            Span::styled(format!("{:<26}", name), Style::new().fg(CYN)),
             Span::styled(format!("{:>7.2} GH/s", g), Style::new().fg(GRN)),
         ]));
     }
     if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
     f.render_widget(Paragraph::new(Text::from(glines))
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" GPUs ", Style::new().fg(MUT)))), chunks[2]);
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), chunks[2]);
 
     let data: Vec<u64> = st.hr_hist.iter().cloned().collect();
     f.render_widget(Sparkline::default()
@@ -387,32 +463,40 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut pool = "pool.pyblock.xyz:23110".to_string();
     let mut addr = String::new();
-    let mut gpus: u32 = 0; // 0 = auto (all detected)
+    let mut gpus: Option<u32> = None; // None = auto-detect all GPUs
+    let mut cpu_threads: usize = 0;
+    let mut use_cpu = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--pool" => { i += 1; if i < args.len() { pool = args[i].clone(); } }
             "--addr" => { i += 1; if i < args.len() { addr = args[i].clone(); } }
-            "--gpus" => { i += 1; if i < args.len() { gpus = args[i].parse().unwrap_or(0); } }
+            "--gpus" => { i += 1; if i < args.len() { gpus = args[i].parse().ok(); } }
+            "--cpu" => { use_cpu = true; }
+            "--cpu-threads" => { i += 1; if i < args.len() { cpu_threads = args[i].parse().unwrap_or(0); use_cpu = true; } }
             _ => {}
         }
         i += 1;
     }
     if addr.is_empty() {
-        eprintln!("usage: pyblockMiner --addr <btc_address> [--pool host:port] [--gpus N]");
+        eprintln!("usage: pyblockMiner --addr <btc_address> [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N]");
         eprintln!("tip: generate an address with  python3 tools/genaddr.py");
         std::process::exit(2);
     }
-    if gpus == 0 {
-        gpus = gpu_names().len().max(1) as u32;
+    let detected = gpu_names().len() as u32;
+    let ngpu = gpus.unwrap_or(detected);
+    if ngpu == 0 { use_cpu = true; } // no GPU → mine on CPU
+    if use_cpu && cpu_threads == 0 {
+        cpu_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     }
+    if !use_cpu { cpu_threads = 0; }
 
     let stats = Arc::new(Mutex::new(Stats::default()));
     { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); }
     {
         let stats = stats.clone();
         let (p, a) = (pool.clone(), addr.clone());
-        std::thread::spawn(move || engine(stats, p, a, gpus));
+        std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads));
     }
 
     let mut terminal = ratatui::init();

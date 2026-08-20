@@ -55,9 +55,13 @@ Options:
 |------|---------|---------|
 | `--addr <addr>` | *(required)* | your Bitcoin address — every block you find pays 99.1% here |
 | `--pool <host:port>` | `pool.pyblock.xyz:23110` | the pool to mine on |
-| `--gpus <N>` | auto (all detected) | how many GPUs to use |
+| `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = none) |
+| `--cpu` | off | also mine on the CPU (added as an extra worker) |
+| `--cpu-threads <N>` | auto (all cores) | CPU threads to use |
 
 Press **`q`** to quit. Run it in a real terminal (it's a full-screen TUI).
+
+**No GPU?** It falls back to **CPU mining** automatically (much slower — CPUs do ~MH/s vs GPUs' GH/s, but it works). You can also force it with `--gpus 0`, or add CPU alongside your GPUs with `--cpu`. The miner uses **all your GPUs and/or CPU cores** at once, splitting the work proportionally so every device stays busy.
 
 ---
 
