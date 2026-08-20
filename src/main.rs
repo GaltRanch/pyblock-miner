@@ -16,13 +16,15 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
-// ── developer donation (like xmrig's donate-level) ──────────────────────────────────────────────
-// Hardcoded, consensus of the project: a small fraction of your hashing mines to the developer's
-// address as a thank-you for the miner. This is SEPARATE from the pool fee (0.9%). Minimum 0.4%,
-// raise it with --donate <pct>. Mechanism: a 2nd stratum connection is authorized to this address;
-// ~donate% of sweeps mine to it, so ~donate% of any blocks you find pay the developer instead.
-const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
-const DONATE_MIN: f64 = 0.4; // percent — floor, cannot go lower
+// ── PyBLØCK hashrate donation (like xmrig's donate-level, but paid in HASH, not satoshis) ────────
+// You don't pay a wallet: for `donate%` of its sweeps the miner mines to the PyBLØCK LOTTO BLAKE2b
+// pool below — regardless of which pool you choose as your primary (--pool). Default and minimum 2%,
+// raise it with --donate <pct>. Separate from any pool's own fee. Mechanism: a 2nd stratum
+// connection to the PyBLØCK pool grinds ~donate% of the time, so ~donate% of your hashrate (and of
+// any blocks that fraction finds) supports PyBLØCK.
+const DONATE_POOL: &str = "pool.pyblock.xyz:23110";                   // PyBLØCK LOTTO BLAKE2b pool
+const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2"; // PyBLØCK address on that pool
+const DONATE_MIN: f64 = 2.0; // percent of hashrate — floor and default
 
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
@@ -375,7 +377,7 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
       let nworkers = st.gpu_names.len();
       let names_str = st.gpu_names.join(", ");
       st.logline(format!("{} worker(s) ready: {}", nworkers, names_str));
-      st.logline(format!("dev donation {:.1}% → {}", donate, DEV_DONATION_ADDR)); }
+      st.logline(format!("hashrate donation {:.1}% → PyBLØCK pool {} ({})", donate, DONATE_POOL, DEV_DONATION_ADDR)); }
 
     let mut donate_credit = 0.0f64;              // accumulates `donate/100` per sweep; ≥1 → this sweep pays the dev
     let mut dev_retry = Instant::now();
@@ -389,8 +391,8 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
                 continue;
             }
         };
-        // best-effort donation session (never blocks mining if it fails)
-        let mut dev: Option<Conn> = Conn::connect(&pool, DEV_DONATION_ADDR, true);
+        // best-effort donation session to the PyBLØCK pool (fixed — always PyBLØCK, not --pool)
+        let mut dev: Option<Conn> = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true);
         { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
           st.logline(format!("connected to PyBLØCK LOTTO BLAKE2b {}", pool)); }
 
@@ -401,7 +403,7 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
             }
             if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
             if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
-                dev = Conn::connect(&pool, DEV_DONATION_ADDR, true);
+                dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true);
                 dev_retry = Instant::now();
             }
             if user.idle.elapsed() > Duration::from_secs(90) {
@@ -499,7 +501,7 @@ fn ui(f: &mut Frame, st: &Stats) {
             Span::styled(st.addr.clone(), Style::new().fg(CYN)),
             Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
             Span::styled("pool fee 0.9%", Style::new().fg(PNK)),
-            Span::styled(format!(" · dev donation {:.1}%", st.donate), Style::new().fg(AMB)),
+            Span::styled(format!(" · donation {:.1}% hash → PyBLØCK", st.donate), Style::new().fg(AMB)),
         ]),
     ])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
         .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN))));

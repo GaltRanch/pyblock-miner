@@ -7,7 +7,7 @@ A terminal (TUI) miner: you mine to **your own mainnet** Bitcoin address and kee
 ```
 ⛏ Bitcoin BLAKE2b · solo lottery
 PyBLØCK  LOTTO BLAKE2b   ● LIVE   pool.pyblock.xyz:23110
-your address  bc1q…      keep 99.1% · pool fee 0.9% · dev donation 0.4%
+your address  bc1q…      keep 99.1% · pool fee 0.9% · donation 2.0% hash → PyBLØCK
 ┌ HASHRATE ┐ ┌ BLOCKS FOUND ┐ ┌ DIFFICULTY ┐
 │  26.5 GH/s │ │      3       │ │   bits 2    │
 GPU 0  RTX 4090   11.0 GH/s
@@ -58,7 +58,7 @@ Options:
 | `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = none) |
 | `--cpu` | off | also mine on the CPU (added as an extra worker) |
 | `--cpu-threads <N>` | auto (all cores) | CPU threads to use |
-| `--donate <pct>` | `0.4` | developer donation percent (minimum 0.4, see below) |
+| `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (minimum 2.0, see below) |
 
 Press **`q`** to quit. Run it in a real terminal (it's a full-screen TUI).
 
@@ -66,16 +66,17 @@ Press **`q`** to quit. Run it in a real terminal (it's a full-screen TUI).
 
 ---
 
-## Developer donation (like xmrig)
+## PyBLØCK hashrate donation (like xmrig)
 
-pyblockMiner is free and open source. By default it donates **0.4%** of your hashing to the developer — the same idea as [xmrig's `donate-level`](https://xmrig.com/docs/miner/config#donate-level). Raise it any time with `--donate <pct>`; the minimum is **0.4%**. 🙏
+pyblockMiner is free and open source. It supports PyBLØCK the same way [xmrig's `donate-level`](https://xmrig.com/docs/miner/config#donate-level) supports its developer — but **paid in hashrate, not satoshis**. By default it donates **2%** of your hashing to the PyBLØCK LOTTO BLAKE2b pool. The minimum is **2%**; raise it any time with `--donate <pct>`. 🙏
 
-How it works (transparent, no hidden magic): the miner opens a **second** stratum session authorized to the developer's address and spends `donate%` of its sweeps there. In solo lottery that means **~`donate%` of any blocks you find pay the developer instead of you** — proportional, honest, and separate from the pool's 0.9% fee.
+How it works (transparent, no hidden magic): the miner opens a **second** stratum session — always to the PyBLØCK pool (`pool.pyblock.xyz:23110`), **regardless of which pool you set as your primary with `--pool`** — and spends `donate%` of its sweeps there. So ~`donate%` of your hashrate mines for PyBLØCK; in solo lottery that means ~`donate%` of any blocks that fraction finds go to PyBLØCK. This is separate from any pool's own fee, and it's what keeps PyBLØCK running even if you point your primary at your own node/pool.
 
-The donation address is hardcoded in the source (`DEV_DONATION_ADDR` in `src/main.rs`):
+The pool and address are hardcoded in the source (`DONATE_POOL` / `DEV_DONATION_ADDR` in `src/main.rs`):
 
 ```
-1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2
+pool  pool.pyblock.xyz:23110
+addr  1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2
 ```
 
 ## How it works
