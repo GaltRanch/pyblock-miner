@@ -140,6 +140,7 @@ struct Stats {
     gpu_ghs: Vec<f64>,
     gpu_names: Vec<String>,
     blocks: u64,
+    accepted: u64,
     rejected: u64,
     hr_total: f64,
     hr_hist: VecDeque<u64>,
@@ -185,6 +186,36 @@ fn target_be(bits: u32) -> [u8; 32] {
     }
     out
 }
+// network block target from the job's compact nbits (Bitcoin standard mantissa·256^(exp-3))
+fn nbits_to_target(nbits: u32) -> [u8; 32] {
+    let exp = (nbits >> 24) as i32;
+    let mant = (nbits & 0x007fffff) as u64;
+    let mut t = [0u8; 32];
+    for i in 0..3i32 {
+        let byte = ((mant >> (8 * (2 - i))) & 0xff) as u8;
+        let pos = 32 - exp + i;
+        if pos >= 0 && pos < 32 { t[pos as usize] = byte; }
+    }
+    t
+}
+// does this accepted nonce meet the NETWORK target (= a real block), or is it only a vardiff share?
+fn nonce_is_block(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, nonce_hex: &str, nbits: u32) -> bool {
+    if nbits == 0 { return false; }
+    let prevhash = match hex::decode(prevhash_hex) { Ok(v) if v.len() >= 32 => v, _ => return false };
+    let mut ntime8 = hex::decode(ntime_hex).unwrap_or_default(); ntime8.resize(8, 0);
+    let work_root = match hex::decode(work_root_hex) { Ok(v) if v.len() >= 32 => v, _ => return false };
+    let nonce = match u32::from_str_radix(nonce_hex, 16) { Ok(n) => n, _ => return false };
+    let mut work = [0u8; 80];
+    work[..32].copy_from_slice(&prevhash[..32]);
+    work[32..36].copy_from_slice(&nonce.to_le_bytes());
+    work[40..48].copy_from_slice(&ntime8[..8]);
+    work[48..80].copy_from_slice(&work_root[..32]);
+    let h = b2b(&work);
+    let target = nbits_to_target(nbits);
+    for i in 0..32 { if h[i] < target[i] { return true; } if h[i] > target[i] { return false; } }
+    true
+}
+
 fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32, threads: usize, nstart: u64, span: u64) -> Vec<String> {
     let prevhash = hex::decode(prevhash_hex).unwrap_or_default();
     let mut ntime8 = hex::decode(ntime_hex).unwrap_or_default(); ntime8.resize(8, 0);
@@ -286,7 +317,7 @@ fn send(stream: &mut TcpStream, v: &Value) {
 
 struct Conn {
     stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
-    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, String>, subid: u64, addr: String, is_dev: bool, idle: Instant,
+    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool)>, subid: u64, addr: String, is_dev: bool, idle: Instant,
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
@@ -333,15 +364,23 @@ impl Conn {
             } else if meth == Some("mining.notify") {
                 self.job = m.get("params").and_then(|v| v.as_array()).cloned();
             } else if let Some(idv) = id {
-                if let Some(nonce) = self.pending.remove(&idv) {
+                if let Some((nonce, is_block)) = self.pending.remove(&idv) {
                     let mut st = stats.lock().unwrap();
                     if m.get("result") == Some(&Value::Bool(true)) {
                         if self.is_dev {
-                            st.donated += 1; let n = st.donated;
-                            st.logline(format!("💚 donation block (#{}) → developer · thank you! · nonce {}", n, nonce));
+                            if is_block {
+                                st.donated += 1; let n = st.donated;
+                                st.logline(format!("💚 donation BLOCK (#{}) → developer · thank you! · nonce {}", n, nonce));
+                            }
                         } else {
-                            st.blocks += 1; let n = st.blocks;
-                            st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
+                            st.accepted += 1;
+                            if is_block {
+                                st.blocks += 1; let n = st.blocks;
+                                st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
+                            } else {
+                                let a = st.accepted;
+                                st.logline(format!("✓ share accepted (#{}) · nonce {}", a, nonce));
+                            }
                         }
                     } else if m.get("error").map_or(false, |e| !e.is_null()) {
                         st.rejected += 1;
@@ -472,10 +511,12 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 user.job.as_ref().and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("").to_string()
             };
             if cur_prev == prevhash {
+                let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
                 let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
                 for nh in nonces {
+                    let is_block = nonce_is_block(&prevhash, &ntime, &work_root, &nh, nbits);
                     conn.subid += 1; let sid = conn.subid;
-                    conn.pending.insert(sid, nh.clone());
+                    conn.pending.insert(sid, (nh.clone(), is_block));
                     send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
                 }
             } else if !nonces.is_empty() {
@@ -495,8 +536,19 @@ fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
         v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
     ))
 }
-fn poll_balance(explorer: &str, addr: &str) -> Option<f64> {
-    if explorer.is_empty() || addr.is_empty() { return None; }
+// regtest has no public explorer → balance comes from the PyBLØCK node-backed endpoint (scantxoutset on the local blake2b node)
+const REGTEST_BALANCE_API: &str = "https://pool.pyblock.xyz:8443/api/blake_balance.php";
+fn poll_balance(net: &str, addr: &str) -> Option<f64> {
+    if addr.is_empty() { return None; }
+    if net == "regtest" {
+        let url = format!("{}?addr={}", REGTEST_BALANCE_API, addr);
+        let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+        let v: Value = serde_json::from_str(&body).ok()?;
+        if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
+        return v.get("balance_btc").and_then(|x| x.as_f64());
+    }
+    let explorer = net_cfg(net).explorer;
+    if explorer.is_empty() { return None; }
     let url = format!("{}/address/{}", explorer, addr);
     let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
@@ -596,7 +648,7 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
     f.render_widget(tile("YOUR HASHRATE", Line::from(vec![Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
         Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len()), BRD), row[0]);
     f.render_widget(tile("BLOCKS FOUND", Line::from(Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
-        &format!("rejected {} · donated {}", st.rejected, st.donated), BRD), row[1]);
+        &format!("{} shares acc · {} rej · {} don", st.accepted, st.rejected, st.donated), BRD), row[1]);
     f.render_widget(tile("DIFFICULTY", Line::from(Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
         &format!("diff {:.0}", st.diff), BRD), row[2]);
     let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) }
@@ -702,7 +754,7 @@ fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
         Line::from(vec![Span::styled("  network      ", Style::new().fg(MUT)), Span::styled(app.network(), Style::new().fg(GRN))]),
         Line::from(vec![Span::styled("  your address ", Style::new().fg(MUT)), Span::styled(app.addr(), Style::new().fg(CYN))]),
         Line::from(vec![Span::styled("  your balance ", Style::new().fg(MUT)), Span::styled(bal, Style::new().fg(GRN))]),
-        Line::from(vec![Span::styled("  your blocks  ", Style::new().fg(MUT)), Span::styled(format!("{} found · {} rejected", st.blocks, st.rejected), Style::new().fg(GRN))]),
+        Line::from(vec![Span::styled("  your blocks  ", Style::new().fg(MUT)), Span::styled(format!("{} blocks · {} shares acc · {} rej", st.blocks, st.accepted, st.rejected), Style::new().fg(GRN))]),
         Line::from(""),
         Line::from(Span::styled("  Network stats come from the PyBLØCK pool for the selected chain. Balance from a public explorer.", Style::new().fg(MUT))),
     ];
@@ -864,6 +916,7 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut cfg = load_config();
+    let mut headless = false;
     // CLI overrides (optional; config is the source of truth otherwise)
     let mut i = 1;
     while i < args.len() {
@@ -874,6 +927,7 @@ fn main() {
             "--gpus" => { i += 1; if i < args.len() { cfg.gpus = args[i].parse().ok(); } }
             "--cpu" => { cfg.cpu = true; }
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
+            "--headless" | "--daemon" | "--no-tui" => { headless = true; }
             _ => {}
         }
         i += 1;
@@ -913,12 +967,34 @@ fn main() {
     // balance poller (per current network + address)
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
         let (net, addr) = { let t = tgt.lock().unwrap(); (t.network.clone(), t.addr.clone()) };
-        match poll_balance(net_cfg(&net).explorer, &addr) {
+        match poll_balance(&net, &addr) {
             Some(b) => { let mut st = stats.lock().unwrap(); st.balance_ok = true; st.balance_btc = b; }
             None => { stats.lock().unwrap().balance_ok = false; }
         }
         std::thread::sleep(Duration::from_secs(60));
     }); }
+
+    // headless (service) mode: no TUI, heartbeat to stdout (journald). Engine + pollers already running.
+    if headless {
+        println!("pyblockMiner (headless) · network={} · pool={} · addr={} · donate={:.1}%",
+            app.network(), tgt.lock().unwrap().pool, app.addr(), donate0);
+        let _ = std::io::stdout().flush();
+        let mut last_printed = 0usize;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let (net, conn, hr, nworkers, blk, acc, rej, neth, newlogs) = {
+                let st = stats.lock().unwrap();
+                let logs: Vec<String> = st.log.iter().cloned().collect();
+                let fresh: Vec<String> = if logs.len() > last_printed { logs[last_printed..].to_vec() } else { vec![] };
+                last_printed = logs.len();
+                (st.network.clone(), st.connected, st.hr_total, st.gpu_ghs.len(), st.blocks, st.accepted, st.rejected, st.net_height, fresh)
+            };
+            for l in &newlogs { println!("  · {}", l); }
+            println!("{} · {} · {:.1} GH/s ({}w) · blocks {} · {} acc (rej {}) · net_h {}",
+                net, if conn { "LIVE" } else { "waiting" }, hr, nworkers, blk, acc, rej, neth);
+            let _ = std::io::stdout().flush();
+        }
+    }
 
     let mut terminal = ratatui::init();
     loop {
