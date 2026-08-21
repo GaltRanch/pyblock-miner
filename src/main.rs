@@ -26,6 +26,9 @@ const DONATE_POOL: &str = "pool.pyblock.xyz:23110";                   // PyBLØC
 const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2"; // PyBLØCK address on that pool
 const DONATE_MIN: f64 = 2.0; // percent of hashrate — floor and default
 
+// public network-stats endpoint (all pyblockMiner users on the PyBLØCK LOTTO pool)
+const STATS_URL: &str = "https://pool.pyblock.xyz:8443/api/blake_stats.php";
+
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
 const YLW: Color = Color::Rgb(255, 255, 0);
@@ -90,6 +93,11 @@ struct Stats {
     hr_hist: VecDeque<u64>,
     log: VecDeque<String>,
     started: Option<Instant>,
+    // PyBLØCK LOTTO network (all pyblockMiner users), polled from the pool stats endpoint
+    net_ok: bool,
+    net_miners: u64,
+    net_ghs: f64,
+    net_height: u64,
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -466,7 +474,7 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
     }
 }
 
-fn tile(title: &str, value: Line<'static>, sub: &str) -> Paragraph<'static> {
+fn tile(title: &str, value: Line<'static>, sub: &str, border: Color) -> Paragraph<'static> {
     let text = Text::from(vec![
         Line::from(Span::styled(title.to_string(), Style::new().fg(MUT))),
         Line::from(""),
@@ -474,17 +482,18 @@ fn tile(title: &str, value: Line<'static>, sub: &str) -> Paragraph<'static> {
         Line::from(Span::styled(sub.to_string(), Style::new().fg(MUT))),
     ]);
     Paragraph::new(text).alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)))
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(border)))
 }
 
 fn ui(f: &mut Frame, st: &Stats) {
     let gpu_h = (st.gpu_names.len().max(1) + 2).min(9) as u16;
     let chunks = Layout::vertical([
         Constraint::Length(4),        // header
-        Constraint::Length(6),        // stat tiles
+        Constraint::Length(6),        // your stat tiles
+        Constraint::Length(6),        // NETWORK tiles (all pyblockMiner users)
         Constraint::Length(gpu_h),    // gpus
         Constraint::Length(5),        // sparkline
-        Constraint::Min(4),           // log
+        Constraint::Min(3),           // log
         Constraint::Length(1),        // footer
     ]).split(f.area());
 
@@ -508,15 +517,28 @@ fn ui(f: &mut Frame, st: &Stats) {
     f.render_widget(head, chunks[0]);
 
     let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(chunks[1]);
-    f.render_widget(tile("HASHRATE", Line::from(vec![
+    f.render_widget(tile("YOUR HASHRATE", Line::from(vec![
         Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
-        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len())), row[0]);
+        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len()), BRD), row[0]);
     f.render_widget(tile("BLOCKS FOUND", Line::from(
         Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
-        &format!("rejected {} · donated {}", st.rejected, st.donated)), row[1]);
+        &format!("rejected {} · donated {}", st.rejected, st.donated), BRD), row[1]);
     f.render_widget(tile("DIFFICULTY", Line::from(
         Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
-        &format!("diff {:.0}", st.diff)), row[2]);
+        &format!("diff {:.0}", st.diff), BRD), row[2]);
+
+    // ── NETWORK cards: all pyblockMiner users on the PyBLØCK LOTTO pool (live) ──
+    let (nm, ng, nh) = if st.net_ok {
+        (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height))
+    } else { ("—".to_string(), "—".to_string(), "—".to_string()) };
+    let nrow = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(chunks[2]);
+    f.render_widget(tile("◈ MINERS ONLINE", Line::from(
+        Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), nrow[0]);
+    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![
+        Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)),
+        Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), nrow[1]);
+    f.render_widget(tile("◈ POOL HEIGHT", Line::from(
+        Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), nrow[2]);
 
     let mut glines: Vec<Line> = vec![];
     for (i, g) in st.gpu_ghs.iter().enumerate() {
@@ -529,27 +551,39 @@ fn ui(f: &mut Frame, st: &Stats) {
     }
     if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
     f.render_widget(Paragraph::new(Text::from(glines))
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), chunks[2]);
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), chunks[3]);
 
     let data: Vec<u64> = st.hr_hist.iter().cloned().collect();
     f.render_widget(Sparkline::default()
         .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" hashrate ", Style::new().fg(MUT))))
-        .data(&data).style(Style::new().fg(GRN)), chunks[3]);
+        .data(&data).style(Style::new().fg(GRN)), chunks[4]);
 
-    let items: Vec<ListItem> = st.log.iter().rev().take(chunks[4].height.saturating_sub(2) as usize).rev()
+    let items: Vec<ListItem> = st.log.iter().rev().take(chunks[5].height.saturating_sub(2) as usize).rev()
         .map(|l| {
             let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB }
                       else if l.contains("rejected") || l.contains("stale") { AMB } else { MUT };
             ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
         }).collect();
     f.render_widget(List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), chunks[4]);
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), chunks[5]);
 
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled(" q ", Style::new().fg(Color::Black).bg(GRN)),
         Span::styled(" quit   ", Style::new().fg(MUT)),
         Span::styled("Until the BLAKE2b hardfork activates on mainnet this is a REGTEST demo (no value). Don't trust, verify.", Style::new().fg(MUT)),
-    ])).wrap(Wrap { trim: true }), chunks[5]);
+    ])).wrap(Wrap { trim: true }), chunks[6]);
+}
+
+// poll the pool network-stats endpoint → (miners_online, network_GH/s, pool_height)
+fn poll_network_stats() -> Option<(u64, f64, u64)> {
+    let body = ureq::get(STATS_URL).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
+    Some((
+        v.get("miners").and_then(|x| x.as_u64()).unwrap_or(0),
+        v.get("network_hashrate_ghs").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
+    ))
 }
 
 fn main() {
@@ -609,6 +643,17 @@ fn main() {
         let stats = stats.clone();
         let (p, a) = (pool.clone(), addr.clone());
         std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads, donate));
+    }
+    // network-stats poller: live count of pyblockMiner users + aggregate network hashrate
+    {
+        let stats = stats.clone();
+        std::thread::spawn(move || loop {
+            match poll_network_stats() {
+                Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
+                None => { stats.lock().unwrap().net_ok = false; }
+            }
+            std::thread::sleep(Duration::from_secs(15));
+        });
     }
 
     let mut terminal = ratatui::init();

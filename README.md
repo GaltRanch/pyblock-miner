@@ -2,14 +2,16 @@
 
 **A GPU/CPU miner for the PyBLØCK LOTTO BLAKE2b pool — Bitcoin BLAKE2b, solo lottery, non-custodial.**
 
-A terminal (TUI) miner: you mine to **your own mainnet** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live hashrate, blocks found and difficulty.
+A terminal (TUI) miner: you mine to **your own mainnet** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
 
 ```
 ⛏ Bitcoin BLAKE2b · solo lottery
 PyBLØCK  LOTTO BLAKE2b   ● LIVE   pool.pyblock.xyz:23110
 your address  bc1q…      keep 99.1% · pool fee 0.9% · donation 2.0% hash → PyBLØCK
-┌ HASHRATE ┐ ┌ BLOCKS FOUND ┐ ┌ DIFFICULTY ┐
-│  26.5 GH/s │ │      3       │ │   bits 2    │
+┌ YOUR HASHRATE ┐ ┌ BLOCKS FOUND ┐ ┌ DIFFICULTY ┐
+│    26.5 GH/s    │ │      3       │ │   bits 2    │
+┌ ◈ MINERS ONLINE ┐ ┌ ◈ NETWORK HASHRATE ┐ ┌ ◈ POOL HEIGHT ┐
+│        7         │ │      184 GH/s        │ │    842 190    │
 GPU 0  RTX 4090   11.0 GH/s
 GPU 1  RTX 5090   15.5 GH/s
 ```
