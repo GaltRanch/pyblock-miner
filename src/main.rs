@@ -136,6 +136,7 @@ struct Stats {
     donate: f64,
     donated: u64,
     diff: f64,
+    best_diff: f64,
     bits: u32,
     gpu_ghs: Vec<f64>,
     gpu_names: Vec<String>,
@@ -198,22 +199,39 @@ fn nbits_to_target(nbits: u32) -> [u8; 32] {
     }
     t
 }
-// does this accepted nonce meet the NETWORK target (= a real block), or is it only a vardiff share?
-fn nonce_is_block(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, nonce_hex: &str, nbits: u32) -> bool {
-    if nbits == 0 { return false; }
-    let prevhash = match hex::decode(prevhash_hex) { Ok(v) if v.len() >= 32 => v, _ => return false };
+// recompute the BLAKE2b PoW hash for an accepted nonce (to classify it: real block? best difficulty?)
+fn nonce_hash(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, nonce_hex: &str) -> Option<[u8; 32]> {
+    let prevhash = hex::decode(prevhash_hex).ok()?;
     let mut ntime8 = hex::decode(ntime_hex).unwrap_or_default(); ntime8.resize(8, 0);
-    let work_root = match hex::decode(work_root_hex) { Ok(v) if v.len() >= 32 => v, _ => return false };
-    let nonce = match u32::from_str_radix(nonce_hex, 16) { Ok(n) => n, _ => return false };
+    let work_root = hex::decode(work_root_hex).ok()?;
+    let nonce = u32::from_str_radix(nonce_hex, 16).ok()?;
+    if prevhash.len() < 32 || work_root.len() < 32 { return None; }
     let mut work = [0u8; 80];
     work[..32].copy_from_slice(&prevhash[..32]);
     work[32..36].copy_from_slice(&nonce.to_le_bytes());
     work[40..48].copy_from_slice(&ntime8[..8]);
     work[48..80].copy_from_slice(&work_root[..32]);
-    let h = b2b(&work);
-    let target = nbits_to_target(nbits);
+    Some(b2b(&work))
+}
+fn hash_le_target(h: &[u8; 32], target: &[u8; 32]) -> bool {
     for i in 0..32 { if h[i] < target[i] { return true; } if h[i] > target[i] { return false; } }
     true
+}
+// difficulty of a hash vs the BLAKE2b diff-1 target (2^224-1): diff ≈ 2^96 / top128(hash)
+fn hash_diff(h: &[u8; 32]) -> f64 {
+    let mut top: u128 = 0;
+    for i in 0..16 { top = (top << 8) | h[i] as u128; }
+    if top == 0 { return f64::INFINITY; }
+    (2f64).powi(96) / (top as f64)
+}
+// human-readable difficulty (best-share monitor)
+fn fmt_diff(d: f64) -> String {
+    if d <= 0.0 { "—".into() }
+    else if d >= 1e12 { format!("{:.2}T", d / 1e12) }
+    else if d >= 1e9 { format!("{:.2}G", d / 1e9) }
+    else if d >= 1e6 { format!("{:.2}M", d / 1e6) }
+    else if d >= 1e3 { format!("{:.2}K", d / 1e3) }
+    else { format!("{:.2}", d) }
 }
 
 fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32, threads: usize, nstart: u64, span: u64) -> Vec<String> {
@@ -512,13 +530,19 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             };
             if cur_prev == prevhash {
                 let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                let net_target = nbits_to_target(nbits);
+                let mut sweep_best = 0.0f64;
                 let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
                 for nh in nonces {
-                    let is_block = nonce_is_block(&prevhash, &ntime, &work_root, &nh, nbits);
+                    let is_block = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
+                        Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; } nbits != 0 && hash_le_target(&h, &net_target) }
+                        None => false,
+                    };
                     conn.subid += 1; let sid = conn.subid;
                     conn.pending.insert(sid, (nh.clone(), is_block));
                     send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
                 }
+                if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
             } else if !nonces.is_empty() {
                 stats.lock().unwrap().logline(format!("· dropped {} stale (tip moved during grind)", nonces.len()));
             }
@@ -650,7 +674,7 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
     f.render_widget(tile("BLOCKS FOUND", Line::from(Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
         &format!("{} shares acc · {} rej · {} don", st.accepted, st.rejected, st.donated), BRD), row[1]);
     f.render_widget(tile("DIFFICULTY", Line::from(Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
-        &format!("diff {:.0}", st.diff), BRD), row[2]);
+        &format!("diff {:.0} · best {}", st.diff, fmt_diff(st.best_diff)), BRD), row[2]);
     let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) }
         else { ("—".into(), "—".into(), "—".into()) };
     let nr = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[2]);
@@ -982,16 +1006,16 @@ fn main() {
         let mut last_printed = 0usize;
         loop {
             std::thread::sleep(Duration::from_secs(5));
-            let (net, conn, hr, nworkers, blk, acc, rej, neth, newlogs) = {
+            let (net, conn, hr, nworkers, blk, acc, rej, neth, bd, newlogs) = {
                 let st = stats.lock().unwrap();
                 let logs: Vec<String> = st.log.iter().cloned().collect();
                 let fresh: Vec<String> = if logs.len() > last_printed { logs[last_printed..].to_vec() } else { vec![] };
                 last_printed = logs.len();
-                (st.network.clone(), st.connected, st.hr_total, st.gpu_ghs.len(), st.blocks, st.accepted, st.rejected, st.net_height, fresh)
+                (st.network.clone(), st.connected, st.hr_total, st.gpu_ghs.len(), st.blocks, st.accepted, st.rejected, st.net_height, st.best_diff, fresh)
             };
             for l in &newlogs { println!("  · {}", l); }
-            println!("{} · {} · {:.1} GH/s ({}w) · blocks {} · {} acc (rej {}) · net_h {}",
-                net, if conn { "LIVE" } else { "waiting" }, hr, nworkers, blk, acc, rej, neth);
+            println!("{} · {} · {:.1} GH/s ({}w) · blocks {} · {} acc (rej {}) · net_h {} · best {}",
+                net, if conn { "LIVE" } else { "waiting" }, hr, nworkers, blk, acc, rej, neth, fmt_diff(bd));
             let _ = std::io::stdout().flush();
         }
     }
