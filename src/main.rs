@@ -46,12 +46,11 @@ fn addr_ok(net: &str, a: &str) -> bool {
         _          => a.starts_with("bc1")   || a.starts_with('1') || a.starts_with('3'),
     }
 }
-// public network-stats endpoint per network (regtest has none → cards show "—")
+// public network-stats endpoint per network (regtest → the :23110 demo pool's stats, same as mainnet)
 fn net_stats_url(net: &str) -> Option<&'static str> {
     match net {
-        "mainnet"  => Some("https://pool.pyblock.xyz:8443/api/blake_stats.php"),
         "testnet4" => Some("https://pool.pyblock.xyz:8443/api/blake_stats_t4.php"),
-        _          => None,
+        _          => Some("https://pool.pyblock.xyz:8443/api/blake_stats.php"),
     }
 }
 
