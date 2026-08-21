@@ -38,13 +38,24 @@ const AMB: Color = Color::Rgb(224, 176, 53);
 const PNK: Color = Color::Rgb(255, 92, 200);
 const BRD: Color = Color::Rgb(35, 60, 35);
 
-// ── address validation: mainnet only (regtest/testnet rewards are unspendable on mainnet) ──
-// Returns "mainnet" (ok to mine), "test" (regtest/testnet → refuse), or "unknown" (unrecognized).
-fn addr_kind(a: &str) -> &'static str {
-    if a.starts_with("bc1") || a.starts_with('1') || a.starts_with('3') { return "mainnet"; }
-    if a.starts_with("bcrt1") || a.starts_with("tb1") || a.starts_with("tpub")
-        || a.starts_with('m') || a.starts_with('n') || a.starts_with('2') { return "test"; }
-    "unknown"
+// ── network selection: mine on mainnet, testnet4, or regtest ──
+// donation only on mainnet (testnet/regtest coins have no value); explorer used for the balance card.
+struct NetCfg { name: &'static str, donate: bool, explorer: &'static str }
+fn net_cfg(net: &str) -> NetCfg {
+    match net {
+        "testnet4" | "testnet" | "t4" => NetCfg { name: "testnet4", donate: false, explorer: "https://mempool.space/testnet4/api" },
+        "regtest"  | "reg"            => NetCfg { name: "regtest",  donate: false, explorer: "" },
+        _                             => NetCfg { name: "mainnet",  donate: true,  explorer: "https://mempool.space/api" },
+    }
+}
+// is `a` a valid address for the chosen network? (a mainnet address on testnet4 — or vice-versa — pays
+// to the wrong chain / is unspendable). Prefixes: mainnet bc1/1/3 · testnet4 tb1/m/n/2 · regtest bcrt1/m/n/2.
+fn addr_ok(net: &str, a: &str) -> bool {
+    match net {
+        "testnet4" => a.starts_with("tb1")   || a.starts_with('m') || a.starts_with('n') || a.starts_with('2'),
+        "regtest"  => a.starts_with("bcrt1") || a.starts_with('m') || a.starts_with('n') || a.starts_with('2'),
+        _          => a.starts_with("bc1")   || a.starts_with('1') || a.starts_with('3'),
+    }
 }
 
 // ── locate gpu_grind + blake2b.cl (env override → next to the binary → repo layout → PATH) ──
@@ -98,6 +109,9 @@ struct Stats {
     net_miners: u64,
     net_ghs: f64,
     net_height: u64,
+    network: String,        // mainnet | testnet4 | regtest
+    balance_ok: bool,
+    balance_btc: f64,       // confirmed balance of the mining address (via explorer)
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -399,8 +413,9 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
                 continue;
             }
         };
-        // best-effort donation session to the PyBLØCK pool (fixed — always PyBLØCK, not --pool)
-        let mut dev: Option<Conn> = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true);
+        // best-effort donation session to the PyBLØCK pool (fixed — always PyBLØCK, not --pool).
+        // Only on mainnet: donate==0 on testnet4/regtest (worthless coins) → no donation session.
+        let mut dev: Option<Conn> = if donate > 0.0 { Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true) } else { None };
         { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
           st.logline(format!("connected to PyBLØCK LOTTO BLAKE2b {}", pool)); }
 
@@ -498,20 +513,32 @@ fn ui(f: &mut Frame, st: &Stats) {
     ]).split(f.area());
 
     let dot = if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) } else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
+    let (net_txt, net_col) = match st.network.as_str() {
+        "mainnet"  => (" MAINNET ",  GRN),
+        "testnet4" => (" TESTNET4 ", YLW),
+        _          => (" REGTEST ",  AMB),
+    };
+    let net_span = Span::styled(net_txt, Style::new().fg(Color::Black).bg(net_col).add_modifier(Modifier::BOLD));
+    let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
+    let mut line2: Vec<Span> = vec![
+        Span::styled("your address  ", Style::new().fg(MUT)),
+        Span::styled(st.addr.clone(), Style::new().fg(CYN)),
+        Span::styled(format!("   {}", bal), Style::new().fg(GRN)),
+        Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
+        Span::styled("pool fee 0.9%", Style::new().fg(PNK)),
+    ];
+    if st.donate > 0.0 {
+        line2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB)));
+    }
     let head = Paragraph::new(Text::from(vec![
         Line::from(vec![
             Span::styled("PyBLØCK", Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
             Span::styled("  LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)),
-            Span::raw("   "), dot,
+            Span::raw("  "), net_span,
+            Span::raw("  "), dot,
             Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT)),
         ]),
-        Line::from(vec![
-            Span::styled("your address  ", Style::new().fg(MUT)),
-            Span::styled(st.addr.clone(), Style::new().fg(CYN)),
-            Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
-            Span::styled("pool fee 0.9%", Style::new().fg(PNK)),
-            Span::styled(format!(" · donation {:.1}% hash → PyBLØCK", st.donate), Style::new().fg(AMB)),
-        ]),
+        Line::from(line2),
     ])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
         .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN))));
     f.render_widget(head, chunks[0]);
@@ -567,10 +594,15 @@ fn ui(f: &mut Frame, st: &Stats) {
     f.render_widget(List::new(items)
         .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), chunks[5]);
 
+    let disc = match st.network.as_str() {
+        "testnet4" => "TESTNET4 — real public BLAKE2b chain, but testnet coins have NO monetary value. Don't trust, verify.",
+        "regtest"  => "REGTEST demo — the coin is not real Bitcoin, no value. Don't trust, verify.",
+        _          => "MAINNET — until the BLAKE2b hardfork activates, mainnet is still SHA-256 (no BLAKE2b blocks yet, no date). Don't trust, verify.",
+    };
     f.render_widget(Paragraph::new(Line::from(vec![
         Span::styled(" q ", Style::new().fg(Color::Black).bg(GRN)),
         Span::styled(" quit   ", Style::new().fg(MUT)),
-        Span::styled("Until the BLAKE2b hardfork activates on mainnet this is a REGTEST demo (no value). Don't trust, verify.", Style::new().fg(MUT)),
+        Span::styled(disc, Style::new().fg(MUT)),
     ])).wrap(Wrap { trim: true }), chunks[6]);
 }
 
@@ -586,6 +618,17 @@ fn poll_network_stats() -> Option<(u64, f64, u64)> {
     ))
 }
 
+// poll the confirmed balance (BTC) of the mining address from a public explorer (per network).
+fn poll_balance(explorer: &str, addr: &str) -> Option<f64> {
+    if explorer.is_empty() { return None; }   // regtest has no public explorer
+    let url = format!("{}/address/{}", explorer, addr);
+    let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    let funded = v.pointer("/chain_stats/funded_txo_sum").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let spent  = v.pointer("/chain_stats/spent_txo_sum").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    Some((funded - spent) / 1e8)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut pool = "pool.pyblock.xyz:23110".to_string();
@@ -594,11 +637,13 @@ fn main() {
     let mut cpu_threads: usize = 0;
     let mut use_cpu = false;
     let mut donate = DONATE_MIN;
+    let mut network = "mainnet".to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--pool" => { i += 1; if i < args.len() { pool = args[i].clone(); } }
             "--addr" => { i += 1; if i < args.len() { addr = args[i].clone(); } }
+            "--network" | "--net" | "--chain" => { i += 1; if i < args.len() { network = args[i].clone(); } }
             "--gpus" => { i += 1; if i < args.len() { gpus = args[i].parse().ok(); } }
             "--cpu" => { use_cpu = true; }
             "--cpu-threads" => { i += 1; if i < args.len() { cpu_threads = args[i].parse().unwrap_or(0); use_cpu = true; } }
@@ -607,28 +652,27 @@ fn main() {
         }
         i += 1;
     }
+    let nc = net_cfg(&network);
+    let network = nc.name.to_string();   // normalize aliases (t4 → testnet4, reg → regtest)
     if addr.is_empty() {
-        eprintln!("usage: pyblockMiner --addr <mainnet_btc_address> [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N] [--donate PCT]");
-        eprintln!("tip: generate a mainnet address with  python3 tools/genaddr.py");
+        eprintln!("usage: pyblockMiner --addr <btc_address> [--network mainnet|testnet4|regtest] [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N] [--donate PCT]");
+        eprintln!("tip: generate an address with  python3 tools/genaddr.py");
         std::process::exit(2);
     }
-    // mainnet-only: regtest/testnet rewards are unspendable on the real chain → refuse to mine.
-    match addr_kind(&addr) {
-        "mainnet" => {}
-        "test" => {
-            eprintln!("✗ '{}' looks like a REGTEST/TESTNET address.", addr);
-            eprintln!("  pyblockMiner mines for the mainnet BLAKE2b chain — rewards to a regtest/testnet");
-            eprintln!("  address would be UNSPENDABLE. Use a MAINNET address (bc1… / 1… / 3…).");
-            eprintln!("  generate one with:  python3 tools/genaddr.py");
-            std::process::exit(2);
-        }
-        _ => {
-            eprintln!("✗ '{}' is not a recognized Bitcoin address.", addr);
-            eprintln!("  use a MAINNET address (bc1… / 1… / 3…). generate one with:  python3 tools/genaddr.py");
-            std::process::exit(2);
-        }
+    // address must match the chosen network (a wrong-network address is unspendable / pays the wrong chain)
+    if !addr_ok(&network, &addr) {
+        let want = match network.as_str() {
+            "testnet4" => "a TESTNET4 address (tb1… / m… / n… / 2…)",
+            "regtest"  => "a REGTEST address (bcrt1… / m… / n… / 2…)",
+            _          => "a MAINNET address (bc1… / 1… / 3…)",
+        };
+        eprintln!("✗ '{}' is not valid for --network {}.", addr, network);
+        eprintln!("  use {} — rewards to a wrong-network address are unspendable.", want);
+        eprintln!("  generate one with:  python3 tools/genaddr.py");
+        std::process::exit(2);
     }
-    if donate < DONATE_MIN { donate = DONATE_MIN; } // floor — thank you 🙏
+    // donation only on mainnet (testnet/regtest coins have no value → nothing to donate)
+    if !nc.donate { donate = 0.0; } else if donate < DONATE_MIN { donate = DONATE_MIN; }
     let detected = gpu_names().len() as u32;
     let ngpu = gpus.unwrap_or(detected);
     if ngpu == 0 { use_cpu = true; } // no GPU → mine on CPU
@@ -638,7 +682,7 @@ fn main() {
     if !use_cpu { cpu_threads = 0; }
 
     let stats = Arc::new(Mutex::new(Stats::default()));
-    { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); st.donate = donate; }
+    { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); st.donate = donate; st.network = network.clone(); }
     {
         let stats = stats.clone();
         let (p, a) = (pool.clone(), addr.clone());
@@ -653,6 +697,18 @@ fn main() {
                 None => { stats.lock().unwrap().net_ok = false; }
             }
             std::thread::sleep(Duration::from_secs(15));
+        });
+    }
+    // balance poller: confirmed balance of your mining address (per-network public explorer)
+    {
+        let stats = stats.clone();
+        let (explorer, a) = (nc.explorer.to_string(), addr.clone());
+        std::thread::spawn(move || loop {
+            match poll_balance(&explorer, &a) {
+                Some(b) => { let mut st = stats.lock().unwrap(); st.balance_ok = true; st.balance_btc = b; }
+                None => { stats.lock().unwrap().balance_ok = false; }
+            }
+            std::thread::sleep(Duration::from_secs(60));
         });
     }
 

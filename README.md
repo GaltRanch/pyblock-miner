@@ -25,6 +25,10 @@ GPU 1  RTX 5090   15.5 GH/s
 - An **NVIDIA GPU** (one or more) with the proprietary driver + OpenCL (`nvidia-smi` and `libOpenCL`). **No GPU?** It falls back to CPU.
 - **Rust** (`cargo`) — https://rustup.rs
 - **gcc** (to build the OpenCL host)
+- **OpenCL headers + ICD loader** (to compile the grinder). Many systems have the NVIDIA runtime but **not** the dev headers → the classic `CL/cl.h: No such file or directory` build error. Install them:
+  - Debian/Ubuntu: `sudo apt install ocl-icd-opencl-dev opencl-headers`
+  - Fedora: `sudo dnf install ocl-icd-devel opencl-headers`
+  - Arch: `sudo pacman -S opencl-icd-loader opencl-headers`
 - **Python 3** with `ecdsa` (only for the address generator): `pip install ecdsa`
 
 ## Build
@@ -55,12 +59,15 @@ Options:
 
 | flag | default | meaning |
 |------|---------|---------|
-| `--addr <addr>` | *(required)* | your **mainnet** Bitcoin address — every block you find pays 99.1% here |
+| `--addr <addr>` | *(required)* | your Bitcoin address for the chosen `--network` — every block you find pays 99.1% here |
+| `--network <net>` | `mainnet` | which chain: `mainnet` (bc1…/1…/3…), `testnet4` (tb1…/m…/n…/2…), or `regtest` (bcrt1…/m…/n…/2…). Sets the accepted address type; the dev donation applies **only on mainnet** (testnet/regtest coins have no value). |
 | `--pool <host:port>` | `pool.pyblock.xyz:23110` | the pool to mine on (selectable) |
 | `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = none) |
 | `--cpu` | off | also mine on the CPU (added as an extra worker) |
 | `--cpu-threads <N>` | auto (all cores) | CPU threads to use |
-| `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (minimum 2.0, see below) |
+| `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (mainnet only, minimum 2.0, see below) |
+
+The TUI shows a **network badge** (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from a public explorer), your hashrate/blocks, and live network cards (miners online + network hashrate).
 
 Press **`q`** to quit. Run it in a real terminal (it's a full-screen TUI).
 
