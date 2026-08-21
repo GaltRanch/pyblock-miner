@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# pyblock_genaddr — generates a Bitcoin address (bc1q…, standard format) + its private key (WIF),
-# to use as your "username" when mining BLAKE2b on PyBLØCK's REGTEST pool (demo).
-# On the pool you keep 99.1% of every block you find, straight to THAT address (PyBLØCK fee 0.9%). Non-custodial.
-# ⚠ It's a REGTEST test pool: the coin is NOT real Bitcoin, it has no value. It's for testing mining.
-# Usage: python3 pyblock_genaddr.py [count]
+# pyblock_genaddr — generates a Bitcoin address + its private key (WIF), to use as your "username"
+# when mining BLAKE2b on a PyBLØCK pool. You keep 99.1% of every block you find, straight to THAT
+# address (PyBLØCK pool fee 0.9%). Non-custodial.
+#   mainnet  → bc1q…   (default; --mainnet)
+#   testnet4 → tb1q…   (--testnet4)  ← for mining the testnet4 BLAKE2b chain (coins have NO value)
+# Usage: python3 pyblock_genaddr.py [--testnet4 | --network mainnet|testnet4] [count]
 import sys, hashlib
 from ecdsa import SigningKey, SECP256k1
 
@@ -43,26 +44,42 @@ def encode_segwit(hrp, witver, prog):
     combined = data + _checksum(hrp, data)
     return hrp + "1" + "".join(_CH[d] for d in combined)
 
-def gen():
+def gen(net):
+    hrp     = "tb"      if net == "testnet4" else "bc"         # bech32 HRP
+    wif_ver = b"\xef"   if net == "testnet4" else b"\x80"      # WIF network byte
     sk = SigningKey.generate(curve=SECP256k1)
     priv = sk.to_string()
     xy = sk.verifying_key.to_string(); x, y = xy[:32], xy[32:]
     pub = (b"\x02" if y[-1] % 2 == 0 else b"\x03") + x        # pubkey comprimida
-    addr = encode_segwit("bc", 0, _hash160(pub))               # p2wpkh mainnet
-    wif = b58check(b"\x80" + priv + b"\x01")                    # WIF comprimido
+    addr = encode_segwit(hrp, 0, _hash160(pub))               # p2wpkh
+    wif = b58check(wif_ver + priv + b"\x01")                   # WIF comprimido
     return addr, wif
 
-n = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+# ── args: [--testnet4 | --mainnet | --network <net>] [count] ──
+net = "mainnet"; count = 1; a = sys.argv[1:]; i = 0
+while i < len(a):
+    if a[i] in ("--testnet4", "--t4", "--testnet"): net = "testnet4"
+    elif a[i] == "--mainnet": net = "mainnet"
+    elif a[i] == "--network" and i + 1 < len(a): i += 1; net = a[i]
+    elif a[i].isdigit(): count = int(a[i])
+    i += 1
+if net not in ("mainnet", "testnet4"): net = "mainnet"
+label = "TESTNET4" if net == "testnet4" else "MAINNET"
+
 print("─" * 64)
-print(" PyBLØCK · BLAKE2b mining address · REGTEST pool (demo)")
+print(f" PyBLØCK · BLAKE2b mining address · {label}")
 print("─" * 64)
-for i in range(max(1, n)):
-    addr, wif = gen()
-    if n > 1: print(f"\n #{i+1}")
-    print(f"  Address (use this as your USERNAME in the miner):\n    {addr}")
+for k in range(max(1, count)):
+    addr, wif = gen(net)
+    if count > 1: print(f"\n #{k+1}")
+    print(f"  Address (use this as your --addr in the miner):\n    {addr}")
     print(f"  Private key (WIF · save it, it's YOURS):\n    {wif}")
 print("─" * 64)
-print(" You mine to YOUR address → you keep 99.1% of every block · PyBLØCK fee 0.9%")
-print(" ⚠ REGTEST test pool: the coin is NOT real Bitcoin, it has no value.")
-print("   It's for testing BLAKE2b mining (the hardfork isn't active on mainnet yet).")
+print(" You mine to YOUR address → you keep 99.1% of every block · PyBLØCK pool fee 0.9%")
+if net == "testnet4":
+    print(" ⚠ TESTNET4: a real public BLAKE2b chain, but testnet coins have NO monetary value.")
+    print("   Mine with:  pyblockMiner --network testnet4 --addr <this tb1…> --pool <host:port>")
+else:
+    print(" ⚠ MAINNET: until the BLAKE2b hardfork activates, mainnet is still SHA-256 (no BLAKE2b")
+    print("   blocks yet, no date). Mine with:  pyblockMiner --addr <this bc1…>")
 print("─" * 64)

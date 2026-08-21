@@ -39,15 +39,16 @@ GPU 1  RTX 5090   15.5 GH/s
 
 This compiles the OpenCL grinder (`gpu/gpu_grind`) and the miner (`target/release/pyblockMiner`).
 
-## 1) Get a mainnet address
+## 1) Get an address
 
-Generate a Bitcoin **mainnet** address (this is your mining "username" — you keep the private key):
+Generate an address for your `--network` (this is your mining "username" — you keep the private key):
 
 ```bash
-python3 tools/genaddr.py
+python3 tools/genaddr.py              # mainnet  → bc1…
+python3 tools/genaddr.py --testnet4   # testnet4 → tb1…
 ```
 
-It prints a `bc1…` address and its WIF private key. Save the key — it's yours. (You can also use any mainnet Bitcoin address you already control.)
+It prints the address and its WIF private key. Save the key — it's yours. (You can also use any address you already control on that network.)
 
 ## 2) Mine
 
