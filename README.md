@@ -2,21 +2,28 @@
 
 **A GPU/CPU miner for the PyBLØCK LOTTO BLAKE2b pool — Bitcoin BLAKE2b, solo lottery, non-custodial.**
 
-A terminal (TUI) miner: you mine to **your own mainnet** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
+A terminal (TUI) miner: you mine to **your own** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
+
+It's a **tabbed app** — everything is in the program, no restarts needed:
 
 ```
-⛏ Bitcoin BLAKE2b · solo lottery
-PyBLØCK  LOTTO BLAKE2b   ● LIVE   pool.pyblock.xyz:23110
-your address  bc1q…      keep 99.1% · pool fee 0.9% · donation 2.0% hash → PyBLØCK
-┌ YOUR HASHRATE ┐ ┌ BLOCKS FOUND ┐ ┌ DIFFICULTY ┐
-│    26.5 GH/s    │ │      3       │ │   bits 2    │
-┌ ◈ MINERS ONLINE ┐ ┌ ◈ NETWORK HASHRATE ┐ ┌ ◈ POOL HEIGHT ┐
-│        7         │ │      184 GH/s        │ │    842 190    │
-GPU 0  RTX 4090   11.0 GH/s
-GPU 1  RTX 5090   15.5 GH/s
+PyBLØCK  1·MINE  2·STRATUMS  3·LEARN  4·NETWORK  5·SETUP  6·HELP
+┌ ⛏ Bitcoin BLAKE2b · solo lottery ──────────────────────────────────┐
+│ LOTTO BLAKE2b   TESTNET4   ● LIVE   pool.pyblock.xyz:23111          │
+│ your address  tb1q…   balance 0.00000000 BTC   keep 99.1% · fee 0.9%│
+├ YOUR HASHRATE ┤ ├ BLOCKS FOUND ┤ ├ DIFFICULTY ┤                     │
+│    26.5 GH/s   │ │      3       │ │   bits 2   │                     │
+├ ◈ MINERS ONLINE ┤ ├ ◈ NETWORK HASHRATE ┤ ├ ◈ POOL HEIGHT ┤         │
+│        7         │ │      184 GH/s        │ │    149 460    │        │
+│ GPU 0  RTX 4090   11.0 GH/s    GPU 1  RTX 5090   15.5 GH/s          │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-> ⚠️ **Honest framing — read this.** BLAKE2b is a *proposed* proof-of-work change for Bitcoin (Bitcoin Knots [PR #359](https://github.com/bitcoinknots/bitcoin/pull/359)). It is **not merged and not active on mainnet — there is no activation date.** Until it activates, `pool.pyblock.xyz:23110` is a **regtest demo pool**: the coin it mines is **not real Bitcoin and has no value.** This exists so miners can test BLAKE2b mining and see that they get paid to their own address, **ready for the day (if ever) the network changes its PoW.** Because it targets mainnet, the miner **requires a mainnet address** (`bc1…` / `1…` / `3…`) and refuses regtest/testnet addresses. Don't trust, verify.
+- **STRATUMS** — pick a pool and **switch it live, without leaving the miner.** PyBLØCK's pools are there by default (mainnet / testnet4 / regtest); add your own custom stratums too.
+- **SETUP** — generate or paste your address, per network; toggle CPU and the donation. Everything **auto-saves** to a config file, so you don't re-type flags.
+- **LEARN / HELP** — what BLAKE2b is, the honest hardfork status, and troubleshooting (incl. the OpenCL-headers fix).
+
+> ⚠️ **Honest framing — read this.** BLAKE2b is a *proposed* proof-of-work change for Bitcoin (Bitcoin Knots [PR #359](https://github.com/bitcoinknots/bitcoin/pull/359)). It is **not merged and not active on Bitcoin mainnet — there is no activation date.** Mainnet is still SHA-256. The **first public chain** where you can actually mine BLAKE2b is **testnet4**, where the change activates at **block 149460** (Bitcoin Knots 29.4.1 RC) — but **testnet4 coins have no monetary value.** `pool.pyblock.xyz:23110` is a **regtest demo** (coin is not real Bitcoin, no value). This exists so miners can test BLAKE2b mining and see they get paid to their own address, **ready for the day (if ever) mainnet changes its PoW.** Each network needs its own address type (`bc1…` mainnet · `tb1…` testnet4 · `bcrt1…` regtest); the dev donation applies **only on mainnet**. Don't trust, verify.
 
 ---
 
@@ -41,36 +48,48 @@ This compiles the OpenCL grinder (`gpu/gpu_grind`) and the miner (`target/releas
 
 ## 1) Get an address
 
-Generate an address for your `--network` (this is your mining "username" — you keep the private key):
+Easiest: launch the miner, go to **SETUP** (`5`), press **`g`** to generate an address for the selected network (or **`e`** to paste one you already control). It's saved for you.
+
+Or from the shell (this is your mining "username" — you keep the private key):
 
 ```bash
 python3 tools/genaddr.py              # mainnet  → bc1…
 python3 tools/genaddr.py --testnet4   # testnet4 → tb1…
+python3 tools/genaddr.py --regtest    # regtest  → bcrt1…
 ```
 
-It prints the address and its WIF private key. Save the key — it's yours. (You can also use any address you already control on that network.)
+It prints the address and its WIF private key. Save the key — it's yours.
 
 ## 2) Mine
 
 ```bash
-./target/release/pyblockMiner --addr <your_mainnet_address>
+./target/release/pyblockMiner
 ```
 
-Options:
+That's it — on first run it opens with PyBLØCK's default stratums. Use **SETUP** to set your address and **STRATUMS** to pick/switch pools; your choices **persist** in `~/.config/pyblockminer/config.json`, so next time you just run `pyblockMiner`.
+
+Flags are **optional overrides** (the saved config is otherwise the source of truth):
 
 | flag | default | meaning |
 |------|---------|---------|
-| `--addr <addr>` | *(required)* | your Bitcoin address for the chosen `--network` — every block you find pays 99.1% here |
-| `--network <net>` | `mainnet` | which chain: `mainnet` (bc1…/1…/3…), `testnet4` (tb1…/m…/n…/2…), or `regtest` (bcrt1…/m…/n…/2…). Sets the accepted address type; the dev donation applies **only on mainnet** (testnet/regtest coins have no value). |
-| `--pool <host:port>` | `pool.pyblock.xyz:23110` | the pool to mine on (selectable) |
-| `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = none) |
+| `--addr <addr>` | *(from config / SETUP)* | your Bitcoin address for the selected network — every block you find pays 99.1% here |
+| `--network <net>` | *(from selected stratum)* | selects the stratum for that chain: `mainnet` (bc1…/1…/3…), `testnet4` (tb1…/m…/n…/2…), or `regtest` (bcrt1…/m…/n…/2…). The dev donation applies **only on mainnet** (testnet/regtest coins have no value). |
+| `--pool <host:port>` | *(selected stratum's URL)* | override the selected stratum's URL |
+| `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = CPU only) |
 | `--cpu` | off | also mine on the CPU (added as an extra worker) |
-| `--cpu-threads <N>` | auto (all cores) | CPU threads to use |
 | `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (mainnet only, minimum 2.0, see below) |
 
-The TUI shows a **network badge** (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from a public explorer), your hashrate/blocks, and live network cards (miners online + network hashrate).
+### Keys
 
-Press **`q`** to quit. Run it in a real terminal (it's a full-screen TUI).
+| key | action |
+|-----|--------|
+| `1`–`6` / `Tab` | switch tabs (MINE · STRATUMS · LEARN · NETWORK · SETUP · HELP) |
+| `q` / `Esc` | quit (`Esc` also cancels a text input) |
+| STRATUMS: `↑↓` `Enter` `a` `d` | move · **switch live** · add custom · delete custom |
+| SETUP: `g` `e` `c` `+/-` | generate address · edit/paste address · toggle CPU · donation |
+| LEARN: `←` `→` | previous / next info page |
+
+The **MINE** tab shows a network badge (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from a public explorer), your hashrate/blocks, and live network cards (miners online + network hashrate). Run it in a real terminal (it's a full-screen TUI).
 
 **No GPU?** It falls back to **CPU mining** automatically (much slower — CPUs do ~MH/s vs GPUs' GH/s, but it works). Force it with `--gpus 0`, or add CPU alongside your GPUs with `--cpu`.
 
@@ -99,12 +118,14 @@ addr  1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2
 ## Files
 
 ```
-src/main.rs        the miner (Rust + ratatui TUI)
+src/main.rs        the miner (Rust + ratatui TUI: tabs, live stratum switching, saved config)
 gpu/gpu_grind.c    OpenCL host: search_b2b kernel driver, oneshot + persistent daemon modes
 gpu/blake2b.cl     BLAKE2b-256 OpenCL kernel
-tools/genaddr.py   Bitcoin address + WIF generator
+tools/genaddr.py   Bitcoin address + WIF generator (mainnet / testnet4 / regtest)
 build.sh           builds everything
 ```
+
+Config is saved at `~/.config/pyblockminer/config.json` (stratums, selected pool, per-network addresses, donation, devices).
 
 ## License
 

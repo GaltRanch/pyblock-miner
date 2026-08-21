@@ -45,8 +45,9 @@ def encode_segwit(hrp, witver, prog):
     return hrp + "1" + "".join(_CH[d] for d in combined)
 
 def gen(net):
-    hrp     = "tb"      if net == "testnet4" else "bc"         # bech32 HRP
-    wif_ver = b"\xef"   if net == "testnet4" else b"\x80"      # WIF network byte
+    if net == "regtest":    hrp, wif_ver = "bcrt", b"\xef"     # regtest bech32 HRP + testnet WIF byte
+    elif net == "testnet4": hrp, wif_ver = "tb",   b"\xef"
+    else:                   hrp, wif_ver = "bc",   b"\x80"     # mainnet
     sk = SigningKey.generate(curve=SECP256k1)
     priv = sk.to_string()
     xy = sk.verifying_key.to_string(); x, y = xy[:32], xy[32:]
@@ -60,11 +61,12 @@ net = "mainnet"; count = 1; a = sys.argv[1:]; i = 0
 while i < len(a):
     if a[i] in ("--testnet4", "--t4", "--testnet"): net = "testnet4"
     elif a[i] == "--mainnet": net = "mainnet"
+    elif a[i] in ("--regtest", "--reg"): net = "regtest"
     elif a[i] == "--network" and i + 1 < len(a): i += 1; net = a[i]
     elif a[i].isdigit(): count = int(a[i])
     i += 1
-if net not in ("mainnet", "testnet4"): net = "mainnet"
-label = "TESTNET4" if net == "testnet4" else "MAINNET"
+if net not in ("mainnet", "testnet4", "regtest"): net = "mainnet"
+label = {"testnet4": "TESTNET4", "regtest": "REGTEST"}.get(net, "MAINNET")
 
 print("─" * 64)
 print(f" PyBLØCK · BLAKE2b mining address · {label}")
@@ -76,7 +78,10 @@ for k in range(max(1, count)):
     print(f"  Private key (WIF · save it, it's YOURS):\n    {wif}")
 print("─" * 64)
 print(" You mine to YOUR address → you keep 99.1% of every block · PyBLØCK pool fee 0.9%")
-if net == "testnet4":
+if net == "regtest":
+    print(" ⚠ REGTEST: a local demo chain — the coin is NOT real Bitcoin and has NO value.")
+    print("   Mine with:  pyblockMiner --network regtest --addr <this bcrt1…> --pool <host:port>")
+elif net == "testnet4":
     print(" ⚠ TESTNET4: a real public BLAKE2b chain, but testnet coins have NO monetary value.")
     print("   Mine with:  pyblockMiner --network testnet4 --addr <this tb1…> --pool <host:port>")
 else:

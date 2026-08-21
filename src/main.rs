@@ -1,39 +1,25 @@
 // pyblockMiner — PyBLØCK LOTTO BLAKE2b miner (Bitcoin BLAKE2b, solo lottery). Rust + ratatui TUI.
-// Native SV1 stratum client + work construction + N-GPU grinding via persistent `gpu_grind` daemons
-// (one per GPU, OpenCL kernel compiled once → all GPUs saturated, no per-sweep overhead).
-// You mine to YOUR mainnet address → keep 99.1% of every block · PyBLØCK pool fee 0.9%. Non-custodial.
-// A small dev donation (default 0.4%, like xmrig) rewards the miner's author — see DEV_DONATION_ADDR.
+// Tabbed app: MINE dashboard · STRATUMS (switch pools live, no restart) · LEARN · NETWORK · SETUP · HELP.
+// Native SV1 stratum client + N-GPU/CPU BLAKE2b grinding via persistent gpu_grind daemons.
+// You mine to YOUR address → keep 99.1% of every block · PyBLØCK pool fee 0.9%. Non-custodial.
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
-// ── PyBLØCK hashrate donation (like xmrig's donate-level, but paid in HASH, not satoshis) ────────
-// You don't pay a wallet: for `donate%` of its sweeps the miner mines to the PyBLØCK LOTTO BLAKE2b
-// pool below — regardless of which pool you choose as your primary (--pool). Default and minimum 2%,
-// raise it with --donate <pct>. Separate from any pool's own fee. Mechanism: a 2nd stratum
-// connection to the PyBLØCK pool grinds ~donate% of the time, so ~donate% of your hashrate (and of
-// any blocks that fraction finds) supports PyBLØCK.
-const DONATE_POOL: &str = "pool.pyblock.xyz:23110";                   // PyBLØCK LOTTO BLAKE2b pool
-const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2"; // PyBLØCK address on that pool
-const DONATE_MIN: f64 = 2.0; // percent of hashrate — floor and default
-
-// public network-stats endpoint (per network; regtest has none → cards show "—")
-fn net_stats_url(net: &str) -> Option<&'static str> {
-    match net {
-        "mainnet"  => Some("https://pool.pyblock.xyz:8443/api/blake_stats.php"),
-        "testnet4" => Some("https://pool.pyblock.xyz:8443/api/blake_stats_t4.php"),
-        _          => None,
-    }
-}
+// ── PyBLØCK hashrate donation (like xmrig, but paid in HASH not satoshis; mainnet only) ──
+const DONATE_POOL: &str = "pool.pyblock.xyz:23110";
+const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
+const DONATE_MIN: f64 = 2.0;
 
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
@@ -44,8 +30,7 @@ const AMB: Color = Color::Rgb(224, 176, 53);
 const PNK: Color = Color::Rgb(255, 92, 200);
 const BRD: Color = Color::Rgb(35, 60, 35);
 
-// ── network selection: mine on mainnet, testnet4, or regtest ──
-// donation only on mainnet (testnet/regtest coins have no value); explorer used for the balance card.
+// ── network config: mainnet | testnet4 | regtest ──
 struct NetCfg { name: &'static str, donate: bool, explorer: &'static str }
 fn net_cfg(net: &str) -> NetCfg {
     match net {
@@ -54,8 +39,6 @@ fn net_cfg(net: &str) -> NetCfg {
         _                             => NetCfg { name: "mainnet",  donate: true,  explorer: "https://mempool.space/api" },
     }
 }
-// is `a` a valid address for the chosen network? (a mainnet address on testnet4 — or vice-versa — pays
-// to the wrong chain / is unspendable). Prefixes: mainnet bc1/1/3 · testnet4 tb1/m/n/2 · regtest bcrt1/m/n/2.
 fn addr_ok(net: &str, a: &str) -> bool {
     match net {
         "testnet4" => a.starts_with("tb1")   || a.starts_with('m') || a.starts_with('n') || a.starts_with('2'),
@@ -63,18 +46,70 @@ fn addr_ok(net: &str, a: &str) -> bool {
         _          => a.starts_with("bc1")   || a.starts_with('1') || a.starts_with('3'),
     }
 }
-
-// ── locate gpu_grind + blake2b.cl (env override → next to the binary → repo layout → PATH) ──
-fn gpu_dir() -> String {
-    if let Ok(d) = std::env::var("PYBLOCK_GPU_DIR") {
-        return d;
+// public network-stats endpoint per network (regtest has none → cards show "—")
+fn net_stats_url(net: &str) -> Option<&'static str> {
+    match net {
+        "mainnet"  => Some("https://pool.pyblock.xyz:8443/api/blake_stats.php"),
+        "testnet4" => Some("https://pool.pyblock.xyz:8443/api/blake_stats_t4.php"),
+        _          => None,
     }
+}
+
+// ── a stratum (pool) entry: PyBLØCK defaults + user's custom ones ──
+#[derive(Serialize, Deserialize, Clone)]
+struct Stratum { name: String, url: String, network: String, #[serde(default)] custom: bool }
+
+fn default_stratums() -> Vec<Stratum> {
+    vec![
+        Stratum { name: "PyBLØCK · mainnet".into(),  url: "pool.pyblock.xyz:23110".into(), network: "mainnet".into(),  custom: false },
+        Stratum { name: "PyBLØCK · testnet4".into(), url: "pool.pyblock.xyz:23111".into(), network: "testnet4".into(), custom: false },
+        Stratum { name: "PyBLØCK · regtest".into(),  url: "pool.pyblock.xyz:23110".into(), network: "regtest".into(),  custom: false },
+    ]
+}
+
+// ── persisted config ──
+#[derive(Serialize, Deserialize)]
+struct Config {
+    #[serde(default = "default_stratums")] stratums: Vec<Stratum>,
+    #[serde(default)] selected: usize,                 // index into stratums
+    #[serde(default)] addrs: HashMap<String, String>,  // network -> address
+    #[serde(default = "d_donate")] donate: f64,
+    #[serde(default)] gpus: Option<u32>,
+    #[serde(default)] cpu: bool,
+}
+fn d_donate() -> f64 { DONATE_MIN }
+impl Default for Config {
+    fn default() -> Self {
+        Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false }
+    }
+}
+fn config_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))
+        .unwrap_or_else(|| ".".into());
+    PathBuf::from(base).join("pyblockminer").join("config.json")
+}
+fn load_config() -> Config {
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_config(c: &Config) {
+    let p = config_path();
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Ok(s) = serde_json::to_string_pretty(c) { let _ = std::fs::write(&p, s); }
+}
+
+// ── live target shared engine↔UI: switch pools/network without restarting ──
+struct Target { pool: String, addr: String, network: String, donate: f64 }
+
+// ── locate gpu_grind + blake2b.cl ──
+fn gpu_dir() -> String {
+    if let Ok(d) = std::env::var("PYBLOCK_GPU_DIR") { return d; }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = exe.parent() {
             for cand in [p.join("gpu"), p.join("../../gpu"), p.to_path_buf()] {
-                if cand.join("blake2b.cl").exists() {
-                    return cand.to_string_lossy().into_owned();
-                }
+                if cand.join("blake2b.cl").exists() { return cand.to_string_lossy().into_owned(); }
             }
         }
     }
@@ -99,7 +134,7 @@ struct Stats {
     endpoint: String,
     addr: String,
     donate: f64,
-    donated: u64,      // blocks found during donation sweeps (paid to the developer)
+    donated: u64,
     diff: f64,
     bits: u32,
     gpu_ghs: Vec<f64>,
@@ -110,14 +145,13 @@ struct Stats {
     hr_hist: VecDeque<u64>,
     log: VecDeque<String>,
     started: Option<Instant>,
-    // PyBLØCK LOTTO network (all pyblockMiner users), polled from the pool stats endpoint
     net_ok: bool,
     net_miners: u64,
     net_ghs: f64,
     net_height: u64,
-    network: String,        // mainnet | testnet4 | regtest
+    network: String,
     balance_ok: bool,
-    balance_btc: f64,       // confirmed balance of the mining address (via explorer)
+    balance_btc: f64,
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -136,7 +170,6 @@ fn b2b(data: &[u8]) -> [u8; 32] {
     o.copy_from_slice(h.as_bytes());
     o
 }
-// target = (2^224-1) >> bits as a 32-byte big-endian array (same as gpu_grind's build_target)
 fn target_be(bits: u32) -> [u8; 32] {
     let mut base = [0u8; 32];
     for b in base.iter_mut().take(32).skip(4) { *b = 0xff; }
@@ -152,7 +185,6 @@ fn target_be(bits: u32) -> [u8; 32] {
     }
     out
 }
-// CPU BLAKE2b grinder (native Rust, multi-threaded). Sweeps [nstart, nstart+span), returns winning nonces.
 fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32, threads: usize, nstart: u64, span: u64) -> Vec<String> {
     let prevhash = hex::decode(prevhash_hex).unwrap_or_default();
     let mut ntime8 = hex::decode(ntime_hex).unwrap_or_default(); ntime8.resize(8, 0);
@@ -189,31 +221,17 @@ fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32
     out.into_inner().unwrap()
 }
 
-// ── persistent gpu_grind daemon (one per GPU) ──
-struct Daemon {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    name: String,
-    weight: f64,   // relative speed (GH/s of last grind) → proportional nonce-space split so all GPUs finish together
-}
+struct Daemon { _child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout>, name: String, weight: f64 }
 fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     let mut child = Command::new(gpu_bin())
         .args(["daemon", &dev.to_string()])
         .current_dir(gpu_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
     let stdin = child.stdin.take()?;
     let stdout = BufReader::new(child.stdout.take()?);
     Some(Daemon { _child: child, stdin, stdout, name, weight: 1.0 })
 }
-// Grind one job across ALL workers: GPU daemons (via stdin) + optional CPU threads, splitting the nonce
-// space proportionally to each worker's measured speed (so all finish together). GPU-only → sweeps 2^32;
-// CPU-only → sweeps only what the CPU can do per call (rotating extranonce next call).
-// Returns (winners, per-GPU GH/s, CPU GH/s).
 fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
              prevhash: &str, ntime: &str, work_root: &str, bits: u32) -> (Vec<String>, Vec<f64>, f64) {
     let secs = 0.35f64;
@@ -222,8 +240,6 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
     let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
     let total: u64 = gpu_caps.iter().sum::<u64>() + cpu_cap;
     let sweep: u64 = if total == 0 || total >= space { space } else { total };
-
-    // dispatch GPU jobs (they grind in the background while the CPU grinds)
     let mut cursor: u64 = 0;
     for (i, d) in ds.iter_mut().enumerate() {
         let span = if total > 0 { (sweep as u128 * gpu_caps[i] as u128 / total as u128) as u64 } else { 0 };
@@ -231,7 +247,6 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
         let _ = d.stdin.flush();
         cursor += span;
     }
-    // CPU grinds the remaining range in parallel with the GPUs
     let mut nonces: Vec<String> = vec![];
     let mut cpu_ghs = 0.0f64;
     if cpu_threads > 0 && cursor < sweep {
@@ -243,22 +258,19 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
         if cpu_ghs > 0.0 { *cpu_rate = cpu_ghs; }
         nonces.extend(w);
     }
-    // collect GPU winners
     let mut gpu_ghs = vec![0.0f64; ds.len()];
     for (i, d) in ds.iter_mut().enumerate() {
         loop {
             let mut line = String::new();
             match d.stdout.read_line(&mut line) {
-                Ok(0) | Err(_) => break, // daemon died
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let t = line.trim();
                     if let Some(rest) = t.strip_prefix("END ") {
                         gpu_ghs[i] = rest.parse().unwrap_or(0.0);
                         if gpu_ghs[i] > 0.0 { d.weight = gpu_ghs[i]; }
                         break;
-                    } else if !t.is_empty() {
-                        nonces.push(t.to_string());
-                    }
+                    } else if !t.is_empty() { nonces.push(t.to_string()); }
                 }
             }
         }
@@ -272,20 +284,9 @@ fn send(stream: &mut TcpStream, v: &Value) {
     let _ = stream.write_all(s.as_bytes());
 }
 
-// ── one stratum connection (the "you" session and the "dev donation" session are both Conn) ──
 struct Conn {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    en1: Option<String>,
-    en2size: usize,
-    diff: f64,
-    job: Option<Vec<Value>>,
-    en2ctr: u64,
-    pending: HashMap<u64, String>,
-    subid: u64,
-    addr: String,
-    is_dev: bool,
-    idle: Instant,
+    stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
+    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, String>, subid: u64, addr: String, is_dev: bool, idle: Instant,
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
@@ -294,17 +295,13 @@ impl Conn {
         let sub_ua = if is_dev { "PyBLOCK-GPU/BLAKE2b-donate" } else { "PyBLOCK-GPU/BLAKE2b" };
         send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":[sub_ua]}));
         send(&mut stream, &json!({"id":2,"method":"mining.authorize","params":[addr,"x"]}));
-        Some(Conn {
-            stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
-            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev,
-            idle: Instant::now(),
-        })
+        Some(Conn { stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
+            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now() })
     }
-    // pump the socket: parse messages, update job/diff/subscribe/submit-results. Returns false if dead.
     fn pump(&mut self, stats: &Arc<Mutex<Stats>>) -> bool {
         let mut tmp = [0u8; 8192];
         match self.stream.read(&mut tmp) {
-            Ok(0) => return false,                 // peer closed
+            Ok(0) => return false,
             Ok(n) => { self.buf.extend_from_slice(&tmp[..n]); self.idle = Instant::now(); }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return false,
@@ -340,12 +337,10 @@ impl Conn {
                     let mut st = stats.lock().unwrap();
                     if m.get("result") == Some(&Value::Bool(true)) {
                         if self.is_dev {
-                            st.donated += 1;
-                            let n = st.donated;
+                            st.donated += 1; let n = st.donated;
                             st.logline(format!("💚 donation block (#{}) → developer · thank you! · nonce {}", n, nonce));
                         } else {
-                            st.blocks += 1;
-                            let n = st.blocks;
+                            st.blocks += 1; let n = st.blocks;
                             st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
                         }
                     } else if m.get("error").map_or(false, |e| !e.is_null()) {
@@ -359,7 +354,6 @@ impl Conn {
         }
         true
     }
-    // job ready for grinding? returns (extranonce1, job array) when subscribed + a notify arrived.
     fn ready(&self) -> Option<(String, Vec<Value>)> {
         match (&self.en1, &self.job) {
             (Some(a), Some(b)) if b.len() >= 8 => Some((a.clone(), b.clone())),
@@ -368,7 +362,6 @@ impl Conn {
     }
 }
 
-// build the BLAKE2b work_root for a job/identity and return (prevhash, ntime, version, job_id, en2hex, work_root_hex)
 fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, String, String, String, String) {
     let prevhash = jobv[1].as_str().unwrap_or("").to_string();
     let job_id = jobv[0].as_str().unwrap_or("").to_string();
@@ -389,8 +382,8 @@ fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, S
     (prevhash, ntime, version, job_id, hex::encode(&en2), hex::encode(work_root))
 }
 
-fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_threads: usize, donate: f64) {
-    // spawn one persistent daemon per GPU (kernel compiled once → all GPUs stay saturated)
+// engine reads the shared Target; when pool/addr changes (live stratum switch) it reconnects.
+fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_threads: usize) {
     let names = gpu_names();
     let mut daemons: Vec<Daemon> = Vec::new();
     for dev in 0..ngpu {
@@ -404,51 +397,51 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
       st.gpu_ghs = vec![0.0; st.gpu_names.len()];
       let nworkers = st.gpu_names.len();
       let names_str = st.gpu_names.join(", ");
-      st.logline(format!("{} worker(s) ready: {}", nworkers, names_str));
-      if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK pool {} ({})", donate, DONATE_POOL, DEV_DONATION_ADDR)); } }
+      st.logline(format!("{} worker(s) ready: {}", nworkers, names_str)); }
 
-    let mut donate_credit = 0.0f64;              // accumulates `donate/100` per sweep; ≥1 → this sweep pays the dev
+    let mut donate_credit = 0.0f64;
     let mut dev_retry = Instant::now();
 
     loop {
+        // read current live target (pool/addr/donate change when the user switches stratum)
+        let (pool, addr, donate) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.donate) };
+        if addr.is_empty() {
+            { let mut st = stats.lock().unwrap(); st.connected = false;
+              st.logline("no address set — go to SETUP [5] to set/generate one".into()); }
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
         let mut user = match Conn::connect(&pool, &addr, false) {
             Some(c) => c,
             None => {
-                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("connection failed — retrying in 3s…".into()); }
+                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("connection failed to {} — retrying in 3s…", pool)); }
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
         };
-        // best-effort donation session to the PyBLØCK pool (fixed — always PyBLØCK, not --pool).
-        // Only on mainnet: donate==0 on testnet4/regtest (worthless coins) → no donation session.
         let mut dev: Option<Conn> = if donate > 0.0 { Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true) } else { None };
         { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
-          st.logline(format!("connected to PyBLØCK LOTTO BLAKE2b {}", pool)); }
+          st.logline(format!("connected to {}", pool));
+          if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
 
         loop {
-            if !user.pump(&stats) {
-                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); }
-                break;
-            }
+            // live switch: if the shared target's pool/addr changed, drop + reconnect
+            { let t = tgt.lock().unwrap();
+              if t.pool != pool || t.addr != addr {
+                stats.lock().unwrap().logline(format!("switching stratum → {}", t.pool)); break;
+              } }
+            if !user.pump(&stats) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); } break; }
             if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
             if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
-                dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true);
-                dev_retry = Instant::now();
+                dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true); dev_retry = Instant::now();
             }
-            if user.idle.elapsed() > Duration::from_secs(90) {
-                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); }
-                break;
-            }
+            if user.idle.elapsed() > Duration::from_secs(90) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); } break; }
 
-            // pick this sweep's identity: dev if its donation quota is due AND its job is ready, else you
             donate_credit += donate / 100.0;
             let dev_ready = dev.as_ref().and_then(|d| d.ready()).is_some();
             let do_donate = donate_credit >= 1.0 && dev_ready;
-
             let (en1v, jobv, is_dev) = if do_donate {
-                let d = dev.as_ref().unwrap();
-                let (a, b) = d.ready().unwrap();
-                (a, b, true)
+                let d = dev.as_ref().unwrap(); let (a, b) = d.ready().unwrap(); (a, b, true)
             } else {
                 match user.ready() { Some((a, b)) => (a, b, false), None => { std::thread::sleep(Duration::from_millis(60)); continue; } }
             };
@@ -471,7 +464,6 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
                 st.hr_hist.push_back(hv);
                 while st.hr_hist.len() > 160 { st.hr_hist.pop_front(); }
             }
-            // pump again — a new block during the grind makes our nonces stale (don't submit → no reject spam)
             user.pump(&stats);
             if let Some(d) = dev.as_mut() { d.pump(&stats); }
             let cur_prev = if is_dev {
@@ -482,137 +474,17 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
             if cur_prev == prevhash {
                 let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
                 for nh in nonces {
-                    conn.subid += 1;
-                    let sid = conn.subid;
+                    conn.subid += 1; let sid = conn.subid;
                     conn.pending.insert(sid, nh.clone());
                     send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
                 }
             } else if !nonces.is_empty() {
-                let mut st = stats.lock().unwrap();
-                st.logline(format!("· dropped {} stale (tip moved during grind)", nonces.len()));
+                stats.lock().unwrap().logline(format!("· dropped {} stale (tip moved during grind)", nonces.len()));
             }
         }
     }
 }
 
-fn tile(title: &str, value: Line<'static>, sub: &str, border: Color) -> Paragraph<'static> {
-    let text = Text::from(vec![
-        Line::from(Span::styled(title.to_string(), Style::new().fg(MUT))),
-        Line::from(""),
-        value,
-        Line::from(Span::styled(sub.to_string(), Style::new().fg(MUT))),
-    ]);
-    Paragraph::new(text).alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(border)))
-}
-
-fn ui(f: &mut Frame, st: &Stats) {
-    let gpu_h = (st.gpu_names.len().max(1) + 2).min(9) as u16;
-    let chunks = Layout::vertical([
-        Constraint::Length(4),        // header
-        Constraint::Length(6),        // your stat tiles
-        Constraint::Length(6),        // NETWORK tiles (all pyblockMiner users)
-        Constraint::Length(gpu_h),    // gpus
-        Constraint::Length(5),        // sparkline
-        Constraint::Min(3),           // log
-        Constraint::Length(1),        // footer
-    ]).split(f.area());
-
-    let dot = if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) } else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
-    let (net_txt, net_col) = match st.network.as_str() {
-        "mainnet"  => (" MAINNET ",  GRN),
-        "testnet4" => (" TESTNET4 ", YLW),
-        _          => (" REGTEST ",  AMB),
-    };
-    let net_span = Span::styled(net_txt, Style::new().fg(Color::Black).bg(net_col).add_modifier(Modifier::BOLD));
-    let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
-    let mut line2: Vec<Span> = vec![
-        Span::styled("your address  ", Style::new().fg(MUT)),
-        Span::styled(st.addr.clone(), Style::new().fg(CYN)),
-        Span::styled(format!("   {}", bal), Style::new().fg(GRN)),
-        Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
-        Span::styled("pool fee 0.9%", Style::new().fg(PNK)),
-    ];
-    if st.donate > 0.0 {
-        line2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB)));
-    }
-    let head = Paragraph::new(Text::from(vec![
-        Line::from(vec![
-            Span::styled("PyBLØCK", Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
-            Span::styled("  LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)),
-            Span::raw("  "), net_span,
-            Span::raw("  "), dot,
-            Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT)),
-        ]),
-        Line::from(line2),
-    ])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
-        .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN))));
-    f.render_widget(head, chunks[0]);
-
-    let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(chunks[1]);
-    f.render_widget(tile("YOUR HASHRATE", Line::from(vec![
-        Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
-        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len()), BRD), row[0]);
-    f.render_widget(tile("BLOCKS FOUND", Line::from(
-        Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
-        &format!("rejected {} · donated {}", st.rejected, st.donated), BRD), row[1]);
-    f.render_widget(tile("DIFFICULTY", Line::from(
-        Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
-        &format!("diff {:.0}", st.diff), BRD), row[2]);
-
-    // ── NETWORK cards: all pyblockMiner users on the PyBLØCK LOTTO pool (live) ──
-    let (nm, ng, nh) = if st.net_ok {
-        (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height))
-    } else { ("—".to_string(), "—".to_string(), "—".to_string()) };
-    let nrow = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(chunks[2]);
-    f.render_widget(tile("◈ MINERS ONLINE", Line::from(
-        Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), nrow[0]);
-    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![
-        Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)),
-        Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), nrow[1]);
-    f.render_widget(tile("◈ POOL HEIGHT", Line::from(
-        Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), nrow[2]);
-
-    let mut glines: Vec<Line> = vec![];
-    for (i, g) in st.gpu_ghs.iter().enumerate() {
-        let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("GPU {}", i));
-        glines.push(Line::from(vec![
-            Span::styled(format!(" {:>2}  ", i), Style::new().fg(MUT)),
-            Span::styled(format!("{:<26}", name), Style::new().fg(CYN)),
-            Span::styled(format!("{:>7.2} GH/s", g), Style::new().fg(GRN)),
-        ]));
-    }
-    if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
-    f.render_widget(Paragraph::new(Text::from(glines))
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), chunks[3]);
-
-    let data: Vec<u64> = st.hr_hist.iter().cloned().collect();
-    f.render_widget(Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" hashrate ", Style::new().fg(MUT))))
-        .data(&data).style(Style::new().fg(GRN)), chunks[4]);
-
-    let items: Vec<ListItem> = st.log.iter().rev().take(chunks[5].height.saturating_sub(2) as usize).rev()
-        .map(|l| {
-            let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB }
-                      else if l.contains("rejected") || l.contains("stale") { AMB } else { MUT };
-            ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
-        }).collect();
-    f.render_widget(List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), chunks[5]);
-
-    let disc = match st.network.as_str() {
-        "testnet4" => "TESTNET4 — real public BLAKE2b chain, but testnet coins have NO monetary value. Don't trust, verify.",
-        "regtest"  => "REGTEST demo — the coin is not real Bitcoin, no value. Don't trust, verify.",
-        _          => "MAINNET — until the BLAKE2b hardfork activates, mainnet is still SHA-256 (no BLAKE2b blocks yet, no date). Don't trust, verify.",
-    };
-    f.render_widget(Paragraph::new(Line::from(vec![
-        Span::styled(" q ", Style::new().fg(Color::Black).bg(GRN)),
-        Span::styled(" quit   ", Style::new().fg(MUT)),
-        Span::styled(disc, Style::new().fg(MUT)),
-    ])).wrap(Wrap { trim: true }), chunks[6]);
-}
-
-// poll the pool network-stats endpoint → (miners_online, network_GH/s, pool_height)
 fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
     let body = ureq::get(url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
@@ -623,10 +495,8 @@ fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
         v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
     ))
 }
-
-// poll the confirmed balance (BTC) of the mining address from a public explorer (per network).
 fn poll_balance(explorer: &str, addr: &str) -> Option<f64> {
-    if explorer.is_empty() { return None; }   // regtest has no public explorer
+    if explorer.is_empty() || addr.is_empty() { return None; }
     let url = format!("{}/address/{}", explorer, addr);
     let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
@@ -635,96 +505,427 @@ fn poll_balance(explorer: &str, addr: &str) -> Option<f64> {
     Some((funded - spent) / 1e8)
 }
 
+// ═══════════════════════ TABS / UI ═══════════════════════
+#[derive(Clone, Copy, PartialEq)]
+enum Tab { Mine, Stratums, Learn, Network, Setup, Help }
+const TABS: [(Tab, &str); 6] = [
+    (Tab::Mine, "MINE"), (Tab::Stratums, "STRATUMS"), (Tab::Learn, "LEARN"),
+    (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"),
+];
+
+enum Input { AddStratum, EditAddr }
+struct App {
+    tab: Tab,
+    cfg: Config,
+    strat_cur: usize,     // cursor in the stratums list
+    learn_page: usize,
+    input: Option<Input>,
+    buf: String,
+    msg: String,          // transient status line
+}
+impl App {
+    fn network(&self) -> String { self.cfg.stratums.get(self.cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()) }
+    fn addr(&self) -> String { self.cfg.addrs.get(&self.network()).cloned().unwrap_or_default() }
+}
+
+fn tile(title: &str, value: Line<'static>, sub: &str, border: Color) -> Paragraph<'static> {
+    Paragraph::new(Text::from(vec![
+        Line::from(Span::styled(title.to_string(), Style::new().fg(MUT))), Line::from(""),
+        value, Line::from(Span::styled(sub.to_string(), Style::new().fg(MUT))),
+    ])).alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(border)))
+}
+
+fn tab_bar(app: &App) -> Line<'static> {
+    let mut spans = vec![Span::styled("PyBLØCK ", Style::new().fg(GRN).add_modifier(Modifier::BOLD))];
+    for (i, (t, name)) in TABS.iter().enumerate() {
+        let sel = *t == app.tab;
+        let st = if sel { Style::new().fg(Color::Black).bg(GRN).add_modifier(Modifier::BOLD) } else { Style::new().fg(MUT) };
+        spans.push(Span::styled(format!(" {}·{} ", i + 1, name), st));
+    }
+    Line::from(spans)
+}
+
+fn ui(f: &mut Frame, app: &App, st: &Stats) {
+    let outer = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+    f.render_widget(Paragraph::new(tab_bar(app)), outer[0]);
+    let body = outer[1];
+    match app.tab {
+        Tab::Mine => render_mine(f, body, st),
+        Tab::Stratums => render_stratums(f, body, app),
+        Tab::Learn => render_learn(f, body, app),
+        Tab::Network => render_network(f, body, st, app),
+        Tab::Setup => render_setup(f, body, app),
+        Tab::Help => render_help(f, body),
+    }
+    // footer
+    let foot = if let Some(k) = &app.input {
+        let label = match k { Input::AddStratum => "new stratum (name,host:port,network)", Input::EditAddr => "address" };
+        Line::from(vec![Span::styled(format!(" {} > ", label), Style::new().fg(Color::Black).bg(YLW)),
+                        Span::styled(format!("{}_", app.buf), Style::new().fg(YLW)),
+                        Span::styled("   Enter=ok  Esc=cancel", Style::new().fg(MUT))])
+    } else if !app.msg.is_empty() {
+        Line::from(Span::styled(app.msg.clone(), Style::new().fg(AMB)))
+    } else {
+        Line::from(vec![Span::styled(" 1-6 ", Style::new().fg(Color::Black).bg(GRN)),
+                        Span::styled(" tabs · ", Style::new().fg(MUT)),
+                        Span::styled("Tab", Style::new().fg(GRN)), Span::styled(" next · ", Style::new().fg(MUT)),
+                        Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))])
+    };
+    f.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), outer[2]);
+}
+
+fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
+    let gpu_h = (st.gpu_names.len().max(1) + 2).min(9) as u16;
+    let c = Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Length(6),
+        Constraint::Length(gpu_h), Constraint::Length(5), Constraint::Min(3)]).split(area);
+    let dot = if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) } else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
+    let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
+    let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
+    let mut l2 = vec![Span::styled("your address  ", Style::new().fg(MUT)), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
+        Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
+        Span::styled("pool fee 0.9%", Style::new().fg(PNK))];
+    if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
+    f.render_widget(Paragraph::new(Text::from(vec![
+        Line::from(vec![Span::styled("LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)), Span::raw("  "),
+            Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
+            Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT))]),
+        Line::from(l2)])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
+        .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN)))), c[0]);
+    let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[1]);
+    f.render_widget(tile("YOUR HASHRATE", Line::from(vec![Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
+        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len()), BRD), row[0]);
+    f.render_widget(tile("BLOCKS FOUND", Line::from(Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
+        &format!("rejected {} · donated {}", st.rejected, st.donated), BRD), row[1]);
+    f.render_widget(tile("DIFFICULTY", Line::from(Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
+        &format!("diff {:.0}", st.diff), BRD), row[2]);
+    let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) }
+        else { ("—".into(), "—".into(), "—".into()) };
+    let nr = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[2]);
+    f.render_widget(tile("◈ MINERS ONLINE", Line::from(Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), nr[0]);
+    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)),
+        Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), nr[1]);
+    f.render_widget(tile("◈ POOL HEIGHT", Line::from(Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), nr[2]);
+    let mut glines: Vec<Line> = vec![];
+    for (i, g) in st.gpu_ghs.iter().enumerate() {
+        let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("GPU {}", i));
+        glines.push(Line::from(vec![Span::styled(format!(" {:>2}  ", i), Style::new().fg(MUT)),
+            Span::styled(format!("{:<26}", name), Style::new().fg(CYN)), Span::styled(format!("{:>7.2} GH/s", g), Style::new().fg(GRN))]));
+    }
+    if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
+    f.render_widget(Paragraph::new(Text::from(glines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), c[3]);
+    let data: Vec<u64> = st.hr_hist.iter().cloned().collect();
+    f.render_widget(Sparkline::default().block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" hashrate ", Style::new().fg(MUT)))).data(&data).style(Style::new().fg(GRN)), c[4]);
+    let items: Vec<ListItem> = st.log.iter().rev().take(c[5].height.saturating_sub(2) as usize).rev().map(|l| {
+        let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB } else if l.contains("rejected") || l.contains("stale") || l.contains("switching") { AMB } else { MUT };
+        ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
+    }).collect();
+    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), c[5]);
+}
+
+fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
+    let mut items: Vec<ListItem> = vec![];
+    for (i, s) in app.cfg.stratums.iter().enumerate() {
+        let cur = i == app.strat_cur;
+        let active = i == app.cfg.selected;
+        let mark = if active { "▶ " } else { "  " };
+        let tag = if s.custom { "custom" } else { "default" };
+        let line = Line::from(vec![
+            Span::styled(mark, Style::new().fg(GRN)),
+            Span::styled(format!("{:<22}", s.name), Style::new().fg(if active { GRN } else { CYN }).add_modifier(if cur { Modifier::REVERSED } else { Modifier::empty() })),
+            Span::styled(format!("{:<28}", s.url), Style::new().fg(MUT)),
+            Span::styled(format!("[{}] {}", s.network, tag), Style::new().fg(AMB)),
+        ]);
+        items.push(ListItem::new(line));
+    }
+    let help = Line::from(vec![Span::styled("  ↑↓ move · ", Style::new().fg(MUT)), Span::styled("Enter", Style::new().fg(GRN)),
+        Span::styled(" switch LIVE · ", Style::new().fg(MUT)), Span::styled("a", Style::new().fg(GRN)), Span::styled(" add custom · ", Style::new().fg(MUT)),
+        Span::styled("d", Style::new().fg(GRN)), Span::styled(" delete custom", Style::new().fg(MUT))]);
+    let c = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN)).title(Span::styled(" STRATUMS — switch pool without leaving the app ", Style::new().fg(GRN)))), c[0]);
+    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD))), c[1]);
+}
+
+fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
+    let pages: Vec<(&str, Vec<&str>)> = vec![
+        ("What is this?", vec![
+            "pyblockMiner mines BLAKE2b — a *proposed* new Proof-of-Work for Bitcoin (Bitcoin Knots PR #359).",
+            "It's solo-lottery: you mine to YOUR OWN address and keep 99.1% of any block you find,",
+            "straight to that address. Non-custodial — the pool never holds your coins. PyBLØCK fee 0.9%.",
+            "",
+            "It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live hashrate, blocks, difficulty.",
+        ]),
+        ("The hardfork — honest status", vec![
+            "BLAKE2b is NOT merged and NOT active on Bitcoin mainnet — there is no activation date.",
+            "MAINNET is still SHA-256. Do not expect real rewards on mainnet yet.",
+            "",
+            "TESTNET4: the change activates on the public testnet4 chain at block 149460 (Knots 29.4.1 RC).",
+            "That is the FIRST place you can actually mine BLAKE2b on a public chain.",
+            "⚠ testnet4 coins have NO monetary value — it's for testing / being ready.",
+        ]),
+        ("How solo-lottery mining works", vec![
+            "Every share your GPU finds that beats the block target IS a block — paid entirely to your address.",
+            "Blocks are rare (that's the lottery); when you hit one, you get the whole coinbase (minus 0.9% fee).",
+            "There's no steady payout — it's all-or-nothing per block, like a lottery ticket that never expires.",
+            "",
+            "The 2% dev donation (mainnet only) sends a small slice of your hashrate to the PyBLØCK pool.",
+        ]),
+        ("Get started", vec![
+            "1. SETUP [5]: pick your network + generate (or paste) an address for it.",
+            "2. STRATUMS [2]: pick a pool (PyBLØCK defaults are there; add custom ones).",
+            "3. MINE [1]: it connects and mines. Leave it running — on testnet4 it starts the moment BLAKE2b activates.",
+            "",
+            "No GPU? it falls back to CPU. Multiple GPUs are auto-detected and all saturated.",
+        ]),
+    ];
+    let p = app.learn_page.min(pages.len() - 1);
+    let (title, lines) = &pages[p];
+    let out: Vec<Line<'static>> = lines.iter().map(|s| Line::from(Span::styled(s.to_string(), Style::new().fg(if s.starts_with('⚠') { AMB } else { GRN })))).collect();
+    (format!(" LEARN — {}/{} · {}   (←/→ pages) ", p + 1, pages.len(), title), out)
+}
+
+fn render_learn(f: &mut Frame, area: Rect, app: &App) {
+    let (title, lines) = info_page(app);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(CYN)).title(Span::styled(title, Style::new().fg(CYN)))), area);
+}
+
+fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
+    let c = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(area);
+    let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) } else { ("—".into(), "—".into(), "—".into()) };
+    let r = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[0]);
+    f.render_widget(tile("◈ MINERS ONLINE", Line::from(Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), r[0]);
+    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)), Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), r[1]);
+    f.render_widget(tile("◈ POOL HEIGHT", Line::from(Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), r[2]);
+    let bal = if st.balance_ok { format!("{:.8} BTC", st.balance_btc) } else { "—".into() };
+    let lines = vec![
+        Line::from(vec![Span::styled("  network      ", Style::new().fg(MUT)), Span::styled(app.network(), Style::new().fg(GRN))]),
+        Line::from(vec![Span::styled("  your address ", Style::new().fg(MUT)), Span::styled(app.addr(), Style::new().fg(CYN))]),
+        Line::from(vec![Span::styled("  your balance ", Style::new().fg(MUT)), Span::styled(bal, Style::new().fg(GRN))]),
+        Line::from(vec![Span::styled("  your blocks  ", Style::new().fg(MUT)), Span::styled(format!("{} found · {} rejected", st.blocks, st.rejected), Style::new().fg(GRN))]),
+        Line::from(""),
+        Line::from(Span::styled("  Network stats come from the PyBLØCK pool for the selected chain. Balance from a public explorer.", Style::new().fg(MUT))),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" NETWORK & YOU ", Style::new().fg(MUT)))), c[1]);
+}
+
+fn render_setup(f: &mut Frame, area: Rect, app: &App) {
+    let net = app.network();
+    let addr = app.addr();
+    let addr_disp = if addr.is_empty() { "— not set —".to_string() } else { addr };
+    let donate_disp = if net_cfg(&net).donate { format!("{:.1}% (mainnet)", app.cfg.donate) } else { "off (testnet/regtest)".into() };
+    let gpus_disp = app.cfg.gpus.map(|n| n.to_string()).unwrap_or_else(|| "auto".into());
+    let lines = vec![
+        Line::from(vec![Span::styled("  selected stratum  ", Style::new().fg(MUT)), Span::styled(app.cfg.stratums.get(app.cfg.selected).map(|s| s.name.clone()).unwrap_or_default(), Style::new().fg(GRN)),
+            Span::styled(format!("  [{}]", net), Style::new().fg(AMB))]),
+        Line::from(vec![Span::styled("  your address      ", Style::new().fg(MUT)), Span::styled(addr_disp, Style::new().fg(CYN))]),
+        Line::from(vec![Span::styled("  donation          ", Style::new().fg(MUT)), Span::styled(donate_disp, Style::new().fg(AMB))]),
+        Line::from(vec![Span::styled("  gpus              ", Style::new().fg(MUT)), Span::styled(gpus_disp, Style::new().fg(GRN)),
+            Span::styled(format!("   cpu: {}", if app.cfg.cpu { "on" } else { "off" }), Style::new().fg(GRN))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  g", Style::new().fg(GRN)), Span::styled(" generate a new address for this network   ", Style::new().fg(MUT)),
+            Span::styled("e", Style::new().fg(GRN)), Span::styled(" edit/paste an address", Style::new().fg(MUT))]),
+        Line::from(vec![Span::styled("  c", Style::new().fg(GRN)), Span::styled(" toggle CPU   ", Style::new().fg(MUT)),
+            Span::styled("+/-", Style::new().fg(GRN)), Span::styled(" donation (mainnet)   ", Style::new().fg(MUT)),
+            Span::styled("changes auto-save + apply live", Style::new().fg(MUT))]),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN)).title(Span::styled(" SETUP — address, network, config (saved) ", Style::new().fg(GRN)))), area);
+}
+
+fn render_help(f: &mut Frame, area: Rect) {
+    let l = |a: &str, b: &str| Line::from(vec![Span::styled(format!("  {:<17} ", a), Style::new().fg(GRN)), Span::styled(b.to_string(), Style::new().fg(MUT))]);
+    let lines = vec![
+        Line::from(Span::styled(" Keys", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
+        l("1-6 / Tab", "switch tabs"), l("q / Esc", "quit (Esc also cancels an input)"),
+        l("STRATUMS", "↑↓ move · Enter switch live · a add · d delete custom"),
+        l("SETUP", "g generate address · e edit address · c toggle CPU · +/- donation"),
+        Line::from(""),
+        Line::from(Span::styled(" Troubleshooting", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
+        l("build fails", "CL/cl.h missing → sudo apt install ocl-icd-opencl-dev opencl-headers"),
+        l("no GPU", "it falls back to CPU automatically (much slower)"),
+        l("connection failed", "the pool may be down/gated; it retries every 3s (no GPU wasted while offline)"),
+        l("wrong address", "each network needs its own type: bc1 mainnet · tb1 testnet4 · bcrt1 regtest"),
+        l("testnet4 addr", "SETUP [5] → g, or:  python3 tools/genaddr.py --testnet4"),
+        Line::from(""),
+        Line::from(vec![Span::styled("  GitHub   ", Style::new().fg(MUT)), Span::styled("github.com/GaltRanch/pyblock-miner", Style::new().fg(CYN))]),
+        Line::from(vec![Span::styled("  Pool     ", Style::new().fg(MUT)), Span::styled("pool.pyblock.xyz  ·  MIT licensed", Style::new().fg(CYN))]),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(CYN)).title(Span::styled(" HELP ", Style::new().fg(CYN)))), area);
+}
+
+// apply the current selected stratum + address to the live engine target + stats display
+fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) {
+    let s = match app.cfg.stratums.get(app.cfg.selected) { Some(s) => s.clone(), None => return };
+    let addr = app.addr();
+    let donate = if net_cfg(&s.network).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
+    { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.addr = addr.clone(); t.network = s.network.clone(); t.donate = donate; }
+    { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false; }
+}
+
+// shell out to tools/genaddr.py to generate an address for `net`; returns the address (adds it to cfg)
+fn gen_address(net: &str) -> Option<String> {
+    let script = { // find tools/genaddr.py next to the binary or in the repo layout
+        let mut cand = vec![PathBuf::from("tools/genaddr.py")];
+        if let Ok(exe) = std::env::current_exe() { if let Some(p) = exe.parent() {
+            cand.push(p.join("tools/genaddr.py")); cand.push(p.join("../../tools/genaddr.py")); } }
+        cand.into_iter().find(|p| p.exists())?
+    };
+    let arg = match net { "testnet4" => "--testnet4", "regtest" => "--regtest", _ => "--mainnet" };
+    let out = Command::new("python3").arg(&script).arg(arg).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // first token that looks like an address of the right prefix
+    for tok in text.split_whitespace() {
+        if addr_ok(net, tok) && tok.len() > 20 { return Some(tok.to_string()); }
+    }
+    None
+}
+
+fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) -> bool {
+    app.msg.clear();
+    // input mode: type into the buffer
+    if let Some(kind) = &app.input {
+        match code {
+            KeyCode::Esc => { app.input = None; app.buf.clear(); }
+            KeyCode::Backspace => { app.buf.pop(); }
+            KeyCode::Enter => {
+                let buf = app.buf.clone();
+                match kind {
+                    Input::AddStratum => {
+                        let parts: Vec<&str> = buf.splitn(3, ',').map(|s| s.trim()).collect();
+                        if parts.len() == 3 && parts[1].contains(':') {
+                            let net = net_cfg(parts[2]).name.to_string();
+                            app.cfg.stratums.push(Stratum { name: parts[0].into(), url: parts[1].into(), network: net, custom: true });
+                            save_config(&app.cfg); app.msg = "stratum added".into();
+                        } else { app.msg = "format: name,host:port,network".into(); }
+                    }
+                    Input::EditAddr => {
+                        let net = app.network();
+                        if addr_ok(&net, buf.trim()) {
+                            app.cfg.addrs.insert(net, buf.trim().to_string());
+                            save_config(&app.cfg); apply_target(app, tgt, stats); app.msg = "address saved".into();
+                        } else { app.msg = format!("not a valid {} address", app.network()); }
+                    }
+                }
+                app.input = None; app.buf.clear();
+            }
+            KeyCode::Char(ch) => { if app.buf.len() < 120 { app.buf.push(ch); } }
+            _ => {}
+        }
+        return false;
+    }
+    // normal mode
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char(c @ '1'..='6') => { app.tab = TABS[c as usize - '1' as usize].0; }
+        KeyCode::Tab => { let i = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0); app.tab = TABS[(i + 1) % TABS.len()].0; }
+        _ => match app.tab {
+            Tab::Stratums => match code {
+                KeyCode::Up => { if app.strat_cur > 0 { app.strat_cur -= 1; } }
+                KeyCode::Down => { if app.strat_cur + 1 < app.cfg.stratums.len() { app.strat_cur += 1; } }
+                KeyCode::Enter => { app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats);
+                    app.msg = format!("switched to {}", app.cfg.stratums[app.strat_cur].name); }
+                KeyCode::Char('a') => { app.input = Some(Input::AddStratum); app.buf.clear(); }
+                KeyCode::Char('d') => {
+                    if let Some(s) = app.cfg.stratums.get(app.strat_cur) { if s.custom {
+                        app.cfg.stratums.remove(app.strat_cur);
+                        if app.cfg.selected >= app.cfg.stratums.len() { app.cfg.selected = 0; }
+                        if app.strat_cur >= app.cfg.stratums.len() && app.strat_cur > 0 { app.strat_cur -= 1; }
+                        save_config(&app.cfg); app.msg = "deleted".into();
+                    } else { app.msg = "can't delete a default stratum".into(); } }
+                }
+                _ => {}
+            },
+            Tab::Learn => match code {
+                KeyCode::Left => { if app.learn_page > 0 { app.learn_page -= 1; } }
+                KeyCode::Right => { app.learn_page += 1; }
+                _ => {}
+            },
+            Tab::Setup => match code {
+                KeyCode::Char('g') => {
+                    let net = app.network();
+                    app.msg = "generating…".into();
+                    if let Some(a) = gen_address(&net) { app.cfg.addrs.insert(net, a.clone()); save_config(&app.cfg); apply_target(app, tgt, stats); app.msg = format!("generated {}", a); }
+                    else { app.msg = "genaddr failed (need python3 + tools/genaddr.py). Use 'e' to paste one.".into(); }
+                }
+                KeyCode::Char('e') => { app.input = Some(Input::EditAddr); app.buf.clear(); }
+                KeyCode::Char('c') => { app.cfg.cpu = !app.cfg.cpu; save_config(&app.cfg); app.msg = "cpu toggled (restart to apply devices)".into(); }
+                KeyCode::Char('+') => { app.cfg.donate += 1.0; save_config(&app.cfg); apply_target(app, tgt, stats); }
+                KeyCode::Char('-') => { app.cfg.donate = (app.cfg.donate - 1.0).max(DONATE_MIN); save_config(&app.cfg); apply_target(app, tgt, stats); }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut pool = "pool.pyblock.xyz:23110".to_string();
-    let mut addr = String::new();
-    let mut gpus: Option<u32> = None; // None = auto-detect all GPUs
-    let mut cpu_threads: usize = 0;
-    let mut use_cpu = false;
-    let mut donate = DONATE_MIN;
-    let mut network = "mainnet".to_string();
+    let mut cfg = load_config();
+    // CLI overrides (optional; config is the source of truth otherwise)
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--pool" => { i += 1; if i < args.len() { pool = args[i].clone(); } }
-            "--addr" => { i += 1; if i < args.len() { addr = args[i].clone(); } }
-            "--network" | "--net" | "--chain" => { i += 1; if i < args.len() { network = args[i].clone(); } }
-            "--gpus" => { i += 1; if i < args.len() { gpus = args[i].parse().ok(); } }
-            "--cpu" => { use_cpu = true; }
-            "--cpu-threads" => { i += 1; if i < args.len() { cpu_threads = args[i].parse().unwrap_or(0); use_cpu = true; } }
-            "--donate" => { i += 1; if i < args.len() { donate = args[i].parse().unwrap_or(DONATE_MIN); } }
+            "--addr" => { i += 1; if i < args.len() { let net = cfg.stratums.get(cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()); cfg.addrs.insert(net, args[i].clone()); } }
+            "--network" | "--net" | "--chain" => { i += 1; if i < args.len() { let n = net_cfg(&args[i]).name; if let Some(idx) = cfg.stratums.iter().position(|s| s.network == n) { cfg.selected = idx; } } }
+            "--pool" => { i += 1; if i < args.len() { if let Some(s) = cfg.stratums.get_mut(cfg.selected) { s.url = args[i].clone(); } } }
+            "--gpus" => { i += 1; if i < args.len() { cfg.gpus = args[i].parse().ok(); } }
+            "--cpu" => { cfg.cpu = true; }
+            "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             _ => {}
         }
         i += 1;
     }
-    let nc = net_cfg(&network);
-    let network = nc.name.to_string();   // normalize aliases (t4 → testnet4, reg → regtest)
-    if addr.is_empty() {
-        eprintln!("usage: pyblockMiner --addr <btc_address> [--network mainnet|testnet4|regtest] [--pool host:port] [--gpus N] [--cpu] [--cpu-threads N] [--donate PCT]");
-        eprintln!("tip: generate an address with  python3 tools/genaddr.py");
-        std::process::exit(2);
-    }
-    // address must match the chosen network (a wrong-network address is unspendable / pays the wrong chain)
-    if !addr_ok(&network, &addr) {
-        let want = match network.as_str() {
-            "testnet4" => "a TESTNET4 address (tb1… / m… / n… / 2…)",
-            "regtest"  => "a REGTEST address (bcrt1… / m… / n… / 2…)",
-            _          => "a MAINNET address (bc1… / 1… / 3…)",
-        };
-        eprintln!("✗ '{}' is not valid for --network {}.", addr, network);
-        eprintln!("  use {} — rewards to a wrong-network address are unspendable.", want);
-        eprintln!("  generate one with:  python3 tools/genaddr.py");
-        std::process::exit(2);
-    }
-    // donation only on mainnet (testnet/regtest coins have no value → nothing to donate)
-    if !nc.donate { donate = 0.0; } else if donate < DONATE_MIN { donate = DONATE_MIN; }
-    let detected = gpu_names().len() as u32;
-    let ngpu = gpus.unwrap_or(detected);
-    if ngpu == 0 { use_cpu = true; } // no GPU → mine on CPU
-    if use_cpu && cpu_threads == 0 {
-        cpu_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    }
-    if !use_cpu { cpu_threads = 0; }
+    if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
+    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new() };
+    app.strat_cur = app.cfg.selected;
+
+    // devices
+    let detected = gpu_names().len() as u32;
+    let ngpu = app.cfg.gpus.unwrap_or(detected);
+    let mut use_cpu = app.cfg.cpu;
+    if ngpu == 0 { use_cpu = true; }
+    let cpu_threads = if use_cpu { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) } else { 0 };
+
+    // shared state
     let stats = Arc::new(Mutex::new(Stats::default()));
-    { let mut st = stats.lock().unwrap(); st.endpoint = pool.clone(); st.addr = addr.clone(); st.donate = donate; st.network = network.clone(); }
-    {
-        let stats = stats.clone();
-        let (p, a) = (pool.clone(), addr.clone());
-        std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads, donate));
-    }
-    // network-stats poller (per network): live count of pyblockMiner users + aggregate network hashrate
-    if let Some(url) = net_stats_url(&network) {
-        let stats = stats.clone();
-        let url = url.to_string();
-        std::thread::spawn(move || loop {
-            match poll_network_stats(&url) {
-                Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
-                None => { stats.lock().unwrap().net_ok = false; }
-            }
-            std::thread::sleep(Duration::from_secs(15));
-        });
-    }
-    // balance poller: confirmed balance of your mining address (per-network public explorer)
-    {
-        let stats = stats.clone();
-        let (explorer, a) = (nc.explorer.to_string(), addr.clone());
-        std::thread::spawn(move || loop {
-            match poll_balance(&explorer, &a) {
-                Some(b) => { let mut st = stats.lock().unwrap(); st.balance_ok = true; st.balance_btc = b; }
-                None => { stats.lock().unwrap().balance_ok = false; }
-            }
-            std::thread::sleep(Duration::from_secs(60));
-        });
-    }
+    let net0 = app.network();
+    let donate0 = if net_cfg(&net0).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
+    let tgt = Arc::new(Mutex::new(Target {
+        pool: app.cfg.stratums.get(app.cfg.selected).map(|s| s.url.clone()).unwrap_or_default(),
+        addr: app.addr(), network: net0.clone(), donate: donate0,
+    }));
+    { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0; }
+
+    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads)); }
+    // network-stats poller (per current network)
+    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
+        let net = tgt.lock().unwrap().network.clone();
+        match net_stats_url(&net).and_then(poll_network_stats) {
+            Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
+            None => { stats.lock().unwrap().net_ok = false; }
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }); }
+    // balance poller (per current network + address)
+    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
+        let (net, addr) = { let t = tgt.lock().unwrap(); (t.network.clone(), t.addr.clone()) };
+        match poll_balance(net_cfg(&net).explorer, &addr) {
+            Some(b) => { let mut st = stats.lock().unwrap(); st.balance_ok = true; st.balance_btc = b; }
+            None => { stats.lock().unwrap().balance_ok = false; }
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }); }
 
     let mut terminal = ratatui::init();
     loop {
-        { let st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &st)); }
+        { let st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); }
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
-                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) { break; }
+                if handle_key(&mut app, k.code, &tgt, &stats) { break; }
             }
         }
     }
