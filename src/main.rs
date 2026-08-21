@@ -26,8 +26,14 @@ const DONATE_POOL: &str = "pool.pyblock.xyz:23110";                   // PyBLØC
 const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2"; // PyBLØCK address on that pool
 const DONATE_MIN: f64 = 2.0; // percent of hashrate — floor and default
 
-// public network-stats endpoint (all pyblockMiner users on the PyBLØCK LOTTO pool)
-const STATS_URL: &str = "https://pool.pyblock.xyz:8443/api/blake_stats.php";
+// public network-stats endpoint (per network; regtest has none → cards show "—")
+fn net_stats_url(net: &str) -> Option<&'static str> {
+    match net {
+        "mainnet"  => Some("https://pool.pyblock.xyz:8443/api/blake_stats.php"),
+        "testnet4" => Some("https://pool.pyblock.xyz:8443/api/blake_stats_t4.php"),
+        _          => None,
+    }
+}
 
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
@@ -399,7 +405,7 @@ fn engine(stats: Arc<Mutex<Stats>>, pool: String, addr: String, ngpu: u32, cpu_t
       let nworkers = st.gpu_names.len();
       let names_str = st.gpu_names.join(", ");
       st.logline(format!("{} worker(s) ready: {}", nworkers, names_str));
-      st.logline(format!("hashrate donation {:.1}% → PyBLØCK pool {} ({})", donate, DONATE_POOL, DEV_DONATION_ADDR)); }
+      if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK pool {} ({})", donate, DONATE_POOL, DEV_DONATION_ADDR)); } }
 
     let mut donate_credit = 0.0f64;              // accumulates `donate/100` per sweep; ≥1 → this sweep pays the dev
     let mut dev_retry = Instant::now();
@@ -607,8 +613,8 @@ fn ui(f: &mut Frame, st: &Stats) {
 }
 
 // poll the pool network-stats endpoint → (miners_online, network_GH/s, pool_height)
-fn poll_network_stats() -> Option<(u64, f64, u64)> {
-    let body = ureq::get(STATS_URL).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
+    let body = ureq::get(url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
     if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
     Some((
@@ -688,11 +694,12 @@ fn main() {
         let (p, a) = (pool.clone(), addr.clone());
         std::thread::spawn(move || engine(stats, p, a, ngpu, cpu_threads, donate));
     }
-    // network-stats poller: live count of pyblockMiner users + aggregate network hashrate
-    {
+    // network-stats poller (per network): live count of pyblockMiner users + aggregate network hashrate
+    if let Some(url) = net_stats_url(&network) {
         let stats = stats.clone();
+        let url = url.to_string();
         std::thread::spawn(move || loop {
-            match poll_network_stats() {
+            match poll_network_stats(&url) {
                 Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
                 None => { stats.lock().unwrap().net_ok = false; }
             }
