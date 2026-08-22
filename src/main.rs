@@ -821,7 +821,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("no GPU", "it falls back to CPU automatically (much slower)"),
         l("connection failed", "the pool may be down/gated; it retries every 3s (no GPU wasted while offline)"),
         l("wrong address", "each network needs its own type: bc1 mainnet · tb1 testnet4 · bcrt1 regtest"),
-        l("testnet4 addr", "SETUP [5] → g, or:  python3 tools/genaddr.py --testnet4"),
+        l("testnet4 addr", "SETUP [5] → g, or:  pyblockMiner --genaddr testnet4"),
         Line::from(""),
         Line::from(vec![Span::styled("  GitHub   ", Style::new().fg(MUT)), Span::styled("github.com/GaltRanch/pyblock-miner", Style::new().fg(CYN))]),
         Line::from(vec![Span::styled("  Pool     ", Style::new().fg(MUT)), Span::styled("pool.pyblock.xyz  ·  MIT licensed", Style::new().fg(CYN))]),
@@ -839,22 +839,33 @@ fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) 
     { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false; }
 }
 
-// shell out to tools/genaddr.py to generate an address for `net`; returns the address (adds it to cfg)
-fn gen_address(net: &str) -> Option<String> {
-    let script = { // find tools/genaddr.py next to the binary or in the repo layout
-        let mut cand = vec![PathBuf::from("tools/genaddr.py")];
-        if let Ok(exe) = std::env::current_exe() { if let Some(p) = exe.parent() {
-            cand.push(p.join("tools/genaddr.py")); cand.push(p.join("../../tools/genaddr.py")); } }
-        cand.into_iter().find(|p| p.exists())?
+// append a generated key to ~/.config/pyblockminer/keys.txt (0600). Returns the path on success.
+fn save_wif(net: &str, addr: &str, wif: &str) -> Option<String> {
+    let path = config_path().parent()?.join("keys.txt");
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)); }
+    use std::io::Write;
+    f.write_all(format!("{}\t{}\t{}\n", net, addr, wif).as_bytes()).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+// generate a P2WPKH address + its WIF natively (pure Rust via rust-bitcoin — no Python needed).
+// testnet4 uses the testnet3 address format (tb1 / WIF 0xef); regtest → bcrt1; else mainnet bc1.
+fn gen_address(net: &str) -> Option<(String, String)> {
+    use bitcoin::{Network, PrivateKey, CompressedPublicKey, Address};
+    use bitcoin::secp256k1::{Secp256k1, rand};
+    let network = match net {
+        "testnet4" => Network::Testnet,
+        "regtest"  => Network::Regtest,
+        _          => Network::Bitcoin,
     };
-    let arg = match net { "testnet4" => "--testnet4", "regtest" => "--regtest", _ => "--mainnet" };
-    let out = Command::new("python3").arg(&script).arg(arg).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // first token that looks like an address of the right prefix
-    for tok in text.split_whitespace() {
-        if addr_ok(net, tok) && tok.len() > 20 { return Some(tok.to_string()); }
-    }
-    None
+    let secp = Secp256k1::new();
+    let (sk, pk) = secp.generate_keypair(&mut rand::thread_rng());
+    let privkey = PrivateKey::new(sk, network);
+    let comp = CompressedPublicKey(pk);
+    let addr = Address::p2wpkh(&comp, network);
+    Some((addr.to_string(), privkey.to_wif()))
 }
 
 fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) -> bool {
@@ -921,8 +932,14 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                 KeyCode::Char('g') => {
                     let net = app.network();
                     app.msg = "generating…".into();
-                    if let Some(a) = gen_address(&net) { app.cfg.addrs.insert(net, a.clone()); save_config(&app.cfg); apply_target(app, tgt, stats); app.msg = format!("generated {}", a); }
-                    else { app.msg = "genaddr failed (need python3 + tools/genaddr.py). Use 'e' to paste one.".into(); }
+                    if let Some((a, w)) = gen_address(&net) {
+                        app.cfg.addrs.insert(net.clone(), a.clone()); save_config(&app.cfg); apply_target(app, tgt, stats);
+                        app.msg = match save_wif(&net, &a, &w) {
+                            Some(p) => format!("generated {} · WIF saved to {} — BACK IT UP", a, p),
+                            None    => format!("generated {} · WIF {} — SAVE THIS (could not write keys.txt!)", a, w),
+                        };
+                    }
+                    else { app.msg = "address generation failed. Use 'e' to paste one.".into(); }
                 }
                 KeyCode::Char('e') => { app.input = Some(Input::EditAddr); app.buf.clear(); }
                 KeyCode::Char('c') => { app.cfg.cpu = !app.cfg.cpu; save_config(&app.cfg); app.msg = "cpu toggled (restart to apply devices)".into(); }
@@ -940,6 +957,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut cfg = load_config();
     let mut headless = false;
+    let mut genaddr_net: Option<String> = None;
     // CLI overrides (optional; config is the source of truth otherwise)
     let mut i = 1;
     while i < args.len() {
@@ -950,10 +968,30 @@ fn main() {
             "--gpus" => { i += 1; if i < args.len() { cfg.gpus = args[i].parse().ok(); } }
             "--cpu" => { cfg.cpu = true; }
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
+            "--genaddr" | "--newaddr" => { let n = if i + 1 < args.len() && !args[i + 1].starts_with("--") { i += 1; net_cfg(&args[i]).name.to_string() } else { "mainnet".to_string() }; genaddr_net = Some(n); }
             "--headless" | "--daemon" | "--no-tui" => { headless = true; }
             _ => {}
         }
         i += 1;
+    }
+
+    // --genaddr [net]: print a fresh address + WIF (saved to keys.txt 0600) and exit. Pure Rust, no Python, no pool.
+    if let Some(net) = genaddr_net {
+        match gen_address(&net) {
+            Some((a, w)) => {
+                let saved = save_wif(&net, &a, &w);
+                println!("── PyBLØCK · BLAKE2b mining address · {} ──", net.to_uppercase());
+                println!("  address : {}", a);
+                println!("  WIF     : {}", w);
+                match saved {
+                    Some(p) => println!("  saved   : {} (0600) — BACK IT UP", p),
+                    None    => println!("  ⚠ could not write keys.txt — SAVE THE WIF ABOVE"),
+                }
+                println!("  mine    : pyblockMiner --network {} --addr {} --pool <host:port>", net, a);
+            }
+            None => { eprintln!("genaddr failed"); std::process::exit(1); }
+        }
+        return;
     }
     if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
