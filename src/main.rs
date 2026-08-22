@@ -463,18 +463,6 @@ impl Conn {
     }
 }
 
-// Parse the block height (BIP34) out of the coinbase prefix (coinb1). Layout:
-//   version(4) | vin_count(1) | prev_txid(32) | prev_vout(4) | scriptSig_len(1) | scriptSig…
-// and the scriptSig begins with a minimal push of the height (little-endian). Returns 0 if unparseable.
-fn coinbase_height(coinb1: &[u8]) -> u64 {
-    if coinb1.len() < 43 { return 0; }
-    let push = coinb1[42] as usize;                     // first scriptSig opcode = number of height bytes
-    if push == 0 || push > 8 || 43 + push > coinb1.len() { return 0; }
-    let mut h = 0u64;
-    for i in 0..push { h |= (coinb1[43 + i] as u64) << (8 * i); }
-    h
-}
-
 fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, String, String, String, String) {
     let prevhash = jobv[1].as_str().unwrap_or("").to_string();
     let job_id = jobv[0].as_str().unwrap_or("").to_string();
@@ -590,9 +578,11 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             //  zeroed out every submission: "hashes but never submits". Let the pool judge staleness instead.)
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
             let net_target = nbits_to_target(nbits);
-            // block height for THIS sweep's job (BIP34 in coinb1) — captured now so it's correct even if
-            // the tip moves before the pool replies; carried in `pending` so BLOCK FOUND logs the real height.
-            let job_height = jobv.get(2).and_then(|v| v.as_str()).map(|s| coinbase_height(&hex::decode(s).unwrap_or_default())).unwrap_or(0);
+            // found-block height. The BLAKE2b stratum notify carries NO coinbase (coinb2 empty, merkle []),
+            // so coinb1 has no BIP34 height — the pool's reported mining height is the only source. blake_stats
+            // returns the *template* height (tip+1) = exactly the block being mined. Captured per-sweep and
+            // carried in `pending` so BLOCK FOUND logs it even if the tip moves before the pool replies.
+            let job_height = stats.lock().unwrap().net_height;
             let mut sweep_best = 0.0f64;
             let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
             for nh in nonces {
@@ -1095,7 +1085,7 @@ fn main() {
             Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
             None => { stats.lock().unwrap().net_ok = false; }
         }
-        std::thread::sleep(Duration::from_secs(15));
+        std::thread::sleep(Duration::from_secs(8));   // match blake_stats' ~8s cache so POOL HEIGHT (+ the BLOCK FOUND height) stay fresh on fast chains
     }); }
     // balance poller (per current network + address)
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
