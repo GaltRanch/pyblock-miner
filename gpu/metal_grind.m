@@ -84,7 +84,7 @@ typedef struct {
 } Gpu;
 
 static Gpu gpu_setup(int didx, const char* argv0){
-  Gpu g; memset(&g,0,sizeof(g));
+  Gpu g = {0};   // zero/nil-init (ARC-safe; every field is assigned below before return)
   NSArray<id<MTLDevice>>* devs = MTLCopyAllDevices();
   if(devs.count==0){ id<MTLDevice> d=MTLCreateSystemDefaultDevice(); if(d) devs=@[d]; }
   if((NSUInteger)didx>=devs.count){ fprintf(stderr,"metal device %d does not exist (have %lu)\n",didx,(unsigned long)devs.count); exit(2); }
