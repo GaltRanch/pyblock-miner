@@ -567,29 +567,24 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             }
             user.pump(&stats);
             if let Some(d) = dev.as_mut() { d.pump(&stats); }
-            let cur_prev = if is_dev {
-                dev.as_ref().and_then(|d| d.job.as_ref()).and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("").to_string()
-            } else {
-                user.job.as_ref().and_then(|j| j.get(1)).and_then(|v| v.as_str()).unwrap_or("").to_string()
-            };
-            if cur_prev == prevhash {
-                let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
-                let net_target = nbits_to_target(nbits);
-                let mut sweep_best = 0.0f64;
-                let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
-                for nh in nonces {
-                    let is_block = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
-                        Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; } nbits != 0 && hash_le_target(&h, &net_target) }
-                        None => false,
-                    };
-                    conn.subid += 1; let sid = conn.subid;
-                    conn.pending.insert(sid, (nh.clone(), is_block));
-                    send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
-                }
-                if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
-            } else if !nonces.is_empty() {
-                stats.lock().unwrap().logline(format!("· dropped {} stale (tip moved during grind)", nonces.len()));
+            // Submit every winner for the job it was ground on (job_id). The POOL decides accept vs stale.
+            // (Previously we dropped ALL winners client-side if the tip moved during the ~0.35s grind — on a
+            //  fast chain like testnet4 BLAKE2b post-activation a new block lands almost every cycle, so that
+            //  zeroed out every submission: "hashes but never submits". Let the pool judge staleness instead.)
+            let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+            let net_target = nbits_to_target(nbits);
+            let mut sweep_best = 0.0f64;
+            let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
+            for nh in nonces {
+                let is_block = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
+                    Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; } nbits != 0 && hash_le_target(&h, &net_target) }
+                    None => false,
+                };
+                conn.subid += 1; let sid = conn.subid;
+                conn.pending.insert(sid, (nh.clone(), is_block));
+                send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
             }
+            if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
         }
     }
 }
