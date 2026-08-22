@@ -589,10 +589,11 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             }
             user.pump(&stats);
             if let Some(d) = dev.as_mut() { d.pump(&stats); }
-            // Submit every winner for the job it was ground on (job_id). The POOL decides accept vs stale.
-            // (Previously we dropped ALL winners client-side if the tip moved during the ~0.35s grind — on a
-            //  fast chain like testnet4 BLAKE2b post-activation a new block lands almost every cycle, so that
-            //  zeroed out every submission: "hashes but never submits". Let the pool judge staleness instead.)
+            // Only submit winners if this sweep's job is still the tip. If a block landed DURING the grind,
+            // its winners are for the old prevhash → worthless (the pool rejects them as stale-prevblk), so we
+            // skip them, exactly like a normal miner does. Safe now because the adaptive sweep keeps each grind
+            // well under the block interval → stale sweeps are a minority (this is NOT the old v0.2.1 bug that
+            // dropped everything with fixed 0.35s sweeps ≈ the block time on a fast chain).
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
             let net_target = nbits_to_target(nbits);
             // found-block height. The BLAKE2b stratum notify carries NO coinbase (coinb2 empty, merkle []),
@@ -600,6 +601,14 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             // returns the *template* height (tip+1) = exactly the block being mined. Captured per-sweep and
             // carried in `pending` so BLOCK FOUND logs it even if the tip moves before the pool replies.
             let job_height = stats.lock().unwrap().net_height;
+            // did the tip move during this grind? compare the ground prevhash to the latest job's prevhash
+            let still_current = {
+                let latest = if is_dev { dev.as_ref().and_then(|d| d.job.as_ref()) } else { user.job.as_ref() };
+                match latest.and_then(|j| j.get(1)).and_then(|v| v.as_str()) {
+                    Some(cur) => cur == prevhash,
+                    None => true,   // unknown → submit rather than silently drop
+                }
+            };
             let mut sweep_best = 0.0f64;
             let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
             for nh in nonces {
@@ -607,6 +616,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                     Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; } nbits != 0 && hash_le_target(&h, &net_target) }
                     None => false,
                 };
+                if !still_current { continue; }   // stale sweep (a block landed mid-grind) — don't submit worthless shares
                 conn.subid += 1; let sid = conn.subid;
                 conn.pending.insert(sid, (nh.clone(), is_block, job_height));
                 send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
