@@ -4,10 +4,9 @@ cd "$(dirname "$0")"
 
 # pyblockMiner build — cross-platform.
 #   Linux  : builds the OpenCL GPU grinder (gpu/gpu_grind) + the Rust miner. Falls back to
-#            CPU-only if the OpenCL dev headers are missing (instead of aborting).
-#   macOS  : builds CPU-only. GPU mining uses OpenCL, which Apple deprecated, so the miner
-#            auto-detects no NVIDIA GPU and mines on all CPU cores (blake2b_simd / NEON).
-#            A Metal GPU backend is future work.
+#            CPU-only if the OpenCL headers or libOpenCL are missing (instead of aborting).
+#   macOS  : builds the Metal GPU grinder (gpu/metal_grind, Apple Silicon) + the Rust miner.
+#            Falls back to CPU only if the Metal build fails. (OpenCL is Linux-only here.)
 
 OS="$(uname -s)"
 
@@ -16,7 +15,7 @@ build_rust() {
   cargo build --release
 }
 
-# ── macOS (Apple Silicon / Intel): CPU-only ──
+# ── macOS (Apple Silicon): Metal GPU grinder + Rust miner (CPU fallback if Metal build fails) ──
 if [ "$OS" = "Darwin" ]; then
   echo "macOS detected — building the Metal GPU grinder + the Rust miner (Apple Silicon)."
   if clang -O2 -fobjc-arc gpu/metal_grind.m -o gpu/metal_grind -framework Metal -framework Foundation 2>&1; then
@@ -45,11 +44,14 @@ fi
 
 if [ "$GPU" = 1 ]; then
   echo "building gpu_grind (OpenCL)…"
-  gcc -O2 -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind -lOpenCL
+  if ! gcc -O2 -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind -lOpenCL; then
+    echo "  ⚠ OpenCL link failed (libOpenCL / ICD loader missing?) — building CPU-only."
+    GPU=0
+  fi
 fi
 
 build_rust
 echo
 if [ "$GPU" = 1 ]; then echo "done (GPU + CPU)."; else echo "done (CPU-only — no OpenCL)."; fi
-echo "  1) generate an address:  python3 tools/genaddr.py"
-echo "  2) mine:                 ./target/release/pyblockMiner --addr <your_address>"
+echo "  1) address:  ./target/release/pyblockMiner --genaddr <mainnet|testnet4|regtest>"
+echo "  2) mine:     ./target/release/pyblockMiner --network <net> --addr <address> --pool <host:port>"

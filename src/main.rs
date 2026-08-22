@@ -274,27 +274,45 @@ fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32
     out.into_inner().unwrap()
 }
 
-struct Daemon { _child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout>, name: String, weight: f64 }
+struct Daemon { _child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout>, name: String, weight: f64, dead: bool }
 fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     let mut child = Command::new(gpu_bin())
         .args(["daemon", &dev.to_string()])
         .current_dir(gpu_dir())
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().ok()?;
     let stdin = child.stdin.take()?;
     let stdout = BufReader::new(child.stdout.take()?);
-    Some(Daemon { _child: child, stdin, stdout, name, weight: 1.0 })
+    // Wait for the grinder's "READY <device>" on stderr before trusting it. Both grinders do all device/
+    // kernel setup AFTER exec and exit on failure, so a spawn success alone doesn't mean a working GPU.
+    // If it never signals READY (died/hung), drop it → the engine falls back to CPU instead of hashing zero.
+    let stderr = child.stderr.take()?;
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let got = BufReader::new(stderr).read_line(&mut line).ok().filter(|&n| n > 0).map(|_| line.trim().to_string());
+        let _ = tx.send(got);
+    });
+    match rx.recv_timeout(Duration::from_secs(8)).ok().flatten() {
+        Some(l) if l.starts_with("READY") => {
+            let dn = l.strip_prefix("READY").unwrap_or("").trim();
+            let name = if dn.is_empty() { name } else { dn.to_string() };
+            Some(Daemon { _child: child, stdin, stdout, name, weight: 1.0, dead: false })
+        }
+        _ => { let _ = child.kill(); None }
+    }
 }
 fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
              prevhash: &str, ntime: &str, work_root: &str, bits: u32) -> (Vec<String>, Vec<f64>, f64) {
     let secs = 0.35f64;
     let space: u64 = 1u64 << 32;
-    let gpu_caps: Vec<u64> = ds.iter().map(|d| ((d.weight * 1e9 * secs) as u64).max(1 << 22)).collect();
+    let gpu_caps: Vec<u64> = ds.iter().map(|d| if d.dead { 0 } else { ((d.weight * 1e9 * secs) as u64).max(1 << 22) }).collect();
     let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
     let total: u64 = gpu_caps.iter().sum::<u64>() + cpu_cap;
     let sweep: u64 = if total == 0 || total >= space { space } else { total };
     let mut cursor: u64 = 0;
     for (i, d) in ds.iter_mut().enumerate() {
+        if d.dead || gpu_caps[i] == 0 { continue; }   // dead daemons get no job; their nonce share went to live workers via `total`
         let span = if total > 0 { (sweep as u128 * gpu_caps[i] as u128 / total as u128) as u64 } else { 0 };
         let _ = writeln!(d.stdin, "{} {} {} {} {} {}", prevhash, ntime, work_root, bits, cursor, span.max(1));
         let _ = d.stdin.flush();
@@ -313,10 +331,11 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
     }
     let mut gpu_ghs = vec![0.0f64; ds.len()];
     for (i, d) in ds.iter_mut().enumerate() {
+        if d.dead { continue; }   // no job was sent to a dead daemon
         loop {
             let mut line = String::new();
             match d.stdout.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => { d.dead = true; d.weight = 0.0; break; }   // daemon died → mark dead so its nonce range redistributes next cycle
                 Ok(_) => {
                     let t = line.trim();
                     if let Some(rest) = t.strip_prefix("END ") {
@@ -334,7 +353,22 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
 fn send(stream: &mut TcpStream, v: &Value) {
     let mut s = serde_json::to_string(v).unwrap();
     s.push('\n');
-    let _ = stream.write_all(s.as_bytes());
+    // the socket is non-blocking (so reads can poll); a plain write_all would DROP a mining.submit on
+    // WouldBlock. Loop until the whole line is sent, retrying briefly on WouldBlock (bounded) so submits
+    // never partial-write.
+    let buf = s.as_bytes(); let mut off = 0; let start = Instant::now();
+    while off < buf.len() {
+        match stream.write(&buf[off..]) {
+            Ok(0) => break,
+            Ok(n) => off += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() > Duration::from_secs(5) { break; }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 struct Conn {
@@ -470,7 +504,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
 
     loop {
         // read current live target (pool/addr/donate change when the user switches stratum)
-        let (pool, addr, donate) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.donate) };
+        let (pool, addr, donate, network) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.donate, t.network.clone()) };
         if addr.is_empty() {
             { let mut st = stats.lock().unwrap(); st.connected = false;
               st.logline("no address set — go to SETUP [5] to set/generate one".into()); }
@@ -493,7 +527,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
         loop {
             // live switch: if the shared target's pool/addr changed, drop + reconnect
             { let t = tgt.lock().unwrap();
-              if t.pool != pool || t.addr != addr {
+              if t.pool != pool || t.addr != addr || t.network != network || t.donate != donate {
                 stats.lock().unwrap().logline(format!("switching stratum → {}", t.pool)); break;
               } }
             if !user.pump(&stats) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); } break; }
@@ -738,13 +772,13 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
             "It's solo-lottery: you mine to YOUR OWN address and keep 99.1% of any block you find,",
             "straight to that address. Non-custodial — the pool never holds your coins. PyBLØCK fee 0.9%.",
             "",
-            "It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live hashrate, blocks, difficulty.",
+            "It saturates your GPU (NVIDIA/OpenCL on Linux, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
         ]),
         ("The hardfork — honest status", vec![
             "BLAKE2b is NOT merged and NOT active on Bitcoin mainnet — there is no activation date.",
             "MAINNET is still SHA-256. Do not expect real rewards on mainnet yet.",
             "",
-            "TESTNET4: the change activates on the public testnet4 chain at block 149460 (Knots 29.4.1 RC).",
+            "TESTNET4: the change activates on the public testnet4 chain at a flag-day block (Knots 29.4.1 RC).",
             "That is the FIRST place you can actually mine BLAKE2b on a public chain.",
             "⚠ testnet4 coins have NO monetary value — it's for testing / being ready.",
         ]),
@@ -856,7 +890,6 @@ fn save_wif(net: &str, addr: &str, wif: &str) -> Option<String> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)); }
-    use std::io::Write;
     f.write_all(format!("{}\t{}\t{}\n", net, addr, wif).as_bytes()).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
@@ -935,7 +968,7 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
             },
             Tab::Learn => match code {
                 KeyCode::Left => { if app.learn_page > 0 { app.learn_page -= 1; } }
-                KeyCode::Right => { app.learn_page += 1; }
+                KeyCode::Right => { if app.learn_page + 1 < 4 { app.learn_page += 1; } }   // 4 LEARN pages
                 _ => {}
             },
             Tab::Setup => match code {
@@ -1008,9 +1041,11 @@ fn main() {
     let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new() };
     app.strat_cur = app.cfg.selected;
 
-    // devices
+    // devices — attempt the GPU grinder even if no GPU is name-detected (it enumerates OpenCL/Metal and
+    // signals READY; if there's no device or it isn't built, spawn_daemon drops it and the engine falls
+    // back to CPU). `--cpu` forces CPU-only.
     let detected = gpu_names().len() as u32;
-    let ngpu = app.cfg.gpus.unwrap_or(detected);
+    let ngpu = if app.cfg.cpu { 0 } else { app.cfg.gpus.unwrap_or(if detected > 0 { detected } else { 1 }) };
     let mut use_cpu = app.cfg.cpu;
     if ngpu == 0 { use_cpu = true; }
     let cpu_threads = if use_cpu { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) } else { 0 };
@@ -1067,6 +1102,9 @@ fn main() {
         }
     }
 
+    // restore the terminal (leave raw mode / alt screen) even if a thread or handler panics
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| { ratatui::restore(); default_hook(info); }));
     let mut terminal = ratatui::init();
     loop {
         { let st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); }

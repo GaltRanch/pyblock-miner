@@ -29,14 +29,15 @@ PyBLØCK  1·MINE  2·STRATUMS  3·LEARN  4·NETWORK  5·SETUP  6·HELP
 
 ## Requirements
 
-- An **NVIDIA GPU** (one or more) with the proprietary driver + OpenCL (`nvidia-smi` and `libOpenCL`). **No GPU?** It falls back to CPU.
 - **Rust** (`cargo`) — https://rustup.rs
-- **gcc** (to build the OpenCL host)
-- **OpenCL headers + ICD loader** (to compile the grinder). Many systems have the NVIDIA runtime but **not** the dev headers → the classic `CL/cl.h: No such file or directory` build error. Install them:
-  - Debian/Ubuntu: `sudo apt install ocl-icd-opencl-dev opencl-headers`
-  - Fedora: `sudo dnf install ocl-icd-devel opencl-headers`
-  - Arch: `sudo pacman -S opencl-icd-loader opencl-headers`
-- **Python 3** with `ecdsa` (only for the address generator): `pip install ecdsa`
+- **GPU (optional — no GPU falls back to CPU):**
+  - **Linux:** an OpenCL GPU (NVIDIA / AMD / Intel). Needs `gcc` + OpenCL headers + ICD loader to build the grinder:
+    - Debian/Ubuntu: `sudo apt install ocl-icd-opencl-dev opencl-headers`
+    - Fedora: `sudo dnf install ocl-icd-devel opencl-headers`
+    - Arch: `sudo pacman -S opencl-icd-loader opencl-headers`
+    - Missing headers/lib? `./build.sh` just builds CPU-only (no abort).
+  - **macOS (Apple Silicon):** the Metal grinder builds with the Xcode command-line tools (`xcode-select --install`). No OpenCL needed.
+- Address generation is **native (Rust)** — no Python required.
 
 ## Build
 
@@ -44,21 +45,21 @@ PyBLØCK  1·MINE  2·STRATUMS  3·LEARN  4·NETWORK  5·SETUP  6·HELP
 ./build.sh
 ```
 
-This compiles the OpenCL grinder (`gpu/gpu_grind`) and the miner (`target/release/pyblockMiner`).
+On Linux this builds the OpenCL grinder (`gpu/gpu_grind`); on macOS the Metal grinder (`gpu/metal_grind`); plus the miner (`target/release/pyblockMiner`). It falls back to CPU-only if the GPU toolchain isn't available.
 
 ## 1) Get an address
 
 Easiest: launch the miner, go to **SETUP** (`5`), press **`g`** to generate an address for the selected network (or **`e`** to paste one you already control). It's saved for you.
 
-Or from the shell (this is your mining "username" — you keep the private key):
+Or from the shell (native — this is your mining "username"; you keep the private key):
 
 ```bash
-python3 tools/genaddr.py              # mainnet  → bc1…
-python3 tools/genaddr.py --testnet4   # testnet4 → tb1…
-python3 tools/genaddr.py --regtest    # regtest  → bcrt1…
+./target/release/pyblockMiner --genaddr mainnet    # bc1…
+./target/release/pyblockMiner --genaddr testnet4   # tb1…
+./target/release/pyblockMiner --genaddr regtest    # bcrt1…
 ```
 
-It prints the address and its WIF private key. Save the key — it's yours.
+It prints the address and its WIF private key (also saved to `~/.config/pyblockminer/keys.txt`, mode `0600`). Save the key — it's yours.
 
 ## 2) Mine
 
@@ -112,17 +113,19 @@ addr  1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2
 
 - **Native SV1 stratum client** (Rust): connects to the pool, subscribes/authorizes with your address as the username, receives BLAKE2b work.
 - **Work construction**: builds the BLAKE2b work (`work_root = BLAKE2b(0x00 || coinb1 || extranonce)`) for each job.
-- **N-GPU + CPU grinding**: spawns one persistent `gpu_grind` (OpenCL) process per GPU. The kernel is compiled **once**; the nonce space is split across GPUs (and CPU) proportionally to their speed, so every device stays busy. Each candidate is **verified on the CPU** with a reference BLAKE2b before being submitted (the miner never trusts the GPU blindly).
+- **N-GPU + CPU grinding**: spawns one persistent grinder per GPU (`gpu_grind` OpenCL on Linux, `metal_grind` Metal on macOS/Apple Silicon). The kernel is compiled **once**; the nonce space is split across GPUs (and CPU) proportionally to their speed, so every device stays busy. Each candidate is **verified on the CPU** with a reference BLAKE2b before being submitted (the miner never trusts the GPU blindly).
 - **Non-custodial payout**: the pool builds a coinbase that pays your address directly (99.1%) plus a 0.9% PyBLØCK fee output. The pool never holds your rewards.
 
 ## Files
 
 ```
-src/main.rs        the miner (Rust + ratatui TUI: tabs, live stratum switching, saved config)
-gpu/gpu_grind.c    OpenCL host: search_b2b kernel driver, oneshot + persistent daemon modes
+src/main.rs        the miner (Rust + ratatui TUI: tabs, live stratum switching, native address gen, saved config)
+gpu/gpu_grind.c    OpenCL host (Linux): search_b2b kernel driver, oneshot + persistent daemon modes
 gpu/blake2b.cl     BLAKE2b-256 OpenCL kernel
-tools/genaddr.py   Bitcoin address + WIF generator (mainnet / testnet4 / regtest)
-build.sh           builds everything
+gpu/metal_grind.m  Metal host (macOS / Apple Silicon): same daemon protocol as gpu_grind
+gpu/blake2b.metal  BLAKE2b-256 Metal compute shader
+tools/genaddr.py   legacy Python address generator (superseded by --genaddr; kept for reference)
+build.sh           builds everything (Linux OpenCL / macOS Metal, CPU fallback)
 ```
 
 Config is saved at `~/.config/pyblockminer/config.json` (stratums, selected pool, per-network addresses, donation, devices).

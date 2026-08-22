@@ -65,65 +65,6 @@ inline void compress(ulong h[8], const ulong m[16], ulong t, int last){
   for(int i=0;i<8;i++) h[i]^= v[i]^v[8+i];
 }
 
-// hash de mensaje corto (len<=128, un bloque) -> digest de 32 bytes. Para validar test vectors.
-__kernel void hash_one(__global const uchar* msg, uint len, __global uchar* out){
-  ulong h[8];
-  for(int i=0;i<8;i++) h[i]=IV[i];
-  h[0]^=0x0000000001010020UL;      // param: digest=32, key=0, fanout=1, depth=1
-  ulong m[16];
-  for(int i=0;i<16;i++){ ulong w=0; for(int j=0;j<8;j++){ int idx=i*8+j; uchar b=(idx<(int)len)?msg[idx]:0; w|=((ulong)b)<<(8*j);} m[i]=w; }
-  compress(h,m,(ulong)len,1);
-  for(int i=0;i<32;i++) out[i]=(uchar)(h[i/8]>>(8*(i%8)));
-}
-
-// benchmark: cada work-item computa `iter` hashes BLAKE2b-256 de un header de 80 bytes
-// con nonce rodante (palabra 9 = bytes 72..79). Acumula para que no se optimice.
-__kernel void bench(__global const uchar* hdr, ulong base, uint iter, __global ulong* acc){
-  uint gid=get_global_id(0);
-  ulong m[16];                     // m0 directo del header: 80B = 10 ulongs LE; palabras 10..15 = 0.
-  for(int i=0;i<10;i++){ ulong w=0; for(int j=0;j<8;j++){ int idx=i*8+j; uchar b=(idx<80)?hdr[idx]:0; w|=((ulong)b)<<(8*j);} m[i]=w; }
-  for(int i=10;i<16;i++) m[i]=0;
-  ulong nonce = base + (ulong)gid*(ulong)iter;
-  ulong a=0;
-  for(uint k=0;k<iter;k++){
-    m[9]=nonce+k;                  // solo cambia la palabra del nonce; el resto de m ya está en registros
-    ulong h[8];
-    for(int i=0;i<8;i++) h[i]=IV[i];
-    h[0]^=0x0000000001010020UL;
-    compress(h,m,80,1);
-    a ^= h[0];
-  }
-  acc[gid]=a;
-}
-
-// ── minero: busca nonces cuyo hash BLAKE2b-256 <= target de 256 bits. ───────────────────────
-// hash y target tratados como enteros LITTLE-ENDIAN de 256 bits: h[0]=palabra baja .. h[3]=palabra
-// alta; los leading-zeros de dificultad caen en la parte ALTA (h[3]). out[0]=contador atómico,
-// out[1..]=gids ganadores (el host reconstruye nonce = nonce_base + gid y lo verifica).
-// ⚠ CONFIRMAR con la referencia de Luke: (a) offset del nonce (aquí m[9]=bytes 72..79) y
-//   (b) la convención exacta de byte-order del hash vs target. Ambos son cambios de 1 línea.
-__kernel void search(__global const uchar* hdr, ulong nonce_base, uint iter,
-                     ulong t0, ulong t1, ulong t2, ulong t3,
-                     volatile __global uint* out){
-  uint gid=get_global_id(0);
-  ulong m[16];
-  for(int i=0;i<10;i++){ ulong w=0; for(int j=0;j<8;j++){ int idx=i*8+j; uchar b=(idx<80)?hdr[idx]:0; w|=((ulong)b)<<(8*j);} m[i]=w; }
-  for(int i=10;i<16;i++) m[i]=0;
-  ulong start = nonce_base + (ulong)gid*(ulong)iter;   // cada thread barre `iter` nonces consecutivos → amortiza el overhead de lanzada
-  for(uint k=0;k<iter;k++){
-    m[9]=start+k;                  // ⚠ posición del nonce — confirmar con la referencia
-    ulong h[8];
-    for(int i=0;i<8;i++) h[i]=IV[i];
-    h[0]^=0x0000000001010020UL;
-    compress(h,m,80,1);
-    bool win = (h[3]<t3) || (h[3]==t3 && (h[2]<t2 || (h[2]==t2 && (h[1]<t1 || (h[1]==t1 && h[0]<=t0)))));
-    if(win){
-      uint idx=atomic_inc(&out[0]);
-      if(idx<255u) out[1u+idx]=gid*iter+k;   // offset dentro de la lanzada; host: nonce = nonce_base + offset
-    }
-  }
-}
-
 // byte-swap de 64 bits (LE<->BE)
 inline ulong bswap64(ulong x){
   return ((x&0x00000000000000FFUL)<<56)|((x&0x000000000000FF00UL)<<40)|

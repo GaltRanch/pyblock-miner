@@ -118,27 +118,29 @@ static double gpu_grind_range(Gpu*g, const uint8_t hdr[80], uint64_t T0,uint64_t
     uint64_t span=(nspan-done<per)?(nspan-done):per;
     if(base>=(1ULL<<32)) break;
     if(base+span>(1ULL<<32)) span=(1ULL<<32)-base;
-    uint64_t gs=(span+iter-1)/iter;
-    ((uint32_t*)[g->mout contents])[0]=0;   // clear winner counter (Shared/unified memory)
-    id<MTLCommandBuffer> cb=[g->q commandBuffer];
-    id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
-    [enc setComputePipelineState:g->pso];
-    [enc setBuffer:g->mhdr offset:0 atIndex:0];
-    [enc setBytes:&base length:sizeof(uint64_t) atIndex:1];
-    [enc setBytes:&iter length:sizeof(uint32_t) atIndex:2];
-    [enc setBytes:T length:sizeof(T) atIndex:3];
-    [enc setBuffer:g->mout offset:0 atIndex:4];
-    [enc dispatchThreads:MTLSizeMake(gs,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-    [enc endEncoding];
-    [cb commit]; [cb waitUntilCompleted];
-    uint32_t* out=(uint32_t*)[g->mout contents];
-    uint32_t n=out[0]; if(n>255)n=255;
-    for(uint32_t i=0;i<n;i++){
-      uint64_t nonce=base+(uint64_t)out[1+i]; if(nonce>=(1ULL<<32))continue;
-      uint8_t hh[80]; memcpy(hh,hdr,80);
-      hh[32]=(uint8_t)nonce; hh[33]=(uint8_t)(nonce>>8); hh[34]=(uint8_t)(nonce>>16); hh[35]=(uint8_t)(nonce>>24);
-      uint8_t dg[32]; blake2b256(dg,hh,80);
-      if(be_le(dg,tgt_be)){ printf("%08llx\n",(unsigned long long)nonce); }
+    @autoreleasepool {   // drain per-launch Metal objects (command buffer/encoder) so memory stays flat over a long session
+      uint64_t gs=(span+iter-1)/iter;
+      ((uint32_t*)[g->mout contents])[0]=0;   // clear winner counter (Shared/unified memory)
+      id<MTLCommandBuffer> cb=[g->q commandBuffer];
+      id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
+      [enc setComputePipelineState:g->pso];
+      [enc setBuffer:g->mhdr offset:0 atIndex:0];
+      [enc setBytes:&base length:sizeof(uint64_t) atIndex:1];
+      [enc setBytes:&iter length:sizeof(uint32_t) atIndex:2];
+      [enc setBytes:T length:sizeof(T) atIndex:3];
+      [enc setBuffer:g->mout offset:0 atIndex:4];
+      [enc dispatchThreads:MTLSizeMake(gs,1,1) threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+      [enc endEncoding];
+      [cb commit]; [cb waitUntilCompleted];
+      uint32_t* out=(uint32_t*)[g->mout contents];
+      uint32_t n=out[0]; if(n>255)n=255;
+      for(uint32_t i=0;i<n;i++){
+        uint64_t nonce=base+(uint64_t)out[1+i]; if(nonce>=(1ULL<<32))continue;
+        uint8_t hh[80]; memcpy(hh,hdr,80);
+        hh[32]=(uint8_t)nonce; hh[33]=(uint8_t)(nonce>>8); hh[34]=(uint8_t)(nonce>>16); hh[35]=(uint8_t)(nonce>>24);
+        uint8_t dg[32]; blake2b256(dg,hh,80);
+        if(be_le(dg,tgt_be)){ printf("%08llx\n",(unsigned long long)nonce); }
+      }
     }
     base+=span; done+=span;
   }
