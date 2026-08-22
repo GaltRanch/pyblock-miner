@@ -374,7 +374,7 @@ fn send(stream: &mut TcpStream, v: &Value) {
 
 struct Conn {
     stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
-    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool)>, subid: u64, addr: String, is_dev: bool, idle: Instant,
+    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64)>, subid: u64, addr: String, is_dev: bool, idle: Instant,
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
@@ -425,19 +425,20 @@ impl Conn {
             } else if meth == Some("mining.notify") {
                 self.job = m.get("params").and_then(|v| v.as_array()).cloned();
             } else if let Some(idv) = id {
-                if let Some((nonce, is_block)) = self.pending.remove(&idv) {
+                if let Some((nonce, is_block, height)) = self.pending.remove(&idv) {
+                    let hs = if height > 0 { format!("height {} ", height) } else { String::new() };
                     let mut st = stats.lock().unwrap();
                     if m.get("result") == Some(&Value::Bool(true)) {
                         if self.is_dev {
                             if is_block {
                                 st.donated += 1; let n = st.donated;
-                                st.logline(format!("💚 donation BLOCK (#{}) → developer · thank you! · nonce {}", n, nonce));
+                                st.logline(format!("💚 donation BLOCK {}(#{}) → developer · thank you! · nonce {}", hs, n, nonce));
                             }
                         } else {
                             st.accepted += 1;
                             if is_block {
                                 st.blocks += 1; let n = st.blocks;
-                                st.logline(format!("🎉 BLOCK FOUND (#{})  paid to your address · nonce {}", n, nonce));
+                                st.logline(format!("🎉 BLOCK FOUND {}(#{})  paid to your address · nonce {}", hs, n, nonce));
                             } else {
                                 let a = st.accepted;
                                 st.logline(format!("✓ share accepted (#{}) · nonce {}", a, nonce));
@@ -460,6 +461,18 @@ impl Conn {
             _ => None,
         }
     }
+}
+
+// Parse the block height (BIP34) out of the coinbase prefix (coinb1). Layout:
+//   version(4) | vin_count(1) | prev_txid(32) | prev_vout(4) | scriptSig_len(1) | scriptSig…
+// and the scriptSig begins with a minimal push of the height (little-endian). Returns 0 if unparseable.
+fn coinbase_height(coinb1: &[u8]) -> u64 {
+    if coinb1.len() < 43 { return 0; }
+    let push = coinb1[42] as usize;                     // first scriptSig opcode = number of height bytes
+    if push == 0 || push > 8 || 43 + push > coinb1.len() { return 0; }
+    let mut h = 0u64;
+    for i in 0..push { h |= (coinb1[43 + i] as u64) << (8 * i); }
+    h
 }
 
 fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, String, String, String, String) {
@@ -577,6 +590,9 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             //  zeroed out every submission: "hashes but never submits". Let the pool judge staleness instead.)
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
             let net_target = nbits_to_target(nbits);
+            // block height for THIS sweep's job (BIP34 in coinb1) — captured now so it's correct even if
+            // the tip moves before the pool replies; carried in `pending` so BLOCK FOUND logs the real height.
+            let job_height = jobv.get(2).and_then(|v| v.as_str()).map(|s| coinbase_height(&hex::decode(s).unwrap_or_default())).unwrap_or(0);
             let mut sweep_best = 0.0f64;
             let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
             for nh in nonces {
@@ -585,7 +601,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                     None => false,
                 };
                 conn.subid += 1; let sid = conn.subid;
-                conn.pending.insert(sid, (nh.clone(), is_block));
+                conn.pending.insert(sid, (nh.clone(), is_block, job_height));
                 send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
             }
             if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
