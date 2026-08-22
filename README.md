@@ -37,15 +37,17 @@ PyBLØCK  1·MINE  2·STRATUMS  3·LEARN  4·NETWORK  5·SETUP  6·HELP
     - Arch: `sudo pacman -S opencl-icd-loader opencl-headers`
     - Missing headers/lib? `./build.sh` just builds CPU-only (no abort).
   - **macOS (Apple Silicon):** the Metal grinder builds with the Xcode command-line tools (`xcode-select --install`). No OpenCL needed.
+  - **Windows:** an OpenCL GPU. Build the grinder (`gpu\gpu_grind.exe`) with either MinGW-w64 `gcc` (able to link `-lOpenCL`) **or** MSVC Build Tools + the NVIDIA CUDA Toolkit (defines `CUDA_PATH`, ships `OpenCL.lib`). No toolchain? `build.bat` just builds CPU-only.
 - Address generation is **native (Rust)** — no Python required.
 
 ## Build
 
 ```bash
-./build.sh
+./build.sh           # Linux / macOS
+build.bat            # Windows
 ```
 
-On Linux this builds the OpenCL grinder (`gpu/gpu_grind`); on macOS the Metal grinder (`gpu/metal_grind`); plus the miner (`target/release/pyblockMiner`). It falls back to CPU-only if the GPU toolchain isn't available.
+On Linux this builds the OpenCL grinder (`gpu/gpu_grind`); on macOS the Metal grinder (`gpu/metal_grind`); on Windows the OpenCL grinder (`gpu\gpu_grind.exe`); plus the miner (`target/release/pyblockMiner`, or `pyblockMiner.exe` on Windows). It falls back to CPU-only if the GPU toolchain isn't available. The miner auto-appends the `.exe` suffix when locating the grinder on Windows.
 
 ## 1) Get an address
 

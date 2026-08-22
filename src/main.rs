@@ -119,9 +119,10 @@ fn gpu_dir() -> String {
 }
 fn gpu_bin() -> String {
     if let Ok(b) = std::env::var("PYBLOCK_GPU_BIN") { return b; }
-    let name = if cfg!(target_os = "macos") { "metal_grind" } else { "gpu_grind" };
+    let base = if cfg!(target_os = "macos") { "metal_grind" } else { "gpu_grind" };
+    let name = format!("{}{}", base, std::env::consts::EXE_SUFFIX);   // ".exe" on Windows, "" on Linux/macOS
     let cand = format!("{}/{}", gpu_dir(), name);
-    if Path::new(&cand).exists() { cand } else { name.into() }
+    if Path::new(&cand).exists() { cand } else { name }
 }
 fn gpu_names() -> Vec<String> {
     #[cfg(target_os = "macos")]
