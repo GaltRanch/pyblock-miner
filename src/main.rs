@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wra
 const DONATE_POOL: &str = "pool.pyblock.xyz:23110";
 const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
 const DONATE_MIN: f64 = 2.0;
+const VERSION: &str = env!("CARGO_PKG_VERSION");   // from Cargo.toml — shown in TUI footer, --version, and the stratum UA
 
 // PyBLØCK palette
 const GRN: Color = Color::Rgb(0, 255, 65);
@@ -379,7 +380,7 @@ impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
         let mut stream = TcpStream::connect(pool).ok()?;
         stream.set_nonblocking(true).ok();
-        let sub_ua = if is_dev { "PyBLOCK-GPU/BLAKE2b-donate" } else { "PyBLOCK-GPU/BLAKE2b" };
+        let sub_ua = if is_dev { format!("PyBLOCK-GPU/BLAKE2b-donate/{}", VERSION) } else { format!("PyBLOCK-GPU/BLAKE2b/{}", VERSION) };
         send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":[sub_ua]}));
         send(&mut stream, &json!({"id":2,"method":"mining.authorize","params":[addr,"x"]}));
         Some(Conn { stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
@@ -692,6 +693,9 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
                         Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))])
     };
     f.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), outer[2]);
+    // version — bottom-right corner
+    f.render_widget(Paragraph::new(Line::from(Span::styled(format!("pyblockMiner v{} ", VERSION), Style::new().fg(MUT))))
+        .alignment(ratatui::layout::Alignment::Right), outer[2]);
 }
 
 fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
@@ -1012,6 +1016,7 @@ fn main() {
             "--cpu" => { cfg.cpu = true; }
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             "--genaddr" | "--newaddr" => { let n = if i + 1 < args.len() && !args[i + 1].starts_with("--") { i += 1; net_cfg(&args[i]).name.to_string() } else { "mainnet".to_string() }; genaddr_net = Some(n); }
+            "--version" | "-V" => { println!("pyblockMiner {}", VERSION); return; }
             "--headless" | "--daemon" | "--no-tui" => { headless = true; }
             _ => {}
         }
