@@ -18,11 +18,16 @@ build_rust() {
 
 # ── macOS (Apple Silicon / Intel): CPU-only ──
 if [ "$OS" = "Darwin" ]; then
-  echo "macOS detected — building CPU-only (OpenCL GPU is Linux-only; the miner falls back to CPU)."
+  echo "macOS detected — building the Metal GPU grinder + the Rust miner (Apple Silicon)."
+  if clang -O2 -fobjc-arc gpu/metal_grind.m -o gpu/metal_grind -framework Metal -framework Foundation 2>&1; then
+    echo "  ✓ metal_grind (Metal) built — will use the Apple GPU."
+  else
+    echo "  ⚠ metal_grind build failed — the miner falls back to CPU automatically."
+  fi
   build_rust
   echo
-  echo "done (CPU-only)."
-  echo "  1) address:  python3 tools/genaddr.py --testnet4"
+  echo "done."
+  echo "  1) address:  ./target/release/pyblockMiner --genaddr testnet4"
   echo "  2) mine:     ./target/release/pyblockMiner --network testnet4 --addr <tb1…> --pool <host:port>"
   exit 0
 fi

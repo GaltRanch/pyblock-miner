@@ -102,29 +102,34 @@ fn save_config(c: &Config) {
 // ── live target shared engine↔UI: switch pools/network without restarting ──
 struct Target { pool: String, addr: String, network: String, donate: f64 }
 
-// ── locate gpu_grind + blake2b.cl ──
+// ── locate the GPU grinder + kernel (Linux: gpu_grind + blake2b.cl · macOS: metal_grind + blake2b.metal) ──
 fn gpu_dir() -> String {
     if let Ok(d) = std::env::var("PYBLOCK_GPU_DIR") { return d; }
+    let has_kernel = |c: &Path| c.join("blake2b.cl").exists() || c.join("blake2b.metal").exists();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = exe.parent() {
             for cand in [p.join("gpu"), p.join("../../gpu"), p.to_path_buf()] {
-                if cand.join("blake2b.cl").exists() { return cand.to_string_lossy().into_owned(); }
+                if has_kernel(&cand) { return cand.to_string_lossy().into_owned(); }
             }
         }
     }
-    if Path::new("gpu/blake2b.cl").exists() { return "gpu".into(); }
+    if has_kernel(Path::new("gpu")) { return "gpu".into(); }
     ".".into()
 }
 fn gpu_bin() -> String {
     if let Ok(b) = std::env::var("PYBLOCK_GPU_BIN") { return b; }
-    let cand = format!("{}/gpu_grind", gpu_dir());
-    if Path::new(&cand).exists() { cand } else { "gpu_grind".into() }
+    let name = if cfg!(target_os = "macos") { "metal_grind" } else { "gpu_grind" };
+    let cand = format!("{}/{}", gpu_dir(), name);
+    if Path::new(&cand).exists() { cand } else { name.into() }
 }
 fn gpu_names() -> Vec<String> {
-    match Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output() {
+    #[cfg(target_os = "macos")]
+    { vec!["Apple GPU (Metal)".to_string()] }   // Apple Silicon = one integrated GPU; metal_grind's READY has the exact name
+    #[cfg(not(target_os = "macos"))]
+    { match Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
         Err(_) => vec![],
-    }
+    } }
 }
 
 #[derive(Default)]
@@ -445,6 +450,11 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
     for dev in 0..ngpu {
         let nm = names.get(dev as usize).cloned().unwrap_or_else(|| format!("GPU {}", dev));
         if let Some(d) = spawn_daemon(dev, nm) { daemons.push(d); }
+    }
+    // if the GPU grinder couldn't start (not built / no device), fall back to CPU so we still mine
+    let mut cpu_threads = cpu_threads;
+    if daemons.is_empty() && cpu_threads == 0 {
+        cpu_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     }
     let mut cpu_rate = 0.05f64;
     { let mut st = stats.lock().unwrap();
