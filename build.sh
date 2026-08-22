@@ -1,20 +1,50 @@
 #!/bin/bash
 set -e
 cd "$(dirname "$0")"
-# preflight: OpenCL dev headers + ICD loader (the usual missing piece — lots of systems have the
-# NVIDIA runtime but not the headers → 'CL/cl.h: No such file or directory').
+
+# pyblockMiner build — cross-platform.
+#   Linux  : builds the OpenCL GPU grinder (gpu/gpu_grind) + the Rust miner. Falls back to
+#            CPU-only if the OpenCL dev headers are missing (instead of aborting).
+#   macOS  : builds CPU-only. GPU mining uses OpenCL, which Apple deprecated, so the miner
+#            auto-detects no NVIDIA GPU and mines on all CPU cores (blake2b_simd / NEON).
+#            A Metal GPU backend is future work.
+
+OS="$(uname -s)"
+
+build_rust() {
+  echo "building pyblockMiner (Rust)…"
+  cargo build --release
+}
+
+# ── macOS (Apple Silicon / Intel): CPU-only ──
+if [ "$OS" = "Darwin" ]; then
+  echo "macOS detected — building CPU-only (OpenCL GPU is Linux-only; the miner falls back to CPU)."
+  build_rust
+  echo
+  echo "done (CPU-only)."
+  echo "  1) address:  python3 tools/genaddr.py --testnet4"
+  echo "  2) mine:     ./target/release/pyblockMiner --network testnet4 --addr <tb1…> --pool <host:port>"
+  exit 0
+fi
+
+# ── Linux: try the OpenCL GPU grinder; fall back to CPU-only if headers absent ──
+GPU=1
 if ! echo '#include <CL/cl.h>' | gcc -fsyntax-only -xc - 2>/dev/null; then
-  echo "✗ OpenCL headers not found (CL/cl.h). Install the OpenCL dev headers + ICD loader:"
+  echo "⚠ OpenCL headers not found (CL/cl.h) — building CPU-only."
+  echo "  For GPU mining, install the OpenCL dev headers + ICD loader and re-run ./build.sh:"
   echo "    Debian/Ubuntu:  sudo apt install ocl-icd-opencl-dev opencl-headers"
   echo "    Fedora:         sudo dnf install ocl-icd-devel opencl-headers"
   echo "    Arch:           sudo pacman -S opencl-icd-loader opencl-headers"
-  exit 1
+  GPU=0
 fi
-echo "building gpu_grind (OpenCL)…"
-gcc -O2 -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind -lOpenCL
-echo "building pyblockMiner…"
-cargo build --release
+
+if [ "$GPU" = 1 ]; then
+  echo "building gpu_grind (OpenCL)…"
+  gcc -O2 -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind -lOpenCL
+fi
+
+build_rust
 echo
-echo "done."
+if [ "$GPU" = 1 ]; then echo "done (GPU + CPU)."; else echo "done (CPU-only — no OpenCL)."; fi
 echo "  1) generate an address:  python3 tools/genaddr.py"
 echo "  2) mine:                 ./target/release/pyblockMiner --addr <your_address>"
