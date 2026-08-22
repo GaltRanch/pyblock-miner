@@ -305,8 +305,7 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     }
 }
 fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
-             prevhash: &str, ntime: &str, work_root: &str, bits: u32) -> (Vec<String>, Vec<f64>, f64) {
-    let secs = 0.35f64;
+             prevhash: &str, ntime: &str, work_root: &str, bits: u32, secs: f64) -> (Vec<String>, Vec<f64>, f64) {
     let space: u64 = 1u64 << 32;
     let gpu_caps: Vec<u64> = ds.iter().map(|d| if d.dead { 0 } else { ((d.weight * 1e9 * secs) as u64).max(1 << 22) }).collect();
     let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
@@ -508,6 +507,12 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
 
     let mut donate_credit = 0.0f64;
     let mut dev_retry = Instant::now();
+    // adaptive sweep length: track the observed block cadence (from the user's prevhash changes) so sweeps
+    // stay short on fast chains (switch to new work sooner → far fewer stale shares + less wasted hashrate)
+    // but keep the efficient default on normal-speed chains.
+    let mut last_prevhash = String::new();
+    let mut last_block_at = Instant::now();
+    let mut block_interval_ema = 30.0f64;   // conservative start → sweep capped at MAX until real cadence is seen
 
     loop {
         // read current live target (pool/addr/donate change when the user switches stratum)
@@ -560,7 +565,18 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 let c = if is_dev { dev.as_mut().unwrap() } else { &mut user };
                 build_work(c, &en1v, &jobv)
             };
-            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &prevhash, &ntime, &work_root, bits);
+            // update the observed block interval from the user's prevhash changes, then size the sweep to a
+            // small fraction of it (clamped): fast chain → short sweep → quick switch; slow chain → 0.35s cap.
+            if !is_dev && prevhash != last_prevhash {
+                if !last_prevhash.is_empty() {
+                    let dt = last_block_at.elapsed().as_secs_f64();
+                    if dt > 0.02 && dt < 600.0 { block_interval_ema = block_interval_ema * 0.7 + dt * 0.3; }
+                }
+                last_prevhash = prevhash.clone();
+                last_block_at = Instant::now();
+            }
+            let sweep_secs = (block_interval_ema * 0.15).clamp(0.06, 0.35);
+            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &prevhash, &ntime, &work_root, bits, sweep_secs);
             {
                 let mut st = stats.lock().unwrap();
                 let mut all = gpu_ghs.clone();
