@@ -567,7 +567,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 st.hr_total = st.gpu_ghs.iter().sum();
                 let hv = (st.hr_total * 100.0) as u64;
                 st.hr_hist.push_back(hv);
-                while st.hr_hist.len() > 160 { st.hr_hist.pop_front(); }
+                while st.hr_hist.len() > 512 { st.hr_hist.pop_front(); }   // keep enough samples so the Sparkline fills wide terminals (it shows the last <width> points)
             }
             user.pump(&stats);
             if let Some(d) = dev.as_mut() { d.pump(&stats); }
@@ -740,7 +740,10 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
     }
     if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
     f.render_widget(Paragraph::new(Text::from(glines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), c[3]);
-    let data: Vec<u64> = st.hr_hist.iter().cloned().collect();
+    // ratatui's Sparkline renders the FIRST N=min(width,len) points, so feed it exactly the last inner_w
+    // samples → the chart fills the full terminal width and updates live (adapts to any window size).
+    let inner_w = (c[4].width.saturating_sub(2) as usize).max(1);   // block borders eat 2 columns
+    let data: Vec<u64> = st.hr_hist.iter().rev().take(inner_w).rev().cloned().collect();
     f.render_widget(Sparkline::default().block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" hashrate ", Style::new().fg(MUT)))).data(&data).style(Style::new().fg(GRN)), c[4]);
     let items: Vec<ListItem> = st.log.iter().rev().take(c[5].height.saturating_sub(2) as usize).rev().map(|l| {
         let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB } else if l.contains("rejected") || l.contains("stale") || l.contains("switching") { AMB } else { MUT };
