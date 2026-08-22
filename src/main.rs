@@ -383,6 +383,10 @@ impl Conn {
         let sub_ua = if is_dev { format!("PyBLOCK-GPU/BLAKE2b-donate/{}", VERSION) } else { format!("PyBLOCK-GPU/BLAKE2b/{}", VERSION) };
         send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":[sub_ua]}));
         send(&mut stream, &json!({"id":2,"method":"mining.authorize","params":[addr,"x"]}));
+        // ask the pool for a LOW starting difficulty. Without this, a datum whose starting/min share-diff is
+        // too high for a GPU (e.g. diff 1024 ≈ 13 min/share at 5 GH/s) yields ~no shares, so vardiff never has
+        // data to adjust DOWN → the miner "hashes but never submits". Pools that honor it start low + vardiff up.
+        send(&mut stream, &json!({"id":3,"method":"mining.suggest_difficulty","params":[1]}));
         Some(Conn { stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
             en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now() })
     }
@@ -600,12 +604,16 @@ fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
     ))
 }
 // regtest has no public explorer → balance comes from the PyBLØCK node-backed endpoint (scantxoutset on the local blake2b node)
-const REGTEST_BALANCE_API: &str = "https://pool.pyblock.xyz:8443/api/blake_balance.php";
+const REGTEST_BALANCE_API:  &str = "https://pool.pyblock.xyz:8443/api/blake_balance.php";
+const TESTNET4_BALANCE_API: &str = "https://pool.pyblock.xyz:8443/api/blake_balance_t4.php";
 fn poll_balance(net: &str, addr: &str) -> Option<f64> {
     if addr.is_empty() { return None; }
-    if net == "regtest" {
-        let url = format!("{}?addr={}", REGTEST_BALANCE_API, addr);
-        let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+    // regtest + testnet4 balances come from OUR BLAKE2b node endpoints — public explorers (mempool.space)
+    // do NOT follow the BLAKE2b RC chain, so they'd report 0 even after you've mined blocks.
+    let pool_api = match net { "regtest" => Some(REGTEST_BALANCE_API), "testnet4" => Some(TESTNET4_BALANCE_API), _ => None };
+    if let Some(api) = pool_api {
+        let url = format!("{}?addr={}", api, addr);
+        let body = ureq::get(&url).timeout(Duration::from_secs(12)).call().ok()?.into_string().ok()?;
         let v: Value = serde_json::from_str(&body).ok()?;
         if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
         return v.get("balance_btc").and_then(|x| x.as_f64());
@@ -822,7 +830,7 @@ fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
         Line::from(vec![Span::styled("  your balance ", Style::new().fg(MUT)), Span::styled(bal, Style::new().fg(GRN))]),
         Line::from(vec![Span::styled("  your blocks  ", Style::new().fg(MUT)), Span::styled(format!("{} blocks · {} shares acc · {} rej", st.blocks, st.accepted, st.rejected), Style::new().fg(GRN))]),
         Line::from(""),
-        Line::from(Span::styled("  Network stats come from the PyBLØCK pool for the selected chain. Balance from a public explorer.", Style::new().fg(MUT))),
+        Line::from(Span::styled("  Network stats + balance come from the PyBLØCK node/pool for the selected chain (mainnet balance via public explorer).", Style::new().fg(MUT))),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" NETWORK & YOU ", Style::new().fg(MUT)))), c[1]);
 }
