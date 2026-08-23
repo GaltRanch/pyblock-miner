@@ -4,7 +4,8 @@ REM   Builds the Rust miner (target\release\pyblockMiner.exe) and tries to build
 REM   GPU grinder (gpu\gpu_grind.exe). Falls back to CPU-only if no OpenCL toolchain is found.
 REM
 REM   For GPU mining you need an OpenCL SDK + a C compiler, either:
-REM     - MinGW-w64 gcc that can link -lOpenCL, OR
+REM     - MinGW-w64 gcc that can link -lOpenCL
+REM         (MSYS2: pacman -S mingw-w64-x86_64-opencl-headers mingw-w64-x86_64-opencl-icd), OR
 REM     - MSVC (Build Tools) + NVIDIA CUDA Toolkit (defines CUDA_PATH and ships OpenCL.lib).
 setlocal
 cd /d "%~dp0"
