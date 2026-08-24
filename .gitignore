@@ -2,3 +2,4 @@
 gpu/gpu_grind
 *.o
 Cargo.lock
+gpu/metal_grind
