@@ -2,7 +2,7 @@
 
 **A GPU/CPU miner for the PyBLØCK LOTTO BLAKE2b pool — Bitcoin BLAKE2b, solo lottery, non-custodial.**
 
-A terminal (TUI) miner: you mine to **your own** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your NVIDIA GPUs (and/or CPU cores) and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
+A terminal (TUI) miner: you mine to **your own** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your GPUs — NVIDIA, AMD or Intel (and/or CPU cores) — and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
 
 It's a **tabbed app** — everything is in the program, no restarts needed:
 

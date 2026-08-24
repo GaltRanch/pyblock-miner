@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
@@ -84,8 +84,13 @@ impl Default for Config {
     }
 }
 fn config_path() -> PathBuf {
+    // Cross-platform config dir. On Windows HOME/XDG are usually unset → the old code fell back to "." (CWD),
+    // so saves landed next to wherever the exe was launched and looked like they "didn't save". Prefer the
+    // native Windows locations (%APPDATA%, then %USERPROFILE%\.config) before the CWD fallback.
     let base = std::env::var("XDG_CONFIG_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))
+        .or_else(|| std::env::var("APPDATA").ok())                                        // Windows: %APPDATA%\Roaming
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))         // Linux / macOS
+        .or_else(|| std::env::var("USERPROFILE").ok().map(|h| format!("{}/.config", h)))  // Windows fallback (no APPDATA)
         .unwrap_or_else(|| ".".into());
     PathBuf::from(base).join("pyblockminer").join("config.json")
 }
@@ -128,10 +133,21 @@ fn gpu_names() -> Vec<String> {
     #[cfg(target_os = "macos")]
     { vec!["Apple GPU (Metal)".to_string()] }   // Apple Silicon = one integrated GPU; metal_grind's READY has the exact name
     #[cfg(not(target_os = "macos"))]
-    { match Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
-        Err(_) => vec![],
-    } }
+    {
+        // Ask the grinder to enumerate OpenCL GPUs (NVIDIA / AMD / Intel) — the SAME global list it will drive,
+        // so detection matches what actually mines. Falls back to nvidia-smi if the grinder isn't built yet.
+        if let Ok(o) = Command::new(gpu_bin()).arg("list").current_dir(gpu_dir()).output() {
+            if o.status.success() {
+                let names: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                    .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                if !names.is_empty() { return names; }
+            }
+        }
+        match Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+            Err(_) => vec![],
+        }
+    }
 }
 
 #[derive(Default)]
@@ -815,7 +831,7 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
             "It's solo-lottery: you mine to YOUR OWN address and keep 99.1% of any block you find,",
             "straight to that address. Non-custodial — the pool never holds your coins. PyBLØCK fee 0.9%.",
             "",
-            "It saturates your GPU (NVIDIA/OpenCL on Linux, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
+            "It saturates your GPU (NVIDIA / AMD / Intel via OpenCL on Linux & Windows, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
         ]),
         ("The hardfork — honest status", vec![
             "BLAKE2b is NOT merged and NOT active on Bitcoin mainnet — there is no activation date.",
@@ -1154,7 +1170,10 @@ fn main() {
         { let st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); }
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
-                if handle_key(&mut app, k.code, &tgt, &stats) { break; }
+                // Windows consoles emit Press AND Release (and Repeat) for one physical keypress; Unix emits
+                // only Press. Without this guard, Tab/arrows/typing fire 2-4× per press (numkeys hid it — they're
+                // absolute/idempotent). Filter to Press so every platform behaves like Unix.
+                if k.kind == KeyEventKind::Press && handle_key(&mut app, k.code, &tgt, &stats) { break; }
             }
         }
     }

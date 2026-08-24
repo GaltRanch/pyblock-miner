@@ -1,6 +1,7 @@
 // gpu_grind.c — OpenCL host for the `search_b2b` kernel. Two modes:
 //   oneshot : ./gpu_grind <prevhash64> <ntime8_16> <work_root64> <bits> [device] [nonce_start] [span]
 //   daemon  : ./gpu_grind daemon <device>   → sets up OpenCL + compiles the kernel ONCE, then reads jobs
+//   list    : ./gpu_grind list   → prints every OpenCL GPU (NVIDIA/AMD/Intel), one per line (device detection)
 //             from stdin ("<prevhash64> <ntime16> <work_root64> <bits> <nstart> <span>\n"), grinds each,
 //             prints verified winning nonces (8-hex) to stdout followed by "END <ghs>\n". No per-job overhead.
 // Every winner is verified with a reference BLAKE2b-256 in C (never trusts the GPU blindly).
@@ -71,15 +72,45 @@ static void build_target(int bits, uint8_t tgt_be[32], cl_ulong T[4]){
 
 typedef struct { cl_context ctx; cl_command_queue q; cl_kernel ks; cl_mem mhdr; cl_mem mout; char dn[128]; } Gpu;
 
+// True if this platform is a discrete-GPU vendor (NVIDIA/AMD). We enumerate those FIRST so device 0 is your
+// real card, not an Intel iGPU or a CPU-OpenCL platform. (Back-compat: NVIDIA-only boxes are unchanged.)
+static int is_discrete_platform(cl_platform_id p){
+  char nm[256]=""; clGetPlatformInfo(p,CL_PLATFORM_NAME,256,nm,0);
+  char vd[256]=""; clGetPlatformInfo(p,CL_PLATFORM_VENDOR,256,vd,0);
+  return strstr(nm,"NVIDIA")||strstr(nm,"CUDA")||strstr(nm,"AMD")||strstr(nm,"ATI")
+      || strstr(vd,"NVIDIA")||strstr(vd,"Advanced Micro")||strstr(vd,"AMD");
+}
+
+// Enumerate ALL GPU devices across ALL OpenCL platforms into a GLOBAL list (any vendor: NVIDIA / AMD / Intel).
+// Discrete vendors first, then the rest. Single source of truth for both `list` (detection) and `daemon <N>`
+// (driving) → device index N means the same GPU in both.  Returns the device count.
+static cl_uint enum_gpus(cl_device_id *out, char names[][128], cl_uint maxn){
+  cl_platform_id plat[8]; cl_uint np=0;
+  if(clGetPlatformIDs(8,plat,&np)!=CL_SUCCESS) return 0;
+  cl_uint total=0;
+  for(int pass=0; pass<2; pass++){
+    for(cl_uint i=0;i<np && total<maxn;i++){
+      if((pass==0) != (is_discrete_platform(plat[i])!=0)) continue;   // pass 0 = discrete; pass 1 = the rest
+      cl_device_id devs[16]; cl_uint nd=0;
+      if(clGetDeviceIDs(plat[i],CL_DEVICE_TYPE_GPU,16,devs,&nd)!=CL_SUCCESS) continue;
+      for(cl_uint j=0;j<nd && total<maxn;j++){
+        out[total]=devs[j]; names[total][0]=0;
+        clGetDeviceInfo(devs[j],CL_DEVICE_NAME,128,names[total],0);
+        total++;
+      }
+    }
+  }
+  return total;
+}
+
 static Gpu gpu_setup(int didx){
   Gpu g; memset(&g,0,sizeof(g)); cl_int e;
-  cl_platform_id plat[8]; cl_uint np=0; chk(clGetPlatformIDs(8,plat,&np),"platforms");
-  cl_platform_id P=plat[0];
-  for(cl_uint i=0;i<np;i++){ char nm[128]; clGetPlatformInfo(plat[i],CL_PLATFORM_NAME,128,nm,0);
-    if(strstr(nm,"NVIDIA")||strstr(nm,"CUDA")){P=plat[i];break;} }
-  cl_device_id devs[16]; cl_uint nd=0; chk(clGetDeviceIDs(P,CL_DEVICE_TYPE_GPU,16,devs,&nd),"devices");
+  cl_device_id devs[32]; char names[32][128];
+  cl_uint nd = enum_gpus(devs, names, 32);
+  if(nd==0){ fprintf(stderr,"no OpenCL GPU device found (install your vendor's OpenCL ICD: NVIDIA driver / AMD ROCm or AMDGPU / Intel)\n"); exit(2); }
   if((cl_uint)didx>=nd){ fprintf(stderr,"device %d does not exist (have %u)\n",didx,nd); exit(2); }
-  cl_device_id dev=devs[didx]; clGetDeviceInfo(dev,CL_DEVICE_NAME,128,g.dn,0);
+  cl_device_id dev=devs[didx];
+  snprintf(g.dn,sizeof(g.dn),"%s",names[didx][0]?names[didx]:"OpenCL GPU");
   g.ctx=clCreateContext(0,1,&dev,0,0,&e); chk(e,"ctx");
   g.q=clCreateCommandQueue(g.ctx,dev,0,&e); chk(e,"queue");
   size_t src_n; char*src=slurp("blake2b.cl",&src_n);
@@ -126,6 +157,13 @@ static double gpu_grind_range(Gpu*g, const uint8_t hdr[80], cl_ulong T0,cl_ulong
 }
 
 int main(int argc,char**argv){
+  // ── list mode: print every OpenCL GPU (any vendor), one per line — the miner uses this to detect devices ──
+  if(argc>=2 && !strcmp(argv[1],"list")){
+    cl_device_id devs[32]; char names[32][128];
+    cl_uint nd=enum_gpus(devs,names,32);
+    for(cl_uint i=0;i<nd;i++) printf("%s\n", names[i][0]?names[i]:"OpenCL GPU");
+    return 0;
+  }
   // ── daemon mode: persistent OpenCL, jobs over stdin ──
   if(argc>=3 && !strcmp(argv[1],"daemon")){
     Gpu g=gpu_setup(atoi(argv[2]));
