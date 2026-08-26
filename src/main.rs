@@ -1,5 +1,6 @@
 // pyblockMiner — PyBLØCK LOTTO BLAKE2b miner (Bitcoin BLAKE2b, solo lottery). Rust + ratatui TUI.
-// Tabbed app: MINE dashboard · STRATUMS (switch pools live, no restart) · LEARN · NETWORK · SETUP · HELP.
+// Tabbed app: MINE dashboard · DATA (session analytics) · STRATUMS (switch pools live) · LEARN · NETWORK · SETUP · HELP.
+// `p` pauses/resumes mining from any tab (GPU/CPU idle, pool stays connected).
 // Native SV1 stratum client + N-GPU/CPU BLAKE2b grinding via persistent gpu_grind daemons.
 // You mine to YOUR address → keep 99.1% of every block · PyBLØCK pool fee 0.9%. Non-custodial.
 use std::collections::{HashMap, VecDeque};
@@ -8,6 +9,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
@@ -129,24 +131,37 @@ fn gpu_bin() -> String {
     let cand = format!("{}/{}", gpu_dir(), name);
     if Path::new(&cand).exists() { cand } else { name }
 }
+// Run `<bin> <args…>` and collect stdout lines, but KILL it if it doesn't finish in `secs`.
+// std has no wait-with-timeout, so: read stdout on a thread, recv_timeout, kill on timeout.
+// Why this matters: a broken OpenCL stack (e.g. a ROCm ICD that doesn't support the card, or a
+// rocm+mesa ICD conflict) makes clGetPlatformIDs/clGetDeviceIDs HANG — a plain .output() would then
+// block forever at startup and the miner "never starts" (both GPU and CPU), with no error shown.
+fn run_lines_timeout(bin: &str, args: &[&str], dir: &str, secs: u64) -> Option<Vec<String>> {
+    let mut child = Command::new(bin).args(args).current_dir(dir)
+        .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || { let mut s = String::new(); let _ = out.read_to_string(&mut s); let _ = tx.send(s); });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(s) => {
+            let _ = child.wait();
+            Some(s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        }
+        Err(_) => { let _ = child.kill(); let _ = child.wait(); None }   // hung → kill it, caller falls back (no GPU) instead of freezing
+    }
+}
 fn gpu_names() -> Vec<String> {
     #[cfg(target_os = "macos")]
     { vec!["Apple GPU (Metal)".to_string()] }   // Apple Silicon = one integrated GPU; metal_grind's READY has the exact name
     #[cfg(not(target_os = "macos"))]
     {
         // Ask the grinder to enumerate OpenCL GPUs (NVIDIA / AMD / Intel) — the SAME global list it will drive,
-        // so detection matches what actually mines. Falls back to nvidia-smi if the grinder isn't built yet.
-        if let Ok(o) = Command::new(gpu_bin()).arg("list").current_dir(gpu_dir()).output() {
-            if o.status.success() {
-                let names: Vec<String> = String::from_utf8_lossy(&o.stdout)
-                    .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-                if !names.is_empty() { return names; }
-            }
+        // so detection matches what actually mines. Timeout-guarded so a hung OpenCL stack can't freeze startup.
+        // Falls back to nvidia-smi if the grinder isn't built yet (also timeout-guarded).
+        if let Some(names) = run_lines_timeout(&gpu_bin(), &["list"], &gpu_dir(), 6) {
+            if !names.is_empty() { return names; }
         }
-        match Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output() {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
-            Err(_) => vec![],
-        }
+        run_lines_timeout("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"], ".", 6).unwrap_or_default()
     }
 }
 
@@ -173,9 +188,11 @@ struct Stats {
     net_miners: u64,
     net_ghs: f64,
     net_height: u64,
+    net_nbits: u32,     // network block target (compact nbits) — for the solo-lottery ETA in the DATA tab
     network: String,
     balance_ok: bool,
     balance_btc: f64,
+    paused: bool,       // mirror of the shared pause flag → shown in the UI
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -500,7 +517,7 @@ fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, S
 }
 
 // engine reads the shared Target; when pool/addr changes (live stratum switch) it reconnects.
-fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_threads: usize) {
+fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_threads: usize, paused: Arc<AtomicBool>) {
     let names = gpu_names();
     let mut daemons: Vec<Daemon> = Vec::new();
     for dev in 0..ngpu {
@@ -565,6 +582,21 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             }
             if user.idle.elapsed() > Duration::from_secs(90) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); } break; }
 
+            // PAUSE: user hit `p`. Stop feeding the grinders (GPU/CPU go idle → no work sent, no shares submitted)
+            // but keep the pool connection alive by pumping it, so resume is instant with no reconnect.
+            if paused.load(Ordering::Relaxed) {
+                { let mut st = stats.lock().unwrap();
+                  if !st.paused { st.paused = true; st.logline("⏸ mining paused".into()); }
+                  st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
+                user.pump(&stats);
+                if let Some(d) = dev.as_mut() { d.pump(&stats); }
+                std::thread::sleep(Duration::from_millis(120));
+                continue;
+            } else {
+                let mut st = stats.lock().unwrap();
+                if st.paused { st.paused = false; st.logline("▶ mining resumed".into()); }
+            }
+
             donate_credit += donate / 100.0;
             let dev_ready = dev.as_ref().and_then(|d| d.ready()).is_some();
             let do_donate = donate_credit >= 1.0 && dev_ready;
@@ -611,6 +643,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             // well under the block interval → stale sweeps are a minority (this is NOT the old v0.2.1 bug that
             // dropped everything with fixed 0.35s sweeps ≈ the block time on a fast chain).
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+            if !is_dev && nbits != 0 { stats.lock().unwrap().net_nbits = nbits; }   // network target → DATA-tab solo-lottery ETA
             let net_target = nbits_to_target(nbits);
             // found-block height. The BLAKE2b stratum notify carries NO coinbase (coinb2 empty, merkle []),
             // so coinb1 has no BIP34 height — the pool's reported mining height is the only source. blake_stats
@@ -679,9 +712,9 @@ fn poll_balance(net: &str, addr: &str) -> Option<f64> {
 
 // ═══════════════════════ TABS / UI ═══════════════════════
 #[derive(Clone, Copy, PartialEq)]
-enum Tab { Mine, Stratums, Learn, Network, Setup, Help }
-const TABS: [(Tab, &str); 6] = [
-    (Tab::Mine, "MINE"), (Tab::Stratums, "STRATUMS"), (Tab::Learn, "LEARN"),
+enum Tab { Mine, Data, Stratums, Learn, Network, Setup, Help }
+const TABS: [(Tab, &str); 7] = [
+    (Tab::Mine, "MINE"), (Tab::Data, "DATA"), (Tab::Stratums, "STRATUMS"), (Tab::Learn, "LEARN"),
     (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"),
 ];
 
@@ -694,6 +727,7 @@ struct App {
     input: Option<Input>,
     buf: String,
     msg: String,          // transient status line
+    paused: Arc<AtomicBool>,   // shared with the engine: `p` toggles pause/resume of mining
 }
 impl App {
     fn network(&self) -> String { self.cfg.stratums.get(self.cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()) }
@@ -724,6 +758,7 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     let body = outer[1];
     match app.tab {
         Tab::Mine => render_mine(f, body, st),
+        Tab::Data => render_data(f, body, st),
         Tab::Stratums => render_stratums(f, body, app),
         Tab::Learn => render_learn(f, body, app),
         Tab::Network => render_network(f, body, st, app),
@@ -739,9 +774,11 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     } else if !app.msg.is_empty() {
         Line::from(Span::styled(app.msg.clone(), Style::new().fg(AMB)))
     } else {
-        Line::from(vec![Span::styled(" 1-6 ", Style::new().fg(Color::Black).bg(GRN)),
+        Line::from(vec![Span::styled(" 1-7 ", Style::new().fg(Color::Black).bg(GRN)),
                         Span::styled(" tabs · ", Style::new().fg(MUT)),
                         Span::styled("Tab", Style::new().fg(GRN)), Span::styled(" next · ", Style::new().fg(MUT)),
+                        Span::styled("p", Style::new().fg(GRN)),
+                        Span::styled(if st.paused { " resume · " } else { " pause · " }, Style::new().fg(MUT)),
                         Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))])
     };
     f.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), outer[2]);
@@ -754,7 +791,9 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
     let gpu_h = (st.gpu_names.len().max(1) + 2).min(9) as u16;
     let c = Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Length(6),
         Constraint::Length(gpu_h), Constraint::Length(5), Constraint::Min(3)]).split(area);
-    let dot = if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) } else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
+    let dot = if st.paused { Span::styled("⏸ PAUSED", Style::new().fg(YLW).add_modifier(Modifier::BOLD)) }
+              else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
+              else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
     let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
     let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
     let mut l2 = vec![Span::styled("your address  ", Style::new().fg(MUT)), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
@@ -799,6 +838,83 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
         ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
     }).collect();
     f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), c[5]);
+}
+
+// human-readable duration (for uptime + solo-lottery ETA)
+fn fmt_dur(s: f64) -> String {
+    if !s.is_finite() || s <= 0.0 { return "—".into(); }
+    let (y, d, h, m) = (31_557_600.0, 86_400.0, 3600.0, 60.0);
+    if s >= y { format!("{:.1} yr", s / y) }
+    else if s >= d { format!("{:.1} d", s / d) }
+    else if s >= h { format!("{:.1} h", s / h) }
+    else if s >= m { format!("{:.1} min", s / m) }
+    else { format!("{:.0} s", s) }
+}
+// a 32-byte big-endian target as an f64 magnitude (precision-lossy, but we only need the order of magnitude)
+fn target_f64(t: &[u8; 32]) -> f64 { let mut v = 0f64; for b in t { v = v * 256.0 + *b as f64; } v }
+// expected seconds to find a block SOLO at `hr_ghs` GH/s against the network target (compact nbits).
+// expected hashes per block = 2^256 / target ; time = hashes / (hashes per second). Mean of a geometric —
+// real luck varies wildly around it, but it's the honest "your odds" number for a lottery miner.
+fn eta_to_block(nbits: u32, hr_ghs: f64) -> f64 {
+    if nbits == 0 || hr_ghs <= 0.0 { return f64::INFINITY; }
+    let t = target_f64(&nbits_to_target(nbits));
+    if t <= 0.0 { return f64::INFINITY; }
+    (2f64.powi(256) / t) / (hr_ghs * 1e9)
+}
+// height (rows) of the per-worker box: one row per worker, clamped
+fn gpu_rows(st: &Stats) -> u16 { (st.gpu_names.len().max(1) + 2).min(9) as u16 }
+
+// ── DATA — session analytics (the "modo análisis de datos"): hashrate stats, share odds, per-worker breakdown ──
+fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
+    let c = Layout::vertical([Constraint::Length(6), Constraint::Length(gpu_rows(st)), Constraint::Min(3)]).split(area);
+    // hashrate stats from the live history buffer (stored as GH/s×100)
+    let (peak, avg) = if st.hr_hist.is_empty() { (0.0, 0.0) } else {
+        let mx = *st.hr_hist.iter().max().unwrap() as f64 / 100.0;
+        let av = st.hr_hist.iter().sum::<u64>() as f64 / st.hr_hist.len() as f64 / 100.0;
+        (mx, av)
+    };
+    let share = if st.net_ok && st.net_ghs > 0.0 { st.hr_total / st.net_ghs * 100.0 } else { 0.0 };
+    let r = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[0]);
+    f.render_widget(tile("AVG HASHRATE", Line::from(vec![Span::styled(format!("{:.2}", avg), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
+        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("now {:.2} GH/s", st.hr_total), BRD), r[0]);
+    f.render_widget(tile("PEAK HASHRATE", Line::from(vec![Span::styled(format!("{:.2}", peak), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
+        Span::styled(" GH/s", Style::new().fg(MUT))]), "session peak", BRD), r[1]);
+    f.render_widget(tile("YOUR NET SHARE", Line::from(vec![Span::styled(if st.net_ok { format!("{:.2}", share) } else { "—".into() }, Style::new().fg(CYN).add_modifier(Modifier::BOLD)),
+        Span::styled(if st.net_ok { " %" } else { "" }, Style::new().fg(MUT))]), "of pyblockMiner network", CYN), r[2]);
+    // per-worker breakdown (name · GH/s · share of your total)
+    let mut wl: Vec<Line> = vec![];
+    for (i, g) in st.gpu_ghs.iter().enumerate() {
+        let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("worker {}", i));
+        let pct = if st.hr_total > 0.0 { g / st.hr_total * 100.0 } else { 0.0 };
+        wl.push(Line::from(vec![Span::styled(format!(" {:<26}", name), Style::new().fg(CYN)),
+            Span::styled(format!("{:>8.2} GH/s", g), Style::new().fg(GRN)),
+            Span::styled(format!("   {:>5.1}%", pct), Style::new().fg(MUT))]));
+    }
+    if wl.is_empty() { wl.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
+    f.render_widget(Paragraph::new(Text::from(wl)).block(Block::default().borders(Borders::ALL)
+        .border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS — hashrate share ", Style::new().fg(MUT)))), c[1]);
+    // session analytics text
+    let up = st.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let total = st.accepted + st.rejected;
+    let rej_rate = if total > 0 { st.rejected as f64 / total as f64 * 100.0 } else { 0.0 };
+    let eta = eta_to_block(st.net_nbits, st.hr_total);
+    let per_day = if eta.is_finite() && eta > 0.0 { 86_400.0 / eta } else { 0.0 };
+    let kv = |k: &str, v: String, col: Color| Line::from(vec![
+        Span::styled(format!("  {:<22}", k), Style::new().fg(MUT)), Span::styled(v, Style::new().fg(col))]);
+    let lines = vec![
+        kv("uptime", fmt_dur(up), GRN),
+        kv("shares accepted", format!("{}", st.accepted), GRN),
+        kv("shares rejected", format!("{}  ({:.1}%)", st.rejected, rej_rate), if rej_rate > 5.0 { AMB } else { MUT }),
+        kv("blocks found", format!("{}", st.blocks), GRN),
+        kv("best share difficulty", fmt_diff(st.best_diff), YLW),
+        kv("current difficulty", format!("diff {:.0} · bits {}", st.diff, st.bits), YLW),
+        Line::from(""),
+        kv("expected time / block", format!("{}   (solo, mean — high variance)", fmt_dur(eta)), CYN),
+        kv("expected blocks / day", if per_day > 0.0 { format!("{:.4}", per_day) } else { "—".into() }, CYN),
+        kv("hashrate donated", format!("{} blocks → PyBLØCK", st.donated), AMB),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL)
+        .border_style(Style::new().fg(CYN)).title(Span::styled(" ANÁLISIS — session data (press p to pause mining while you review) ", Style::new().fg(CYN)))), c[2]);
 }
 
 fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
@@ -915,7 +1031,10 @@ fn render_help(f: &mut Frame, area: Rect) {
     let l = |a: &str, b: &str| Line::from(vec![Span::styled(format!("  {:<17} ", a), Style::new().fg(GRN)), Span::styled(b.to_string(), Style::new().fg(MUT))]);
     let lines = vec![
         Line::from(Span::styled(" Keys", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
-        l("1-6 / Tab", "switch tabs"), l("q / Esc", "quit (Esc also cancels an input)"),
+        l("1-7 / Tab", "switch tabs (MINE · DATA · STRATUMS · LEARN · NETWORK · SETUP · HELP)"),
+        l("p", "pause / resume mining (works from any tab — GPU/CPU go idle, pool stays connected)"),
+        l("DATA", "session analytics: avg/peak hashrate, net share, per-worker split, solo ETA-to-block"),
+        l("q / Esc", "quit (Esc also cancels an input)"),
         l("STRATUMS", "↑↓ move · Enter switch live · a add · d delete custom"),
         l("SETUP", "g generate address · e edit address · c toggle CPU · +/- donation"),
         Line::from(""),
@@ -1006,8 +1125,14 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
     // normal mode
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Char(c @ '1'..='6') => { app.tab = TABS[c as usize - '1' as usize].0; }
+        KeyCode::Char(c @ '1'..='7') => { app.tab = TABS[c as usize - '1' as usize].0; }
         KeyCode::Tab => { let i = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0); app.tab = TABS[(i + 1) % TABS.len()].0; }
+        // pause/resume mining — works from any tab (the engine picks it up within ~120ms; connection stays alive)
+        KeyCode::Char('p') => {
+            let v = !app.paused.load(Ordering::Relaxed);
+            app.paused.store(v, Ordering::Relaxed);
+            app.msg = if v { "⏸ mining paused — press p to resume".into() } else { "▶ mining resumed".into() };
+        }
         _ => match app.tab {
             Tab::Stratums => match code {
                 KeyCode::Up => { if app.strat_cur > 0 { app.strat_cur -= 1; } }
@@ -1098,7 +1223,8 @@ fn main() {
     }
     if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
-    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new() };
+    let paused = Arc::new(AtomicBool::new(false));   // shared pause flag: `p` toggles, engine idles the grinders
+    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone() };
     app.strat_cur = app.cfg.selected;
 
     // devices — attempt the GPU grinder even if no GPU is name-detected (it enumerates OpenCL/Metal and
@@ -1120,7 +1246,7 @@ fn main() {
     }));
     { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0; }
 
-    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads)); }
+    { let stats = stats.clone(); let tgt = tgt.clone(); let paused = paused.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads, paused)); }
     // network-stats poller (per current network)
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
         let net = tgt.lock().unwrap().network.clone();
