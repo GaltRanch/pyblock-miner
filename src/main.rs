@@ -407,7 +407,7 @@ fn send(stream: &mut TcpStream, v: &Value) {
 
 struct Conn {
     stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
-    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64)>, subid: u64, addr: String, is_dev: bool, idle: Instant,
+    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64)>, subid: u64, addr: String, is_dev: bool, idle: Instant, last_notify: Instant,
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
@@ -421,7 +421,7 @@ impl Conn {
         // data to adjust DOWN → the miner "hashes but never submits". Pools that honor it start low + vardiff up.
         send(&mut stream, &json!({"id":3,"method":"mining.suggest_difficulty","params":[1]}));
         Some(Conn { stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
-            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now() })
+            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now(), last_notify: Instant::now() })
     }
     fn pump(&mut self, stats: &Arc<Mutex<Stats>>) -> bool {
         let mut tmp = [0u8; 8192];
@@ -457,6 +457,7 @@ impl Conn {
                 }
             } else if meth == Some("mining.notify") {
                 self.job = m.get("params").and_then(|v| v.as_array()).cloned();
+                self.last_notify = Instant::now();   // fresh work arrived → feeds the job-freshness watchdog
             } else if let Some(idv) = id {
                 if let Some((nonce, is_block, height)) = self.pending.remove(&idv) {
                     let hs = if height > 0 { format!("height {} ", height) } else { String::new() };
@@ -581,6 +582,13 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true); dev_retry = Instant::now();
             }
             if user.idle.elapsed() > Duration::from_secs(90) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); } break; }
+            // Job-freshness watchdog: force a clean resubscribe if no NEW work (mining.notify) has arrived for a
+            // while, scaled to the observed block cadence. `idle` only tracks ANY bytes (set_difficulty pings keep
+            // it alive), so a connection that stays open but stops delivering jobs — exactly what happens at a
+            // chain transition (BLAKE2b activation / pool re-point / node reorg) — would otherwise leave the miner
+            // grinding dead work until a manual restart. This makes it pick up the new template ON ITS OWN.
+            let stall = Duration::from_secs_f64((block_interval_ema * 6.0).clamp(90.0, 600.0));
+            if user.last_notify.elapsed() > stall { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("no new job in {}s — resubscribing…", stall.as_secs())); } break; }
 
             // PAUSE: user hit `p`. Stop feeding the grinders (GPU/CPU go idle → no work sent, no shares submitted)
             // but keep the pool connection alive by pumping it, so resume is instant with no reconnect.
