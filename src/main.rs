@@ -193,6 +193,13 @@ struct Stats {
     balance_ok: bool,
     balance_btc: f64,
     paused: bool,       // mirror of the shared pause flag → shown in the UI
+    // BLAKE2b activation gating: None=unknown (grind, safe default), Some(false)=chain is still SHA-256d
+    // (DON'T grind → save power), Some(true)=blake2b live. Set from the pool network-stats endpoint.
+    blake2b_active: Option<bool>,
+    activation_height: u64,
+    blocks_until_act: u64,
+    latest_version: String,   // newest published miner version (from the pool) → drives the update label
+    update_available: bool,
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -605,6 +612,18 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 if st.paused { st.paused = false; st.logline("▶ mining resumed".into()); }
             }
 
+            // ALGO GATE: pyblockMiner only hashes BLAKE2b. While the chain is still SHA-256d (pre-activation),
+            // grinding is pure wasted electricity + guaranteed rejects — so idle the grinders and wait. The pool
+            // reports blake2b_active=false until the flag-day height; we keep the connection pumped so mining
+            // resumes ON ITS OWN the moment BLAKE2b activates. (None/unknown → grind — safe default.)
+            if stats.lock().unwrap().blake2b_active == Some(false) {
+                { let mut st = stats.lock().unwrap(); st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
+                user.pump(&stats);
+                if let Some(d) = dev.as_mut() { d.pump(&stats); }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
             donate_credit += donate / 100.0;
             let dev_ready = dev.as_ref().and_then(|d| d.ready()).is_some();
             let do_donate = donate_credit >= 1.0 && dev_ready;
@@ -683,15 +702,26 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
     }
 }
 
-fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
+struct NetStats { miners: u64, ghs: f64, height: u64, blake2b_active: Option<bool>, activation_height: u64, blocks_until: u64, latest: String }
+// true if `latest` is a strictly newer semver than `cur` (both "x.y.z", optional leading 'v')
+fn is_newer(latest: &str, cur: &str) -> bool {
+    let t = |s: &str| { let mut i = s.trim().trim_start_matches('v').split('.').map(|x| x.parse::<u32>().unwrap_or(0));
+        (i.next().unwrap_or(0), i.next().unwrap_or(0), i.next().unwrap_or(0)) };
+    t(latest) > t(cur)
+}
+fn poll_network_stats(url: &str) -> Option<NetStats> {
     let body = ureq::get(url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
     if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
-    Some((
-        v.get("miners").and_then(|x| x.as_u64()).unwrap_or(0),
-        v.get("network_hashrate_ghs").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
-    ))
+    Some(NetStats {
+        miners: v.get("miners").and_then(|x| x.as_u64()).unwrap_or(0),
+        ghs: v.get("network_hashrate_ghs").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        height: v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
+        blake2b_active: v.get("blake2b_active").and_then(|x| x.as_bool()),   // null/absent → None (unknown → grind)
+        activation_height: v.get("activation_height").and_then(|x| x.as_u64()).unwrap_or(0),
+        blocks_until: v.get("blocks_until_activation").and_then(|x| x.as_u64()).unwrap_or(0),
+        latest: v.get("miner_latest").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
 }
 // The balance ALWAYS comes from the PyBLØCK blake2b node for the SELECTED network — pyblockMiner mines
 // BLAKE2b, so the balance lives on the blake2b chain, NOT on public SHA-256 explorers (mempool.space doesn't
@@ -795,6 +825,7 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
     let c = Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Length(6),
         Constraint::Length(gpu_h), Constraint::Length(5), Constraint::Min(3)]).split(area);
     let dot = if st.paused { Span::styled("⏸ PAUSED", Style::new().fg(YLW).add_modifier(Modifier::BOLD)) }
+              else if st.blake2b_active == Some(false) { Span::styled("⏳ WAITING · SHA-256d", Style::new().fg(AMB).add_modifier(Modifier::BOLD)) }
               else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
               else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
     let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
@@ -803,10 +834,17 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
         Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
         Span::styled("pool fee 0.9%", Style::new().fg(PNK))];
     if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
+    let mut l1 = vec![Span::styled("LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)), Span::raw("  "),
+        Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
+        Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT))];
+    if st.blake2b_active == Some(false) {
+        l1.push(Span::styled(format!("   ⛔ BLAKE2b @ {} ({} to go) — not mining, saving power", st.activation_height, st.blocks_until_act), Style::new().fg(AMB)));
+    }
+    if st.update_available {
+        l1.push(Span::styled(format!("   ⬆ v{} — git pull && ./build.sh", st.latest_version), Style::new().fg(PNK).add_modifier(Modifier::BOLD)));
+    }
     f.render_widget(Paragraph::new(Text::from(vec![
-        Line::from(vec![Span::styled("LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)), Span::raw("  "),
-            Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
-            Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT))]),
+        Line::from(l1),
         Line::from(l2)])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
         .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN)))), c[0]);
     let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[1]);
@@ -1048,6 +1086,11 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("wrong address", "each network needs its own type: bc1 mainnet · tb1 testnet4 · bcrt1 regtest"),
         l("testnet4 addr", "SETUP [5] → g, or:  pyblockMiner --genaddr testnet4"),
         Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(" Update", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
+        l("new version", "the MINE header shows ⬆ v<x> when a newer release is published on the pool"),
+        l("update command", "cd pyblock-miner && git pull && ./build.sh    (then relaunch the miner)"),
+        Line::from(""),
         Line::from(vec![Span::styled("  GitHub   ", Style::new().fg(MUT)), Span::styled("github.com/GaltRanch/pyblock-miner", Style::new().fg(CYN))]),
         Line::from(vec![Span::styled("  Pool     ", Style::new().fg(MUT)), Span::styled("pool.pyblock.xyz  ·  MIT licensed", Style::new().fg(CYN))]),
     ];
@@ -1254,7 +1297,10 @@ fn main() {
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
         let net = tgt.lock().unwrap().network.clone();
         match net_stats_url(&net).and_then(poll_network_stats) {
-            Some((m, g, h)) => { let mut st = stats.lock().unwrap(); st.net_ok = true; st.net_miners = m; st.net_ghs = g; st.net_height = h; }
+            Some(ns) => { let mut st = stats.lock().unwrap();
+                st.net_ok = true; st.net_miners = ns.miners; st.net_ghs = ns.ghs; st.net_height = ns.height;
+                st.blake2b_active = ns.blake2b_active; st.activation_height = ns.activation_height; st.blocks_until_act = ns.blocks_until;
+                if !ns.latest.is_empty() { st.update_available = is_newer(&ns.latest, VERSION); st.latest_version = ns.latest; } }
             None => { stats.lock().unwrap().net_ok = false; }
         }
         std::thread::sleep(Duration::from_secs(8));   // match blake_stats' ~8s cache so POOL HEIGHT (+ the BLOCK FOUND height) stay fresh on fast chains
