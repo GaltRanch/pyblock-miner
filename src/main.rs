@@ -34,12 +34,12 @@ const PNK: Color = Color::Rgb(255, 92, 200);
 const BRD: Color = Color::Rgb(35, 60, 35);
 
 // ── network config: mainnet | testnet4 | regtest ──
-struct NetCfg { name: &'static str, donate: bool, explorer: &'static str }
+struct NetCfg { name: &'static str, donate: bool }
 fn net_cfg(net: &str) -> NetCfg {
     match net {
-        "testnet4" | "testnet" | "t4" => NetCfg { name: "testnet4", donate: false, explorer: "https://mempool.space/testnet4/api" },
-        "regtest"  | "reg"            => NetCfg { name: "regtest",  donate: false, explorer: "" },
-        _                             => NetCfg { name: "mainnet",  donate: true,  explorer: "https://mempool.space/api" },
+        "testnet4" | "testnet" | "t4" => NetCfg { name: "testnet4", donate: false },
+        "regtest"  | "reg"            => NetCfg { name: "regtest",  donate: false },
+        _                             => NetCfg { name: "mainnet",  donate: true },
     }
 }
 fn addr_ok(net: &str, a: &str) -> bool {
@@ -693,29 +693,24 @@ fn poll_network_stats(url: &str) -> Option<(u64, f64, u64)> {
         v.get("block_height").and_then(|x| x.as_u64()).unwrap_or(0),
     ))
 }
-// regtest has no public explorer → balance comes from the PyBLØCK node-backed endpoint (scantxoutset on the local blake2b node)
-const REGTEST_BALANCE_API:  &str = "https://pool.pyblock.xyz:8443/api/blake_balance.php";
-const TESTNET4_BALANCE_API: &str = "https://pool.pyblock.xyz:8443/api/blake_balance_t4.php";
+// The balance ALWAYS comes from the PyBLØCK blake2b node for the SELECTED network — pyblockMiner mines
+// BLAKE2b, so the balance lives on the blake2b chain, NOT on public SHA-256 explorers (mempool.space doesn't
+// follow the blake2b chain → it would report 0/garbage). The network is auto-detected from the active stratum;
+// each network has its own pool endpoint that reads that network's blake2b node. When the stable mainnet
+// BLAKE2b version ships, "mainnet" transparently reads the mainnet blake2b node — no code change, no hardcode.
+fn net_balance_url(net: &str) -> &'static str {
+    match net {
+        "testnet4" => "https://pool.pyblock.xyz:8443/api/blake_balance_t4.php",
+        _          => "https://pool.pyblock.xyz:8443/api/blake_balance.php",   // mainnet + regtest → PyBLØCK blake2b node
+    }
+}
 fn poll_balance(net: &str, addr: &str) -> Option<f64> {
     if addr.is_empty() { return None; }
-    // regtest + testnet4 balances come from OUR BLAKE2b node endpoints — public explorers (mempool.space)
-    // do NOT follow the BLAKE2b RC chain, so they'd report 0 even after you've mined blocks.
-    let pool_api = match net { "regtest" => Some(REGTEST_BALANCE_API), "testnet4" => Some(TESTNET4_BALANCE_API), _ => None };
-    if let Some(api) = pool_api {
-        let url = format!("{}?addr={}", api, addr);
-        let body = ureq::get(&url).timeout(Duration::from_secs(12)).call().ok()?.into_string().ok()?;
-        let v: Value = serde_json::from_str(&body).ok()?;
-        if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
-        return v.get("balance_btc").and_then(|x| x.as_f64());
-    }
-    let explorer = net_cfg(net).explorer;
-    if explorer.is_empty() { return None; }
-    let url = format!("{}/address/{}", explorer, addr);
-    let body = ureq::get(&url).timeout(Duration::from_secs(8)).call().ok()?.into_string().ok()?;
+    let url = format!("{}?addr={}", net_balance_url(net), addr);
+    let body = ureq::get(&url).timeout(Duration::from_secs(12)).call().ok()?.into_string().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
-    let funded = v.pointer("/chain_stats/funded_txo_sum").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let spent  = v.pointer("/chain_stats/spent_txo_sum").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    Some((funded - spent) / 1e8)
+    if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
+    v.get("balance_btc").and_then(|x| x.as_f64())
 }
 
 // ═══════════════════════ TABS / UI ═══════════════════════
