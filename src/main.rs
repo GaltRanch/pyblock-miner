@@ -19,7 +19,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
 
 // ── PyBLØCK hashrate donation (like xmrig, but paid in HASH not satoshis; mainnet only) ──
-const DONATE_POOL: &str = "pool.pyblock.xyz:23110";
+const DONATE_POOL: &str = "pool.pyblock.xyz:4445";
 const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
 const DONATE_MIN: f64 = 2.0;
 const VERSION: &str = env!("CARGO_PKG_VERSION");   // from Cargo.toml — shown in TUI footer, --version, and the stratum UA
@@ -63,7 +63,7 @@ struct Stratum { name: String, url: String, network: String, #[serde(default)] c
 
 fn default_stratums() -> Vec<Stratum> {
     vec![
-        Stratum { name: "PyBLØCK · mainnet".into(),  url: "pool.pyblock.xyz:23110".into(), network: "mainnet".into(),  custom: false },
+        Stratum { name: "PyBLØCK · mainnet".into(),  url: "pool.pyblock.xyz:4445".into(), network: "mainnet".into(),  custom: false },
         Stratum { name: "PyBLØCK · testnet4".into(), url: "pool.pyblock.xyz:23111".into(), network: "testnet4".into(), custom: false },
         Stratum { name: "PyBLØCK · regtest".into(),  url: "pool.pyblock.xyz:23110".into(), network: "regtest".into(),  custom: false },
     ]
