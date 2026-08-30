@@ -63,7 +63,10 @@ struct Stratum { name: String, url: String, network: String, #[serde(default)] c
 
 fn default_stratums() -> Vec<Stratum> {
     vec![
-        Stratum { name: "PyBLØCK · mainnet".into(),  url: "pool.pyblock.xyz:4445".into(), network: "mainnet".into(),  custom: false },
+        // 3 pools mainnet BLAKE2b (misma cadena, distinto puerto/modo — se elige en la tab STRATUMS):
+        Stratum { name: "PyBLØCK · LOTTO".into(),    url: "pool.pyblock.xyz:4445".into(),  network: "mainnet".into(),  custom: false },
+        Stratum { name: "PyBLØCK · CHIRP".into(),    url: "pool.pyblock.xyz:5574".into(),  network: "mainnet".into(),  custom: false },
+        Stratum { name: "PyBLØCK · CAROUSEL".into(), url: "pool.pyblock.xyz:30110".into(), network: "mainnet".into(),  custom: false },
         Stratum { name: "PyBLØCK · testnet4".into(), url: "pool.pyblock.xyz:23111".into(), network: "testnet4".into(), custom: false },
         Stratum { name: "PyBLØCK · regtest".into(),  url: "pool.pyblock.xyz:23110".into(), network: "regtest".into(),  custom: false },
     ]
@@ -97,9 +100,32 @@ fn config_path() -> PathBuf {
     PathBuf::from(base).join("pyblockminer").join("config.json")
 }
 fn load_config() -> Config {
-    std::fs::read_to_string(config_path()).ok()
+    let mut c: Config = std::fs::read_to_string(config_path()).ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    reconcile_defaults(&mut c);
+    c
+}
+// Refresca los stratums DEFAULT (custom=false) contra default_stratums() para que un cambio de
+// puerto/URL por versión (p.ej. mainnet :23110→:4445) llegue a configs ya guardados. Preserva
+// los stratums custom, el índice seleccionado, addresses y donate.
+fn reconcile_defaults(c: &mut Config) {
+    let defs = default_stratums();
+    let mut changed = false;
+    // Clave = URL (identidad estable del pool). Antes era por NETWORK, pero ahora hay 3 pools mainnet
+    // (LOTTO/CHIRP/CAROUSEL) con la MISMA network → habría que distinguirlos por URL. Actualiza el nombre
+    // de los defaults guardados (p.ej. "PyBLØCK · mainnet" :4445 → "PyBLØCK · LOTTO") sin tocar los custom.
+    for s in c.stratums.iter_mut() {
+        if s.custom { continue; }
+        if let Some(d) = defs.iter().find(|d| d.url == s.url && !d.custom) {
+            if s.name != d.name || s.network != d.network { s.name = d.name.clone(); s.network = d.network.clone(); changed = true; }
+        }
+    }
+    // Agrega los pools default que falten (por URL) → CHIRP/CAROUSEL llegan a configs ya guardados.
+    for d in defs.iter() {
+        if !c.stratums.iter().any(|s| !s.custom && s.url == d.url) { c.stratums.push(d.clone()); changed = true; }
+    }
+    if changed { save_config(c); }
 }
 fn save_config(c: &Config) {
     let p = config_path();
