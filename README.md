@@ -7,19 +7,34 @@ A terminal (TUI) miner: you mine to **your own** Bitcoin address and keep **99.1
 It's a **tabbed app** — everything is in the program, no restarts needed:
 
 ```
-PyBLØCK  1·MINE  2·STRATUMS  3·LEARN  4·NETWORK  5·SETUP  6·HELP
-┌ ⛏ Bitcoin BLAKE2b · solo lottery ──────────────────────────────────┐
-│ LOTTO BLAKE2b   TESTNET4   ● LIVE   pool.pyblock.xyz:23111          │
-│ your address  tb1q…   balance 0.00000000 BTC   keep 99.1% · fee 0.9%│
-├ YOUR HASHRATE ┤ ├ BLOCKS FOUND ┤ ├ DIFFICULTY ┤                     │
-│    26.5 GH/s   │ │      3       │ │   bits 2   │                     │
-├ ◈ MINERS ONLINE ┤ ├ ◈ NETWORK HASHRATE ┤ ├ ◈ POOL HEIGHT ┤         │
-│        7         │ │      184 GH/s        │ │    149 460    │        │
-│ GPU 0  RTX 4090   11.0 GH/s    GPU 1  RTX 5090   15.5 GH/s          │
-└────────────────────────────────────────────────────────────────────┘
+PyBLØCK  1·MINE  2·DATA  3·STRATUMS  4·LEARN  5·NETWORK  6·SETUP  7·HELP
+╭ ⛏ Bitcoin BLAKE2b · syndicate · weighted split ─────────────────────────────────────────╮
+│ 🌌 CHIRP BLAKE2b   MAINNET   ● LIVE   pool.pyblock.xyz:5574                             │
+│ your address  bc1q…   balance 0.01234567 BTC   your slice of every block  0.84% · fee 0.9%│
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ YOUR HASHRATE ──╮ ╭ BLOCKS FOUND ──╮ ╭ DIFFICULTY ──╮
+│    26.5 GH/s    │ │       0        │ │    bits 2    │
+╭ ◈ IN THE COINBASE ╮ ╭ ◈ SYNDICATE HASHRATE ╮ ╭ ◈ LAST BLOCK REWARD ╮
+│        38         │ │      8.07 TH/s       │ │  3.3816 BTC · your cut ≈ 0.028 BTC │
+╭ 🌌 CHIRP · who is in the coinbase · 58 miners · ↑↓ 1–18 of 58 ───────────────────────────╮
+│   #  MINER                                       TENURE  POWER 24h  SHARE          STATUS │
+│   1  bc1qjdqlvwfxum8dh4t5v9mvskdarjvlek2a9g5pw2   7.2 d      57.3M  ▰▰▰▰▰▰▰▰▰▰  30.00%  ● │
+│ ▶ 2  bc1q…you…                                    7.2 d       1.6M  ▰▱▱▱▱▱▱▱▱▱   0.84%  ● you │
+│  …   every eligible miner, then the ones still earning their 7 days (⏳ 3.1 d to go)      │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-- **STRATUMS** — pick a pool and **switch it live, without leaving the miner.** PyBLØCK's pools are there by default (mainnet / testnet4 / regtest); add your own custom stratums too.
+### Three pools, one chain — the MINE tab adapts to how each one pays
+
+| pool | port | what the coinbase does | what MINE shows you |
+|------|------|------------------------|---------------------|
+| 🎰 **LOTTO** | `4445` | solo lottery — every block you find pays **your** address · you keep 99.1% · fee 0.9% | your odds: expected time-to-block at your hashrate |
+| 🌌 **CHIRP** | `5574` | syndicate — every block is **split on-chain among ALL eligible miners** by weight (7-day loyalty) · fee 0.9% | **everyone in the coinbase draw**: rank, address, tenure, power, share % and status, your row marked `▶ you`, your live slice + cut in BTC · `↑↓` scrolls |
+| 🎠 **CAROUSEL** | `30110` | rotating **clean templates** from independent suppliers — finder keeps 98% · supplier 1% · PyBLØCK 1% | the template being mined **right now**, the whole rotation, the recent trail |
+
+The header, the network tiles and the panel all follow the selected stratum. **NETWORK** (`5`) shows the same mode panel full-height. Data comes from the pool's own APIs (`chirp_api.php?chain=blake2b`, `carousel.php?carrousel=1`), refreshed every 15 s.
+
+- **STRATUMS** — pick a pool and **switch it live, without leaving the miner.** Each pool says in one line what it does with the coinbase. PyBLØCK's pools are there by default (LOTTO / CHIRP / CAROUSEL / testnet4 / regtest); add your own custom stratums too.
 - **SETUP** — generate or paste your address, per network; toggle CPU and the donation. Everything **auto-saves** to a config file, so you don't re-type flags.
 - **LEARN / HELP** — what BLAKE2b is, the honest hardfork status, and troubleshooting (incl. the OpenCL-headers fix).
 
@@ -86,13 +101,15 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 
 | key | action |
 |-----|--------|
-| `1`–`6` / `Tab` | switch tabs (MINE · STRATUMS · LEARN · NETWORK · SETUP · HELP) |
+| `1`–`7` / `Tab` | switch tabs (MINE · DATA · STRATUMS · LEARN · NETWORK · SETUP · HELP) |
+| `p` | pause / resume mining from any tab |
+| MINE / NETWORK: `↑↓` `PgUp` `PgDn` `Home` `End` | scroll the CHIRP coinbase list (everyone in the draw) |
 | `q` / `Esc` | quit (`Esc` also cancels a text input) |
 | STRATUMS: `↑↓` `Enter` `a` `d` | move · **switch live** · add custom · delete custom |
 | SETUP: `g` `e` `c` `+/-` | generate address · edit/paste address · toggle CPU · donation |
 | LEARN: `←` `→` | previous / next info page |
 
-The **MINE** tab shows a network badge (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from a public explorer), your hashrate/blocks, and live network cards (miners online + network hashrate). Run it in a real terminal (it's a full-screen TUI).
+The **MINE** tab shows the pool mode (LOTTO / CHIRP / CAROUSEL), a network badge (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from the PyBLØCK BLAKE2b node), your hashrate/blocks, mode-aware network cards, and the coinbase panel described above. Run it in a real terminal (it's a full-screen TUI); it lays out for any width — addresses show in full on wide terminals and masked (`bc1qjd…5pw2`) on narrow ones.
 
 **No GPU?** It falls back to **CPU mining** automatically (much slower — CPUs do ~MH/s vs GPUs' GH/s, but it works). Force it with `--gpus 0`, or add CPU alongside your GPUs with `--cpu`.
 

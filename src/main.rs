@@ -1,5 +1,7 @@
 // pyblockMiner — PyBLØCK LOTTO BLAKE2b miner (Bitcoin BLAKE2b, solo lottery). Rust + ratatui TUI.
 // Tabbed app: MINE dashboard · DATA (session analytics) · STRATUMS (switch pools live) · LEARN · NETWORK · SETUP · HELP.
+// Pool MODES (same chain, different coinbase): LOTTO solo · CHIRP syndicate (MINE lists EVERY miner in the coinbase
+// draw + your slice) · CAROUSEL rotating supplier templates (shows the live template). Detected from the stratum port.
 // `p` pauses/resumes mining from any tab (GPU/CPU idle, pool stays connected).
 // Native SV1 stratum client + N-GPU/CPU BLAKE2b grinding via persistent gpu_grind daemons.
 // You mine to YOUR address → keep 99.1% of every block · PyBLØCK pool fee 0.9%. Non-custodial.
@@ -10,13 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph, Sparkline, Wrap};
 
 // ── PyBLØCK hashrate donation (like xmrig, but paid in HASH not satoshis; mainnet only) ──
 const DONATE_POOL: &str = "pool.pyblock.xyz:4445";
@@ -32,6 +34,9 @@ const MUT: Color = Color::Rgb(130, 154, 130);
 const AMB: Color = Color::Rgb(224, 176, 53);
 const PNK: Color = Color::Rgb(255, 92, 200);
 const BRD: Color = Color::Rgb(35, 60, 35);
+const PUR: Color = Color::Rgb(185, 107, 255);   // CHIRP accent — the pool site's violet
+const WHT: Color = Color::Rgb(236, 236, 244);   // CAROUSEL accent + primary values (soft white)
+const DIM: Color = Color::Rgb(58, 70, 58);      // quiet card borders — the frame recedes, the numbers speak
 
 // ── network config: mainnet | testnet4 | regtest ──
 struct NetCfg { name: &'static str, donate: bool }
@@ -71,6 +76,69 @@ fn default_stratums() -> Vec<Stratum> {
         Stratum { name: "PyBLØCK · regtest".into(),  url: "pool.pyblock.xyz:23110".into(), network: "regtest".into(),  custom: false },
     ]
 }
+
+// ── pool MODE: what the coinbase does on this stratum. Same BLAKE2b chain, different payout rules.
+//    Detected from the port (PyBLØCK convention: 4445 LOTTO · 5574 CHIRP · 30110 CAROUSEL) or the name. ──
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+enum PoolMode { #[default] Lotto, Chirp, Carousel, Custom }
+fn pool_mode(url: &str, name: &str) -> PoolMode {
+    let port = url.rsplit(':').next().unwrap_or("");
+    let n = name.to_ascii_uppercase();
+    match port {
+        "5574" | "5554"            => PoolMode::Chirp,
+        "30110" | "30000"          => PoolMode::Carousel,
+        "4445" | "23111" | "23110" => PoolMode::Lotto,
+        _ if n.contains("CHIRP")   => PoolMode::Chirp,
+        _ if n.contains("CAROUSEL") || n.contains("CARROUSEL") => PoolMode::Carousel,
+        _ if n.contains("LOTTO")   => PoolMode::Lotto,
+        _                          => PoolMode::Custom,
+    }
+}
+impl PoolMode {
+    fn label(self) -> &'static str { match self { PoolMode::Lotto => "LOTTO", PoolMode::Chirp => "CHIRP", PoolMode::Carousel => "CAROUSEL", PoolMode::Custom => "CUSTOM" } }
+    fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Custom => "⛏" } }
+    fn accent(self) -> Color { match self { PoolMode::Lotto => YLW, PoolMode::Chirp => PUR, PoolMode::Carousel => WHT, PoolMode::Custom => CYN } }
+    fn tagline(self) -> &'static str {
+        match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · weighted split", PoolMode::Carousel => "rotating clean templates", PoolMode::Custom => "custom stratum" }
+    }
+    // who gets paid — one honest line, shown in STRATUMS and in the MINE header
+    fn payout(self) -> &'static str {
+        match self {
+            PoolMode::Lotto    => "every block you find pays YOUR address · you keep 99.1% · PyBLØCK fee 0.9%",
+            PoolMode::Chirp    => "every block is split on-chain among ALL eligible miners by weight · 7-day loyalty · fee 0.9%",
+            PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 98% · supplier 1% · PyBLØCK 1%",
+            PoolMode::Custom   => "payout rules are the pool operator's — check their site",
+        }
+    }
+    fn payout_short(self) -> &'static str {
+        match self {
+            PoolMode::Lotto => "keep 99.1% · fee 0.9%", PoolMode::Chirp => "weighted split · fee 0.9%",
+            PoolMode::Carousel => "keep 98% · supplier 1% · fee 1%", PoolMode::Custom => "operator's rules",
+        }
+    }
+}
+
+// ── CHIRP syndicate: everyone in the coinbase draw. Source: pool.pyblock.xyz chirp_api.php (chain=blake2b) ──
+#[derive(Clone, Default)]
+struct ChirpMember { addr: String, days: f64, power: f64, weight: f64, eligible: bool, last_seen: u64 }
+#[derive(Clone, Default)]
+struct ChirpInfo {
+    members: Vec<ChirpMember>,   // sorted: eligible by weight desc, then the rest by tenure desc
+    candidates: u64, workers: u64, blocks: u64, hashrate_ths: f64, min_days: f64, min_power: f64,
+    reward_sats: u64, height: u64, fee_bps: u64, fetched: u64,
+}
+impl ChirpInfo {
+    fn sum_weight(&self) -> f64 { self.members.iter().filter(|m| m.eligible).map(|m| m.weight).sum() }
+    fn me(&self, addr: &str) -> Option<&ChirpMember> { if addr.is_empty() { None } else { self.members.iter().find(|m| m.addr == addr) } }
+    // your share of the next coinbase (0..100) — only if you're eligible
+    fn my_pct(&self, addr: &str) -> Option<f64> {
+        let m = self.me(addr)?; let s = self.sum_weight();
+        if m.eligible && s > 0.0 { Some(m.weight / s * 100.0) } else { None }
+    }
+}
+// ── CAROUSEL: independent suppliers' clean templates in rotation. Source: b.pyblock.xyz carousel.php?carrousel=1 ──
+#[derive(Clone, Default)]
+struct CarouselInfo { suppliers: Vec<String>, current: String, recent: Vec<String>, miners: u64, hashrate_ths: f64, live: bool, fetched: u64 }
 
 // ── persisted config ──
 #[derive(Serialize, Deserialize)]
@@ -226,6 +294,9 @@ struct Stats {
     blocks_until_act: u64,
     latest_version: String,   // newest published miner version (from the pool) → drives the update label
     update_available: bool,
+    mode: PoolMode,                    // what the coinbase does on the active stratum (LOTTO / CHIRP / CAROUSEL)
+    chirp: Option<ChirpInfo>,          // CHIRP: everyone in the coinbase draw (kept while polling, cleared on switch)
+    carousel: Option<CarouselInfo>,    // CAROUSEL: templates in rotation + the one being mined right now
 }
 impl Stats {
     fn logline(&mut self, s: String) {
@@ -769,6 +840,60 @@ fn poll_balance(net: &str, addr: &str) -> Option<f64> {
     v.get("balance_btc").and_then(|x| x.as_f64())
 }
 
+// ── mode data: CHIRP coinbase members · CAROUSEL rotation (the pool's own pages poll these every 15s) ──
+const CHIRP_API: &str = "https://pool.pyblock.xyz:8443/chirp_api.php";
+const CAROUSEL_API: &str = "https://b.pyblock.xyz:8443/carousel.php?carrousel=1";
+fn get_json(url: &str, secs: u64) -> Option<Value> {
+    let body = ureq::get(url).timeout(Duration::from_secs(secs)).call().ok()?.into_string().ok()?;
+    serde_json::from_str(&body).ok()
+}
+fn now_unix() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
+fn poll_chirp() -> Option<ChirpInfo> {
+    let list = get_json(&format!("{}?mode=miners&chain=blake2b", CHIRP_API), 10)?;
+    let mut members: Vec<ChirpMember> = list.as_array()?.iter().map(|m| ChirpMember {
+        addr: m.get("address").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        days: m.get("days").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        power: m.get("power").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        weight: m.get("weight").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        eligible: m.get("eligible").and_then(|x| x.as_bool()).unwrap_or(false),
+        last_seen: m.get("last_seen").and_then(|x| x.as_u64()).unwrap_or(0),
+    }).collect();
+    let f = |a: f64, b: f64| b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal);
+    members.sort_by(|a, b| b.eligible.cmp(&a.eligible).then(f(a.weight, b.weight)).then(f(a.days, b.days)));
+    let mut info = ChirpInfo { members, fetched: now_unix(), min_days: 7.0, ..Default::default() };
+    if let Some(p) = get_json(&format!("{}?mode=pool&chain=blake2b", CHIRP_API), 8) {
+        info.candidates = p.get("candidates").and_then(|x| x.as_u64()).unwrap_or(0);
+        info.workers = p.get("workers").and_then(|x| x.as_u64()).unwrap_or(0);
+        info.blocks = p.get("blocks").and_then(|x| x.as_u64()).unwrap_or(0);
+        info.hashrate_ths = p.get("hashrate").and_then(|x| x.as_f64()).unwrap_or(0.0);   // the site formats this as TH/s
+        info.min_days = p.get("min_days").and_then(|x| x.as_f64()).unwrap_or(7.0);
+        info.min_power = p.get("min_power").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    } else {
+        info.candidates = info.members.iter().filter(|m| m.eligible).count() as u64;
+    }
+    if let Some(c) = get_json(&format!("{}?mode=coinbase&chain=blake2b", CHIRP_API), 8) {
+        info.reward_sats = c.get("reward_sats").and_then(|x| x.as_u64()).unwrap_or(0);
+        info.height = c.get("height").and_then(|x| x.as_u64()).unwrap_or(0);
+        info.fee_bps = c.get("fee_bps").and_then(|x| x.as_u64()).unwrap_or(90);
+    }
+    Some(info)
+}
+fn poll_carousel() -> Option<CarouselInfo> {
+    let v = get_json(CAROUSEL_API, 10)?;
+    let strs = |k: &str| -> Vec<String> { v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|e| {
+        // suppliers: ["name", …] · recent: [["name"], …] or [["name", ts], …]
+        e.as_str().map(|s| s.to_string()).or_else(|| e.as_array().and_then(|i| i.first()).and_then(|s| s.as_str()).map(|s| s.to_string()))
+    }).collect()).unwrap_or_default() };
+    Some(CarouselInfo {
+        suppliers: strs("suppliers"), recent: strs("recent"),
+        current: v.get("current").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        miners: v.get("miners").and_then(|x| x.as_u64()).unwrap_or(0),
+        hashrate_ths: v.get("hashrate").and_then(|x| x.as_f64()).unwrap_or(0.0) / 1e12,   // endpoint returns H/s
+        live: v.get("live").and_then(|x| x.as_bool()).unwrap_or(false),
+        fetched: now_unix(),
+    })
+}
+
 // ═══════════════════════ TABS / UI ═══════════════════════
 #[derive(Clone, Copy, PartialEq)]
 enum Tab { Mine, Data, Stratums, Learn, Network, Setup, Help }
@@ -787,18 +912,55 @@ struct App {
     buf: String,
     msg: String,          // transient status line
     paused: Arc<AtomicBool>,   // shared with the engine: `p` toggles pause/resume of mining
+    list_scroll: usize,   // ↑↓ offset into the CHIRP coinbase list (MINE + NETWORK tabs)
 }
 impl App {
     fn network(&self) -> String { self.cfg.stratums.get(self.cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()) }
     fn addr(&self) -> String { self.cfg.addrs.get(&self.network()).cloned().unwrap_or_default() }
 }
 
-fn tile(title: &str, value: Line<'static>, sub: &str, border: Color) -> Paragraph<'static> {
+// ── visual language: one quiet rounded frame everywhere, muted labels, bold values, ONE accent per pool mode ──
+fn card(title: &str, accent: Color) -> Block<'static> {
+    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM))
+        .title(Span::styled(format!(" {} ", title), Style::new().fg(accent)))
+}
+// stat tile: label · big value · footnote (3 rows + frame = 5). `accent` colours the label.
+fn tile(title: &str, value: Line<'static>, sub: &str, accent: Color) -> Paragraph<'static> {
+    let lab = if accent == BRD || accent == MUT { MUT } else { accent };
     Paragraph::new(Text::from(vec![
-        Line::from(Span::styled(title.to_string(), Style::new().fg(MUT))), Line::from(""),
-        value, Line::from(Span::styled(sub.to_string(), Style::new().fg(MUT))),
+        Line::from(Span::styled(title.to_string(), Style::new().fg(lab))),
+        value,
+        Line::from(Span::styled(sub.to_string(), Style::new().fg(MUT))),
     ])).alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(border)))
+        .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM)))
+}
+fn bold(s: String, col: Color) -> Span<'static> { Span::styled(s, Style::new().fg(col).add_modifier(Modifier::BOLD)) }
+fn dim(s: &str) -> Span<'static> { Span::styled(s.to_string(), Style::new().fg(MUT)) }
+// bc1qg8dfm…llyr — like the pool site. `full` shows the whole address (wide terminals).
+fn mask_addr(a: &str, full: bool) -> String {
+    let c: Vec<char> = a.chars().collect();
+    if full || c.len() <= 14 { a.to_string() }
+    else { format!("{}…{}", c[..6].iter().collect::<String>(), c[c.len() - 4..].iter().collect::<String>()) }
+}
+// TH/s magnitude → human string (mirrors the pool site's formatHashrate)
+fn fmt_ths(th: f64) -> String {
+    if th <= 0.0 { "—".into() }
+    else if th >= 1e6 { format!("{:.2} EH/s", th / 1e6) } else if th >= 1e3 { format!("{:.2} PH/s", th / 1e3) }
+    else if th >= 1.0 { format!("{:.2} TH/s", th) } else if th >= 1e-3 { format!("{:.2} GH/s", th * 1e3) }
+    else if th >= 1e-6 { format!("{:.2} MH/s", th * 1e6) } else { format!("{:.0} KH/s", th * 1e9) }
+}
+fn fmt_num(v: f64) -> String {
+    if v >= 1e9 { format!("{:.1}G", v / 1e9) } else if v >= 1e6 { format!("{:.1}M", v / 1e6) }
+    else if v >= 1e3 { format!("{:.1}K", v / 1e3) } else { format!("{:.0}", v) }
+}
+// ▰▰▰▱▱ — a `w`-cell progress bar
+fn bar(frac: f64, w: usize) -> String {
+    let n = (frac.clamp(0.0, 1.0) * w as f64).round() as usize;
+    format!("{}{}", "▰".repeat(n), "▱".repeat(w - n))
+}
+fn fmt_ago(secs: u64) -> String {
+    if secs < 60 { format!("{}s", secs) } else if secs < 3600 { format!("{}m", secs / 60) }
+    else if secs < 86_400 { format!("{}h", secs / 3600) } else { format!("{}d", secs / 86_400) }
 }
 
 fn tab_bar(app: &App) -> Line<'static> {
@@ -816,7 +978,7 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     f.render_widget(Paragraph::new(tab_bar(app)), outer[0]);
     let body = outer[1];
     match app.tab {
-        Tab::Mine => render_mine(f, body, st),
+        Tab::Mine => render_mine(f, body, st, app),
         Tab::Data => render_data(f, body, st),
         Tab::Stratums => render_stratums(f, body, app),
         Tab::Learn => render_learn(f, body, app),
@@ -833,12 +995,16 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     } else if !app.msg.is_empty() {
         Line::from(Span::styled(app.msg.clone(), Style::new().fg(AMB)))
     } else {
-        Line::from(vec![Span::styled(" 1-7 ", Style::new().fg(Color::Black).bg(GRN)),
+        let mut sp = vec![Span::styled(" 1-7 ", Style::new().fg(Color::Black).bg(GRN)),
                         Span::styled(" tabs · ", Style::new().fg(MUT)),
-                        Span::styled("Tab", Style::new().fg(GRN)), Span::styled(" next · ", Style::new().fg(MUT)),
-                        Span::styled("p", Style::new().fg(GRN)),
+                        Span::styled("Tab", Style::new().fg(GRN)), Span::styled(" next · ", Style::new().fg(MUT))];
+        if st.mode == PoolMode::Chirp && matches!(app.tab, Tab::Mine | Tab::Network) {
+            sp.push(Span::styled("↑↓", Style::new().fg(GRN))); sp.push(Span::styled(" coinbase list · ", Style::new().fg(MUT)));
+        }
+        sp.extend([Span::styled("p", Style::new().fg(GRN)),
                         Span::styled(if st.paused { " resume · " } else { " pause · " }, Style::new().fg(MUT)),
-                        Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))])
+                        Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))]);
+        Line::from(sp)
     };
     f.render_widget(Paragraph::new(foot).wrap(Wrap { trim: true }), outer[2]);
     // version — bottom-right corner
@@ -846,65 +1012,258 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
         .alignment(ratatui::layout::Alignment::Right), outer[2]);
 }
 
-fn render_mine(f: &mut Frame, area: Rect, st: &Stats) {
-    let gpu_h = (st.gpu_names.len().max(1) + 2).min(9) as u16;
-    let c = Layout::vertical([Constraint::Length(4), Constraint::Length(6), Constraint::Length(6),
-        Constraint::Length(gpu_h), Constraint::Length(5), Constraint::Min(3)]).split(area);
-    let dot = if st.paused { Span::styled("⏸ PAUSED", Style::new().fg(YLW).add_modifier(Modifier::BOLD)) }
-              else if st.blake2b_active == Some(false) { Span::styled("⏳ WAITING · SHA-256d", Style::new().fg(AMB).add_modifier(Modifier::BOLD)) }
-              else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
-              else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
-    let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
-    let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
-    let mut l2 = vec![Span::styled("your address  ", Style::new().fg(MUT)), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
-        Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::styled("   keep 99.1% · ", Style::new().fg(MUT)),
-        Span::styled("pool fee 0.9%", Style::new().fg(PNK))];
-    if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
-    let mut l1 = vec![Span::styled("LOTTO BLAKE2b", Style::new().fg(YLW).add_modifier(Modifier::BOLD)), Span::raw("  "),
-        Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
-        Span::styled(format!("   {}", st.endpoint), Style::new().fg(MUT))];
-    if st.blake2b_active == Some(false) {
-        l1.push(Span::styled(format!("   ⛔ BLAKE2b @ {} ({} to go) — not mining, saving power", st.activation_height, st.blocks_until_act), Style::new().fg(AMB)));
-    }
-    if st.update_available {
-        l1.push(Span::styled(format!("   ⬆ v{} — git pull && ./build.sh", st.latest_version), Style::new().fg(PNK).add_modifier(Modifier::BOLD)));
-    }
-    f.render_widget(Paragraph::new(Text::from(vec![
-        Line::from(l1),
-        Line::from(l2)])).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN))
-        .title(Span::styled(" ⛏ Bitcoin BLAKE2b · solo lottery ", Style::new().fg(GRN)))), c[0]);
-    let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[1]);
-    f.render_widget(tile("YOUR HASHRATE", Line::from(vec![Span::styled(format!("{:.1}", st.hr_total), Style::new().fg(GRN).add_modifier(Modifier::BOLD)),
-        Span::styled(" GH/s", Style::new().fg(MUT))]), &format!("{} worker(s)", st.gpu_ghs.len()), BRD), row[0]);
-    f.render_widget(tile("BLOCKS FOUND", Line::from(Span::styled(format!("{}", st.blocks), Style::new().fg(GRN).add_modifier(Modifier::BOLD))),
-        &format!("{} shares acc · {} rej · {} don", st.accepted, st.rejected, st.donated), BRD), row[1]);
-    f.render_widget(tile("DIFFICULTY", Line::from(Span::styled(format!("bits {}", st.bits), Style::new().fg(YLW).add_modifier(Modifier::BOLD))),
-        &format!("diff {:.0} · best {}", st.diff, fmt_diff(st.best_diff)), BRD), row[2]);
-    let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) }
-        else { ("—".into(), "—".into(), "—".into()) };
-    let nr = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[2]);
-    f.render_widget(tile("◈ MINERS ONLINE", Line::from(Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), nr[0]);
-    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)),
-        Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), nr[1]);
-    f.render_widget(tile("◈ POOL HEIGHT", Line::from(Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), nr[2]);
+fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
+    let gpu_h = gpu_rows(st);
+    // The mode panel (CHIRP coinbase list · CAROUSEL rotation · LOTTO odds) takes what its content needs,
+    // within what the screen can spare after header + tiles + workers + sparkline + a small log.
+    let head_h = header_rows(area.width);
+    let fixed = head_h + 5 + 5 + gpu_h + 4 + 6;
+    let want = mode_panel_rows(st, area.width) as u16 + 2;
+    let panel_h = want.min(area.height.saturating_sub(fixed)).max(5);
+    let c = Layout::vertical([Constraint::Length(head_h), Constraint::Length(5), Constraint::Length(5),
+        Constraint::Length(panel_h), Constraint::Length(gpu_h), Constraint::Length(4), Constraint::Min(3)]).split(area);
+    render_header(f, c[0], st);
+    render_your_tiles(f, c[1], st);
+    render_net_tiles(f, c[2], st);
+    render_mode_panel(f, c[3], st, app);
+    // workers
     let mut glines: Vec<Line> = vec![];
     for (i, g) in st.gpu_ghs.iter().enumerate() {
         let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("GPU {}", i));
-        glines.push(Line::from(vec![Span::styled(format!(" {:>2}  ", i), Style::new().fg(MUT)),
-            Span::styled(format!("{:<26}", name), Style::new().fg(CYN)), Span::styled(format!("{:>7.2} GH/s", g), Style::new().fg(GRN))]));
+        glines.push(Line::from(vec![dim(&format!("  {:>2}  ", i)), Span::styled(format!("{:<28}", name), Style::new().fg(WHT)),
+            bold(format!("{:>7.2}", g), GRN), dim(" GH/s")]));
     }
-    if glines.is_empty() { glines.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
-    f.render_widget(Paragraph::new(Text::from(glines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS ", Style::new().fg(MUT)))), c[3]);
+    if glines.is_empty() { glines.push(Line::from(dim("  warming up…"))); }
+    f.render_widget(Paragraph::new(Text::from(glines)).block(card("WORKERS", MUT)), c[4]);
     // ratatui's Sparkline renders the FIRST N=min(width,len) points, so feed it exactly the last inner_w
     // samples → the chart fills the full terminal width and updates live (adapts to any window size).
-    let inner_w = (c[4].width.saturating_sub(2) as usize).max(1);   // block borders eat 2 columns
+    let inner_w = (c[5].width.saturating_sub(2) as usize).max(1);   // block borders eat 2 columns
     let data: Vec<u64> = st.hr_hist.iter().rev().take(inner_w).rev().cloned().collect();
-    f.render_widget(Sparkline::default().block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" hashrate ", Style::new().fg(MUT)))).data(&data).style(Style::new().fg(GRN)), c[4]);
-    let items: Vec<ListItem> = st.log.iter().rev().take(c[5].height.saturating_sub(2) as usize).rev().map(|l| {
+    f.render_widget(Sparkline::default().block(card("hashrate", MUT)).data(&data).style(Style::new().fg(GRN)), c[5]);
+    let items: Vec<ListItem> = st.log.iter().rev().take(c[6].height.saturating_sub(2) as usize).rev().map(|l| {
         let col = if l.contains("BLOCK FOUND") { GRN } else if l.contains("donation") { AMB } else if l.contains("rejected") || l.contains("stale") || l.contains("switching") { AMB } else { MUT };
-        ListItem::new(Line::from(Span::styled(l.clone(), Style::new().fg(col))))
+        ListItem::new(Line::from(Span::styled(format!("  {}", l), Style::new().fg(col))))
     }).collect();
-    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" log ", Style::new().fg(MUT)))), c[5]);
+    f.render_widget(List::new(items).block(card("log", MUT)), c[6]);
+}
+
+// ── header: which pool MODE you're on, chain, connection, and — the thing a miner cares about — who gets paid ──
+// 2 content rows on wide terminals; on narrow ones the address/balance and the payout get a row each (nothing truncates)
+fn header_rows(width: u16) -> u16 { if width < 132 { 5 } else { 4 } }
+fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
+    let m = st.mode; let ac = m.accent();
+    let dot = if st.paused { bold("⏸ PAUSED".into(), YLW) }
+              else if st.blake2b_active == Some(false) { bold("⏳ WAITING · SHA-256d".into(), AMB) }
+              else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
+              else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
+    let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
+    let mut l1 = vec![bold(format!("{} {} BLAKE2b", m.icon(), m.label()), ac), Span::raw("  "),
+        Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
+        dim(&format!("   {}", st.endpoint))];
+    if st.blake2b_active == Some(false) {
+        l1.push(Span::styled(format!("   ⛔ BLAKE2b @ {} ({} to go) — not mining, saving power", st.activation_height, st.blocks_until_act), Style::new().fg(AMB)));
+    }
+    if st.update_available { l1.push(bold(format!("   ⬆ v{} — git pull && ./build.sh", st.latest_version), PNK)); }
+    let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
+    let narrow = header_rows(area.width) == 5;
+    let mut l2 = vec![dim("your address  "), Span::styled(st.addr.clone(), Style::new().fg(CYN)), Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::raw("   ")];
+    let mut l3 = vec![dim("payout        ")];
+    if narrow { std::mem::swap(&mut l2, &mut l3); }   // narrow: l3 is now the address row, l2 collects the payout
+    match m {
+        // CHIRP: your LIVE slice of every block the syndicate finds
+        PoolMode::Chirp => {
+            l2.push(match st.chirp.as_ref() {
+                None => dim("weighted split · loading the coinbase draw…"),
+                Some(c) => match c.me(&st.addr) {
+                    Some(me) if me.eligible => bold(format!("your slice of every block  {:.2}%", c.my_pct(&st.addr).unwrap_or(0.0)), PUR),
+                    Some(me) => Span::styled(format!("joining the draw · {:.1} of {:.0} days", me.days, c.min_days), Style::new().fg(AMB)),
+                    None => Span::styled("not in the coinbase draw yet · mine here to enter", Style::new().fg(AMB)),
+                },
+            });
+            l2.push(dim(" · fee 0.9%"));
+        }
+        PoolMode::Custom => l2.push(dim(m.payout_short())),
+        _ => l2.push(Span::styled(m.payout_short().to_string(), Style::new().fg(PNK))),
+    }
+    if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
+    let lines = if narrow { vec![Line::from(l1), Line::from(l3), Line::from(l2)] } else { vec![Line::from(l1), Line::from(l2)] };
+    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&format!("⛏ Bitcoin BLAKE2b · {}", m.tagline()), ac)), area);
+}
+
+fn render_your_tiles(f: &mut Frame, area: Rect, st: &Stats) {
+    let row = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+    f.render_widget(tile("YOUR HASHRATE", Line::from(vec![bold(format!("{:.1}", st.hr_total), GRN), dim(" GH/s")]),
+        &format!("{} worker(s)", st.gpu_ghs.len()), MUT), row[0]);
+    f.render_widget(tile("BLOCKS FOUND", Line::from(bold(format!("{}", st.blocks), GRN)),
+        &format!("{} shares acc · {} rej · {} don", st.accepted, st.rejected, st.donated), MUT), row[1]);
+    f.render_widget(tile("DIFFICULTY", Line::from(bold(format!("bits {}", st.bits), YLW)),
+        &format!("diff {:.0} · best {}", st.diff, fmt_diff(st.best_diff)), MUT), row[2]);
+}
+
+// ── network tiles, per MODE: LOTTO = the pyblockMiner network · CHIRP = the syndicate · CAROUSEL = the rotation ──
+fn render_net_tiles(f: &mut Frame, area: Rect, st: &Stats) {
+    let r = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+    match (st.mode, st.chirp.as_ref(), st.carousel.as_ref()) {
+        (PoolMode::Chirp, Some(c), _) => {
+            let reward = c.reward_sats as f64 / 1e8;
+            let cut = c.my_pct(&st.addr).map(|p| format!("your cut ≈ {:.5} BTC", reward * p / 100.0 * (1.0 - c.fee_bps as f64 / 10_000.0)))
+                .unwrap_or_else(|| "split by weight among eligible miners".into());
+            f.render_widget(tile("◈ IN THE COINBASE", Line::from(bold(format!("{}", c.candidates), PUR)), &format!("eligible miners · {} workers", c.workers), PUR), r[0]);
+            f.render_widget(tile("◈ SYNDICATE HASHRATE", Line::from(bold(fmt_ths(c.hashrate_ths), PUR)), &format!("{} blocks found together", c.blocks), PUR), r[1]);
+            f.render_widget(tile("◈ LAST BLOCK REWARD", Line::from(vec![bold(if reward > 0.0 { format!("{:.4}", reward) } else { "—".into() }, PUR), dim(" BTC")]), &cut, PUR), r[2]);
+        }
+        (PoolMode::Carousel, _, Some(k)) => {
+            let cur = if k.current.is_empty() { "—".to_string() } else { k.current.clone() };
+            f.render_widget(tile("◈ SUPPLIERS", Line::from(bold(format!("{}", k.suppliers.len()), WHT)), "clean templates in rotation", WHT), r[0]);
+            f.render_widget(tile("◈ CAROUSEL HASHRATE", Line::from(bold(fmt_ths(k.hashrate_ths), WHT)), &format!("{} miners on the rotation", k.miners), WHT), r[1]);
+            f.render_widget(tile("◈ NOW MINING", Line::from(bold(cur, WHT)), "this supplier's template · rotates every cycle", WHT), r[2]);
+        }
+        _ => {
+            let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), fmt_ths(st.net_ghs / 1e3), format!("{}", st.net_height)) }
+                else { ("—".into(), "—".into(), "—".into()) };
+            let sub = match st.mode { PoolMode::Chirp => "syndicate data loading…", PoolMode::Carousel => "rotation data loading…", _ => "PyBLØCK LOTTO network" };
+            f.render_widget(tile("◈ MINERS ONLINE", Line::from(bold(nm, CYN)), "using pyblockMiner", CYN), r[0]);
+            f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(bold(ng, CYN)), "all pyblockMiner users", CYN), r[1]);
+            f.render_widget(tile("◈ POOL HEIGHT", Line::from(bold(nh, CYN)), sub, CYN), r[2]);
+        }
+    }
+}
+
+// rows the mode panel wants (content only) — MINE sizes the panel from this, NETWORK gives it the whole tab
+fn mode_panel_rows(st: &Stats, width: u16) -> usize {
+    let w = (width.saturating_sub(2) as usize).max(20);
+    let wrapped = |len: usize| (len.max(1) + w - 1) / w;   // rows a `len`-char line takes once wrapped
+    match st.mode {
+        PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len() + 3).unwrap_or(1),
+        PoolMode::Carousel => match st.carousel.as_ref() {
+            Some(k) => {
+                let rot = 14 + k.suppliers.iter().map(|s| s.chars().count() + 3).sum::<usize>() + 2;
+                let trail = 14 + k.recent.iter().rev().take(10).map(|s| s.chars().count() + 3).sum::<usize>();
+                1 + wrapped(rot) + wrapped(trail) + wrapped(14 + 92)
+            }
+            None => 1,
+        },
+        PoolMode::Lotto => 3,
+        PoolMode::Custom => 2,
+    }
+}
+fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
+    match st.mode {
+        PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll),
+        PoolMode::Carousel => {
+            let upd = st.carousel.as_ref().map(|k| format!(" · updated {} ago", fmt_ago(now_unix().saturating_sub(k.fetched)))).unwrap_or_default();
+            f.render_widget(Paragraph::new(Text::from(carousel_lines(st))).wrap(Wrap { trim: false })
+                .block(card(&format!("🎠 CAROUSEL · rotating clean templates{}", upd), WHT)), area)
+        }
+        PoolMode::Lotto => f.render_widget(Paragraph::new(Text::from(lotto_lines(st))).wrap(Wrap { trim: false })
+            .block(card("🎰 LOTTO · solo lottery", YLW)), area),
+        PoolMode::Custom => f.render_widget(Paragraph::new(Text::from(vec![
+            Line::from(vec![dim("  stratum  "), Span::styled(st.endpoint.clone(), Style::new().fg(WHT))]),
+            Line::from(vec![dim("  payout   "), dim(PoolMode::Custom.payout())]),
+        ])).block(card("⛏ CUSTOM STRATUM", CYN)), area),
+    }
+}
+fn lotto_lines(st: &Stats) -> Vec<Line<'static>> {
+    let eta = eta_to_block(st.net_nbits, st.hr_total);
+    let per_day = if eta.is_finite() && eta > 0.0 { 86_400.0 / eta } else { 0.0 };
+    vec![
+        Line::from(vec![dim("  how it pays  "), Span::styled("every winning share IS a block — the whole coinbase goes to your address", Style::new().fg(WHT))]),
+        if eta.is_finite() {
+            Line::from(vec![dim("  your odds    "), bold(format!("~{} per block", fmt_dur(eta)), YLW),
+                dim(&format!("  at {:.1} GH/s · mean, high variance · ~{:.4} blocks/day", st.hr_total, per_day))])
+        } else {
+            Line::from(vec![dim("  your odds    "), dim("waiting for hashrate + a network target to estimate your time-to-block…")])
+        },
+        Line::from(vec![dim("  payout       "), Span::styled("you keep 99.1% · PyBLØCK fee 0.9% · non-custodial", Style::new().fg(PNK))]),
+    ]
+}
+fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
+    let Some(k) = st.carousel.as_ref() else { return vec![Line::from(dim("  loading the rotation from the pool…"))]; };
+    let mut out = vec![Line::from(vec![dim("  now mining  "),
+        bold(if k.current.is_empty() { "—".to_string() } else { format!("{}'s clean template", k.current) }, WHT),
+        dim(&format!("   · {} suppliers · {} miners · {}{}", k.suppliers.len(), k.miners, fmt_ths(k.hashrate_ths), if k.live { "" } else { " · rotation paused" }))])];
+    // the wheel: every supplier in the rotation, the live one lit
+    let mut rot = vec![dim("  rotation    ")];
+    for (i, s) in k.suppliers.iter().enumerate() {
+        if i > 0 { rot.push(Span::styled(" · ", Style::new().fg(DIM))); }
+        if *s == k.current { rot.push(bold(format!("▶ {}", s), WHT)); } else { rot.push(dim(s)); }
+    }
+    out.push(Line::from(rot));
+    // recent is oldest → newest; show the last few so the trail ends at what's being mined now
+    let trail: Vec<String> = k.recent.iter().rev().take(10).rev().cloned().collect();
+    out.push(Line::from(vec![dim("  recent      "), Span::styled(trail.join(" › "), Style::new().fg(Color::Rgb(150, 150, 165)))]));
+    out.push(Line::from(vec![dim("  payout      "), Span::styled("finder keeps 98% · supplier 1% · PyBLØCK 1% · split on-chain in the coinbase · non-custodial", Style::new().fg(PNK))]));
+    out
+}
+// ── CHIRP: EVERY miner in the coinbase draw — rank · address · tenure · power · share of the next block · status.
+//    Your row is marked ▶. Eligible miners first (by weight), then the ones still earning their 7 days. ↑↓ scrolls. ──
+fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let Some(c) = st.chirp.as_ref() else {
+        f.render_widget(Paragraph::new(Line::from(dim("  loading the coinbase draw from the pool…"))).block(card("🌌 CHIRP · who is in the coinbase", PUR)), area);
+        return;
+    };
+    let full = inner_w >= 124;            // wide terminal → whole addresses
+    let show_power = inner_w >= 96;
+    let aw = if full { 62 } else { 13 };
+    let sum = c.sum_weight(); let now = now_unix();
+    let reward = c.reward_sats as f64 / 1e8;
+    let keep = 1.0 - c.fee_bps as f64 / 10_000.0;
+    let soft = Color::Rgb(120, 80, 170);
+    // bars are relative to the leader (leader = full bar) so the distribution reads at a glance; the % is the truth
+    let top_w = c.members.iter().filter(|m| m.eligible).map(|m| m.weight).fold(0.0f64, f64::max).max(1e-9);
+    // ── summary: the draw, then YOU ──
+    let mut head: Vec<Line<'static>> = vec![Line::from(vec![
+        bold(format!("  {} ", c.candidates), PUR), dim("eligible miners share every block · "),
+        Span::styled(fmt_ths(c.hashrate_ths), Style::new().fg(WHT)),
+        dim(&format!(" · {} workers · {} blocks · last reward {}", c.workers, c.blocks, if reward > 0.0 { format!("{:.4} BTC", reward) } else { "—".into() })),
+    ])];
+    head.push(match c.me(&st.addr) {
+        Some(m) if m.eligible => { let p = if sum > 0.0 { m.weight / sum * 100.0 } else { 0.0 };
+            Line::from(vec![bold("  you  ".into(), PUR), bold(format!("{:.2}% of every block ≈ {:.5} BTC", p, reward * p / 100.0 * keep), WHT),
+                dim(&format!(" · tenure {:.1} d · power {}", m.days, fmt_num(m.power)))]) }
+        Some(m) => Line::from(vec![bold("  you  ".into(), AMB), Span::styled(format!("joining the draw · {:.1} of {:.0} days  {}  keep mining, stay connected",
+                m.days, c.min_days, bar(m.days / c.min_days.max(0.1), 10)), Style::new().fg(AMB))]),
+        None => Line::from(vec![dim("  you  "), dim(&format!("not in the draw yet — mine here {:.0} days to enter · the pool lists you once it sees your shares", c.min_days))]),
+    });
+    head.push(Line::from(Span::styled(format!("    {:>2}  {:<aw$}  {:>7}  {}{:<10} {:>7}   STATUS", "#", "MINER", "TENURE",
+        if show_power { format!("{:>9}  ", "POWER 24h") } else { String::new() }, "SHARE", "", aw = aw), Style::new().fg(DIM))));
+    // ── rows ──
+    let rows: Vec<Line<'static>> = c.members.iter().enumerate().map(|(i, m)| {
+        let is_me = !st.addr.is_empty() && m.addr == st.addr;
+        let pct = if m.eligible && sum > 0.0 { m.weight / sum * 100.0 } else { 0.0 };
+        let age = now.saturating_sub(m.last_seen);
+        let (status, scol) = if !m.eligible {
+            if m.days < c.min_days { (format!("⏳ {:.1} d to go", c.min_days - m.days), AMB) }
+            else if m.power < c.min_power { ("⚠ below min power".to_string(), AMB) }
+            else { ("⏳ pending".to_string(), AMB) }
+        } else if age > 20 * 3600 { (format!("⚠ drops in {}h", 24u64.saturating_sub(age / 3600)), Color::Red) }
+        else if age > 3600 { (format!("● offline {}", fmt_ago(age)), AMB) }
+        else { ("● eligible".to_string(), GRN) };
+        let name_st = if is_me { Style::new().fg(PUR).add_modifier(Modifier::BOLD) } else if m.eligible { Style::new().fg(WHT) } else { Style::new().fg(MUT) };
+        let mut sp = vec![bold(if is_me { "  ▶ " } else { "    " }.into(), PUR), dim(&format!("{:>2}  ", i + 1)),
+            Span::styled(format!("{:<aw$}  ", mask_addr(&m.addr, full), aw = aw), name_st), dim(&format!("{:>5.1} d  ", m.days))];
+        if show_power { sp.push(dim(&format!("{:>9}  ", fmt_num(m.power)))); }
+        if m.eligible {
+            sp.push(Span::styled(bar(m.weight / top_w, 10), Style::new().fg(if is_me { PUR } else { soft })));
+            sp.push(if is_me { bold(format!(" {:>6.2}%   ", pct), WHT) } else { Span::styled(format!(" {:>6.2}%   ", pct), Style::new().fg(WHT)) });
+        } else {
+            sp.push(Span::styled(bar((m.days / c.min_days.max(0.1)).min(1.0), 10), Style::new().fg(DIM)));
+            sp.push(dim(&format!(" {:>6}   ", "—")));
+        }
+        sp.push(Span::styled(status, Style::new().fg(scol)));
+        if is_me { sp.push(bold("  you".into(), PUR)); }
+        Line::from(sp)
+    }).collect();
+    // ── scroll window ──
+    let vis = inner_h.saturating_sub(head.len());
+    let off = scroll.min(rows.len().saturating_sub(vis));
+    let shown: Vec<Line<'static>> = rows.iter().skip(off).take(vis).cloned().collect();
+    let scroll_hint = if rows.len() > vis && vis > 0 { format!(" · ↑↓ {}–{} of {}", off + 1, (off + vis).min(rows.len()), rows.len()) } else { String::new() };
+    let title = format!("🌌 CHIRP · who is in the coinbase · {} miners{} · updated {} ago", c.members.len(), scroll_hint, fmt_ago(now.saturating_sub(c.fetched)));
+    let mut lines = head; lines.extend(shown);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&title, PUR)), area);
 }
 
 // human-readable duration (for uptime + solo-lottery ETA)
@@ -933,7 +1292,7 @@ fn gpu_rows(st: &Stats) -> u16 { (st.gpu_names.len().max(1) + 2).min(9) as u16 }
 
 // ── DATA — session analytics (the "modo análisis de datos"): hashrate stats, share odds, per-worker breakdown ──
 fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
-    let c = Layout::vertical([Constraint::Length(6), Constraint::Length(gpu_rows(st)), Constraint::Min(3)]).split(area);
+    let c = Layout::vertical([Constraint::Length(5), Constraint::Length(gpu_rows(st)), Constraint::Min(3)]).split(area);
     // hashrate stats from the live history buffer (stored as GH/s×100)
     let (peak, avg) = if st.hr_hist.is_empty() { (0.0, 0.0) } else {
         let mx = *st.hr_hist.iter().max().unwrap() as f64 / 100.0;
@@ -958,8 +1317,7 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
             Span::styled(format!("   {:>5.1}%", pct), Style::new().fg(MUT))]));
     }
     if wl.is_empty() { wl.push(Line::from(Span::styled(" warming up…", Style::new().fg(MUT)))); }
-    f.render_widget(Paragraph::new(Text::from(wl)).block(Block::default().borders(Borders::ALL)
-        .border_style(Style::new().fg(BRD)).title(Span::styled(" WORKERS — hashrate share ", Style::new().fg(MUT)))), c[1]);
+    f.render_widget(Paragraph::new(Text::from(wl)).block(card("WORKERS · hashrate share", MUT)), c[1]);
     // session analytics text
     let up = st.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     let total = st.accepted + st.rejected;
@@ -980,31 +1338,37 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
         kv("expected blocks / day", if per_day > 0.0 { format!("{:.4}", per_day) } else { "—".into() }, CYN),
         kv("hashrate donated", format!("{} blocks → PyBLØCK", st.donated), AMB),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL)
-        .border_style(Style::new().fg(CYN)).title(Span::styled(" ANÁLISIS — session data (press p to pause mining while you review) ", Style::new().fg(CYN)))), c[2]);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
+        .block(card("ANÁLISIS · session data (press p to pause mining while you review)", CYN)), c[2]);
 }
 
+// ── STRATUMS: each pool as a two-line card row — name · url · chain, then WHAT IT DOES WITH THE COINBASE ──
 fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
     let mut items: Vec<ListItem> = vec![];
+    let row_bg = Style::new().bg(Color::Rgb(20, 28, 20));
     for (i, s) in app.cfg.stratums.iter().enumerate() {
         let cur = i == app.strat_cur;
         let active = i == app.cfg.selected;
-        let mark = if active { "▶ " } else { "  " };
-        let tag = if s.custom { "custom" } else { "default" };
-        let line = Line::from(vec![
-            Span::styled(mark, Style::new().fg(GRN)),
-            Span::styled(format!("{:<22}", s.name), Style::new().fg(if active { GRN } else { CYN }).add_modifier(if cur { Modifier::REVERSED } else { Modifier::empty() })),
-            Span::styled(format!("{:<28}", s.url), Style::new().fg(MUT)),
-            Span::styled(format!("[{}] {}", s.network, tag), Style::new().fg(AMB)),
+        let m = pool_mode(&s.url, &s.name); let ac = m.accent();
+        let name_st = if active { Style::new().fg(ac).add_modifier(Modifier::BOLD) } else { Style::new().fg(WHT) };
+        let mut l1 = Line::from(vec![
+            Span::styled(if active { " ● " } else if cur { " › " } else { "   " }, Style::new().fg(if active { GRN } else { ac })),
+            Span::raw(format!("{} ", m.icon())),
+            Span::styled(format!("{:<24}", s.name), name_st),
+            dim(&format!("{:<26}", s.url)),
+            Span::styled(format!("{:<10}", s.network), Style::new().fg(AMB)),
+            Span::styled(if s.custom { "custom  " } else { "        " }, Style::new().fg(DIM)),
+            Span::styled(if active { "● LIVE" } else { "" }, Style::new().fg(GRN)),
         ]);
-        items.push(ListItem::new(line));
+        let mut l2 = Line::from(vec![Span::raw("      "), Span::styled(format!("{:<28}", m.tagline()), Style::new().fg(ac)), dim(m.payout())]);
+        if cur { l1 = l1.style(row_bg); l2 = l2.style(row_bg); }
+        items.push(ListItem::new(Text::from(vec![l1, l2, Line::from("")])));
     }
-    let help = Line::from(vec![Span::styled("  ↑↓ move · ", Style::new().fg(MUT)), Span::styled("Enter", Style::new().fg(GRN)),
-        Span::styled(" switch LIVE · ", Style::new().fg(MUT)), Span::styled("a", Style::new().fg(GRN)), Span::styled(" add custom · ", Style::new().fg(MUT)),
-        Span::styled("d", Style::new().fg(GRN)), Span::styled(" delete custom", Style::new().fg(MUT))]);
-    let c = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
-    f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN)).title(Span::styled(" STRATUMS — switch pool without leaving the app ", Style::new().fg(GRN)))), c[0]);
-    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD))), c[1]);
+    let help = Line::from(vec![dim("  ↑↓ move · "), Span::styled("Enter", Style::new().fg(GRN)), dim(" switch LIVE (no restart) · "),
+        Span::styled("a", Style::new().fg(GRN)), dim(" add custom  name,host:port,network · "), Span::styled("d", Style::new().fg(GRN)), dim(" delete custom")]);
+    let c = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+    f.render_widget(List::new(items).block(card("STRATUMS · same BLAKE2b chain, three ways to get paid", GRN)), c[0]);
+    f.render_widget(Paragraph::new(help).block(card("", MUT)), c[1]);
 }
 
 fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
@@ -1047,27 +1411,23 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
 
 fn render_learn(f: &mut Frame, area: Rect, app: &App) {
     let (title, lines) = info_page(app);
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(CYN)).title(Span::styled(title, Style::new().fg(CYN)))), area);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card(title.trim(), CYN)), area);
 }
 
+// ── NETWORK: the pool's numbers for your MODE, you, and the full mode panel (CHIRP: the whole coinbase list) ──
 fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
-    let c = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(area);
-    let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), format!("{:.1}", st.net_ghs), format!("{}", st.net_height)) } else { ("—".into(), "—".into(), "—".into()) };
-    let r = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(c[0]);
-    f.render_widget(tile("◈ MINERS ONLINE", Line::from(Span::styled(nm, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "using pyblockMiner", CYN), r[0]);
-    f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(vec![Span::styled(ng, Style::new().fg(CYN).add_modifier(Modifier::BOLD)), Span::styled(if st.net_ok { " GH/s" } else { "" }, Style::new().fg(MUT))]), "all pyblockMiner users", CYN), r[1]);
-    f.render_widget(tile("◈ POOL HEIGHT", Line::from(Span::styled(nh, Style::new().fg(CYN).add_modifier(Modifier::BOLD))), "PyBLØCK LOTTO network", CYN), r[2]);
+    let c = Layout::vertical([Constraint::Length(5), Constraint::Length(4), Constraint::Min(4)]).split(area);
+    render_net_tiles(f, c[0], st);
     let bal = if st.balance_ok { format!("{:.8} BTC", st.balance_btc) } else { "—".into() };
+    let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), fmt_ths(st.net_ghs / 1e3), format!("{}", st.net_height)) } else { ("—".into(), "—".into(), "—".into()) };
     let lines = vec![
-        Line::from(vec![Span::styled("  network      ", Style::new().fg(MUT)), Span::styled(app.network(), Style::new().fg(GRN))]),
-        Line::from(vec![Span::styled("  your address ", Style::new().fg(MUT)), Span::styled(app.addr(), Style::new().fg(CYN))]),
-        Line::from(vec![Span::styled("  your balance ", Style::new().fg(MUT)), Span::styled(bal, Style::new().fg(GRN))]),
-        Line::from(vec![Span::styled("  your blocks  ", Style::new().fg(MUT)), Span::styled(format!("{} blocks · {} shares acc · {} rej", st.blocks, st.accepted, st.rejected), Style::new().fg(GRN))]),
-        Line::from(""),
-        Line::from(Span::styled("  Network stats + balance come from the PyBLØCK node/pool for the selected chain (mainnet balance via public explorer).", Style::new().fg(MUT))),
+        Line::from(vec![dim("  you     "), Span::styled(app.network(), Style::new().fg(GRN)), dim(" · "), Span::styled(app.addr(), Style::new().fg(CYN)),
+            dim(" · balance "), Span::styled(bal, Style::new().fg(GRN)),
+            dim(&format!(" · {} blocks · {} shares acc · {} rej", st.blocks, st.accepted, st.rejected))]),
+        Line::from(vec![dim("  chain   "), dim(&format!("pyblockMiner network: {} miners · {} · pool height {} · stats + balance from the PyBLØCK BLAKE2b node for this chain", nm, ng, nh))]),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(BRD)).title(Span::styled(" NETWORK & YOU ", Style::new().fg(MUT)))), c[1]);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(card("NETWORK & YOU", MUT)), c[1]);
+    render_mode_panel(f, c[2], st, app);
 }
 
 fn render_setup(f: &mut Frame, area: Rect, app: &App) {
@@ -1090,8 +1450,7 @@ fn render_setup(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("+/-", Style::new().fg(GRN)), Span::styled(" donation (mainnet)   ", Style::new().fg(MUT)),
             Span::styled("changes auto-save + apply live", Style::new().fg(MUT))]),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(GRN)).title(Span::styled(" SETUP — address, network, config (saved) ", Style::new().fg(GRN)))), area);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("SETUP · address, network, config (saved)", GRN)), area);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
@@ -1104,6 +1463,13 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("q / Esc", "quit (Esc also cancels an input)"),
         l("STRATUMS", "↑↓ move · Enter switch live · a add · d delete custom"),
         l("SETUP", "g generate address · e edit address · c toggle CPU · +/- donation"),
+        l("MINE / NETWORK", "on CHIRP: ↑↓ PgUp PgDn Home scroll the coinbase list (everyone in the draw)"),
+        Line::from(""),
+        Line::from(Span::styled(" Pools — same BLAKE2b chain, three ways to get paid", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
+        l("🎰 LOTTO :4445", PoolMode::Lotto.payout()),
+        l("🌌 CHIRP :5574", PoolMode::Chirp.payout()),
+        l("🎠 CAROUSEL :30110", PoolMode::Carousel.payout()),
+        l("coinbase panel", "MINE shows who the next block pays: CHIRP lists every eligible miner + share; CAROUSEL the live template"),
         Line::from(""),
         Line::from(Span::styled(" Troubleshooting", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
         l("build fails", "CL/cl.h missing → sudo apt install ocl-icd-opencl-dev opencl-headers"),
@@ -1120,8 +1486,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(vec![Span::styled("  GitHub   ", Style::new().fg(MUT)), Span::styled("github.com/GaltRanch/pyblock-miner", Style::new().fg(CYN))]),
         Line::from(vec![Span::styled("  Pool     ", Style::new().fg(MUT)), Span::styled("pool.pyblock.xyz  ·  MIT licensed", Style::new().fg(CYN))]),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).border_style(Style::new().fg(CYN)).title(Span::styled(" HELP ", Style::new().fg(CYN)))), area);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("HELP", CYN)), area);
 }
 
 // apply the current selected stratum + address to the live engine target + stats display
@@ -1130,7 +1495,9 @@ fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) 
     let addr = app.addr();
     let donate = if net_cfg(&s.network).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
     { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.addr = addr.clone(); t.network = s.network.clone(); t.donate = donate; }
-    { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false; }
+    { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false;
+      // pool mode drives the MINE/NETWORK panels; drop the old mode's data so the new one starts clean (poller refills within ~1s)
+      st.mode = pool_mode(&s.url, &s.name); st.chirp = None; st.carousel = None; }
 }
 
 // append a generated key to ~/.config/pyblockminer/keys.txt (0600). Returns the path on success.
@@ -1209,8 +1576,9 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
             Tab::Stratums => match code {
                 KeyCode::Up => { if app.strat_cur > 0 { app.strat_cur -= 1; } }
                 KeyCode::Down => { if app.strat_cur + 1 < app.cfg.stratums.len() { app.strat_cur += 1; } }
-                KeyCode::Enter => { app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats);
-                    app.msg = format!("switched to {}", app.cfg.stratums[app.strat_cur].name); }
+                KeyCode::Enter => { app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats); app.list_scroll = 0;
+                    let s = &app.cfg.stratums[app.strat_cur];
+                    app.msg = format!("switched to {} · {}", s.name, pool_mode(&s.url, &s.name).payout()); }
                 KeyCode::Char('a') => { app.input = Some(Input::AddStratum); app.buf.clear(); }
                 KeyCode::Char('d') => {
                     if let Some(s) = app.cfg.stratums.get(app.strat_cur) { if s.custom {
@@ -1222,6 +1590,19 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                 }
                 _ => {}
             },
+            // CHIRP coinbase list: scroll through everyone in the draw (MINE panel + NETWORK full view)
+            Tab::Mine | Tab::Network => {
+                let n = stats.lock().unwrap().chirp.as_ref().map(|c| c.members.len()).unwrap_or(0);
+                match code {
+                    KeyCode::Up => { app.list_scroll = app.list_scroll.saturating_sub(1); }
+                    KeyCode::Down => { if app.list_scroll + 1 < n { app.list_scroll += 1; } }
+                    KeyCode::PageUp => { app.list_scroll = app.list_scroll.saturating_sub(10); }
+                    KeyCode::PageDown => { app.list_scroll = (app.list_scroll + 10).min(n.saturating_sub(1)); }
+                    KeyCode::Home => { app.list_scroll = 0; }
+                    KeyCode::End => { app.list_scroll = n.saturating_sub(1); }
+                    _ => {}
+                }
+            }
             Tab::Learn => match code {
                 KeyCode::Left => { if app.learn_page > 0 { app.learn_page -= 1; } }
                 KeyCode::Right => { if app.learn_page + 1 < 4 { app.learn_page += 1; } }   // 4 LEARN pages
@@ -1296,7 +1677,7 @@ fn main() {
     if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
     let paused = Arc::new(AtomicBool::new(false));   // shared pause flag: `p` toggles, engine idles the grinders
-    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone() };
+    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone(), list_scroll: 0 };
     app.strat_cur = app.cfg.selected;
 
     // devices — attempt the GPU grinder even if no GPU is name-detected (it enumerates OpenCL/Metal and
@@ -1316,9 +1697,27 @@ fn main() {
         pool: app.cfg.stratums.get(app.cfg.selected).map(|s| s.url.clone()).unwrap_or_default(),
         addr: app.addr(), network: net0.clone(), donate: donate0,
     }));
-    { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0; }
+    { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0;
+      st.mode = app.cfg.stratums.get(app.cfg.selected).map(|s| pool_mode(&s.url, &s.name)).unwrap_or_default(); }
 
     { let stats = stats.clone(); let tgt = tgt.clone(); let paused = paused.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads, paused)); }
+    // mode poller: CHIRP coinbase draw / CAROUSEL rotation for the ACTIVE stratum. Refreshes every 15s (the pool's
+    // own pages do the same) and immediately on a stratum switch. A failed poll keeps the last good data on screen.
+    { let stats = stats.clone(); std::thread::spawn(move || {
+        let mut last_mode: Option<PoolMode> = None; let mut last_poll = Instant::now();
+        loop {
+            let mode = stats.lock().unwrap().mode;
+            if last_mode != Some(mode) || last_poll.elapsed() >= Duration::from_secs(15) {
+                last_mode = Some(mode); last_poll = Instant::now();
+                match mode {
+                    PoolMode::Chirp => { let r = poll_chirp(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Chirp && r.is_some() { st.chirp = r; } }
+                    PoolMode::Carousel => { let r = poll_carousel(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Carousel && r.is_some() { st.carousel = r; } }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }); }
     // network-stats poller (per current network)
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
         let net = tgt.lock().unwrap().network.clone();
