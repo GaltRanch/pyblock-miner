@@ -96,6 +96,17 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = CPU only) |
 | `--cpu` | off | also mine on the CPU (added as an extra worker) |
 | `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (mainnet only, minimum 2.0, see below) |
+| `--worker <name>` | *(none)* | log in as `addr.name` so the pool tells your rigs apart (also SETUP → `w`) |
+| `--api-port <N>` | off | local stats API: `http://127.0.0.1:N/` (JSON) and `/metrics` (Prometheus) — localhost only |
+| `--telegram <token>,<chat_id>` | off | alerts to a Telegram chat (also SETUP → `t`) |
+| `--webhook <url>` | off | alerts as a JSON `POST {source,title,body,ts}` |
+| `--no-log-file` · `--no-bell` · `--no-desktop` | on | turn off the timestamped `miner.log`, the terminal bell, or desktop notifications |
+
+### Alerts, log file, local API
+
+The miner tells you what matters even when you're not looking: **block found**, **GPU down / back online**, **pool unreachable / back**, and on CHIRP **you're on the list · you're in the coinbase draw · you're falling out (no shares for 1 h) · you dropped off**. Channels: terminal bell, desktop notification (`notify-send` on Linux, Notification Center on macOS), Telegram, webhook. Toggle them in **SETUP** (`b` bell · `n` desktop · `t` telegram · `x` send a test alert).
+
+Every log line is also appended, timestamped, to `~/.config/pyblockminer/miner.log` (rotated at 5 MB) so a bad night can be reconstructed. With `--api-port 18080`, `curl 127.0.0.1:18080/` returns live JSON (hashrate, workers, shares, your CHIRP slice and expected BTC/day, balance…) and `/metrics` feeds Prometheus/Grafana.
 
 ### Keys
 
@@ -106,10 +117,13 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | MINE / NETWORK: `↑↓` `PgUp` `PgDn` `Home` `End` | scroll the CHIRP coinbase list (everyone in the draw) |
 | `q` / `Esc` | quit (`Esc` also cancels a text input) |
 | STRATUMS: `↑↓` `Enter` `a` `d` | move · **switch live** · add custom · delete custom |
-| SETUP: `g` `e` `c` `+/-` | generate address · edit/paste address · toggle CPU · donation |
+| SETUP: `g` `e` `w` `c` `+/-` | generate address · edit/paste address · worker name · toggle CPU · donation |
+| SETUP: `b` `n` `t` `x` | bell · desktop notifications · Telegram `token,chat_id` · send a test alert |
 | LEARN: `←` `→` | previous / next info page |
 
 The **MINE** tab shows the pool mode (LOTTO / CHIRP / CAROUSEL), a network badge (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from the PyBLØCK BLAKE2b node), your hashrate/blocks, mode-aware network cards, and the coinbase panel described above. Run it in a real terminal (it's a full-screen TUI); it lays out for any width — addresses show in full on wide terminals and masked (`bc1qjd…5pw2`) on narrow ones.
+
+**It looks after itself.** A GPU grinder that crashes or stops answering is killed and **respawned automatically** (backoff 10 s → 5 min; the WORKERS row shows `○ offline · auto-respawning` meanwhile). Pool connections have an 8 s timeout and reconnect with exponential backoff (3 s → 60 s), so a dead pool never looks like a hung miner. If the engine ever stops ticking while connected, the header flips to `⚠ ENGINE STALLED` instead of lying with a green LIVE.
 
 **No GPU?** It falls back to **CPU mining** automatically (much slower — CPUs do ~MH/s vs GPUs' GH/s, but it works). Force it with `--gpus 0`, or add CPU alongside your GPUs with `--cpu`.
 

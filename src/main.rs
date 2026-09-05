@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -149,13 +149,32 @@ struct Config {
     #[serde(default = "d_donate")] donate: f64,
     #[serde(default)] gpus: Option<u32>,
     #[serde(default)] cpu: bool,
+    #[serde(default)] worker: String,                  // stratum worker suffix → login "addr.worker" (tells your rigs apart on the pool)
+    #[serde(default = "d_true")] log_file: bool,       // append every log line to <config dir>/miner.log
+    #[serde(default)] api_port: u16,                   // 0 = off · else JSON at http://127.0.0.1:<port>/ and Prometheus at /metrics
+    #[serde(default)] alerts: AlertCfg,
 }
+// ── alerts: what a miner wants to know without watching the screen ──
+#[derive(Serialize, Deserialize, Clone)]
+struct AlertCfg {
+    #[serde(default = "d_true")] bell: bool,           // terminal bell
+    #[serde(default = "d_true")] desktop: bool,        // notify-send (Linux) / osascript (macOS)
+    #[serde(default)] telegram_token: String,          // Bot API token · with telegram_chat → sendMessage
+    #[serde(default)] telegram_chat: String,
+    #[serde(default)] webhook_url: String,             // POST {source,title,body,ts} as JSON
+}
+impl Default for AlertCfg { fn default() -> Self { AlertCfg { bell: true, desktop: true, telegram_token: String::new(), telegram_chat: String::new(), webhook_url: String::new() } } }
 fn d_donate() -> f64 { DONATE_MIN }
+fn d_true() -> bool { true }
 impl Default for Config {
     fn default() -> Self {
-        Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false }
+        Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false,
+                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default() }
     }
 }
+// worker names travel inside the stratum username → keep them plain: [A-Za-z0-9-_], max 24
+fn clean_worker(s: &str) -> String { s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(24).collect() }
+fn login(addr: &str, worker: &str) -> String { if worker.is_empty() { addr.to_string() } else { format!("{}.{}", addr, worker) } }
 fn config_path() -> PathBuf {
     // Cross-platform config dir. On Windows HOME/XDG are usually unset → the old code fell back to "." (CWD),
     // so saves landed next to wherever the exe was launched and looked like they "didn't save". Prefer the
@@ -202,7 +221,7 @@ fn save_config(c: &Config) {
 }
 
 // ── live target shared engine↔UI: switch pools/network without restarting ──
-struct Target { pool: String, addr: String, network: String, donate: f64 }
+struct Target { pool: String, addr: String, worker: String, network: String, donate: f64 }
 
 // ── locate the GPU grinder + kernel (Linux: gpu_grind + blake2b.cl · macOS: metal_grind + blake2b.metal) ──
 fn gpu_dir() -> String {
@@ -294,15 +313,67 @@ struct Stats {
     blocks_until_act: u64,
     latest_version: String,   // newest published miner version (from the pool) → drives the update label
     update_available: bool,
+    gpu_dead: Vec<bool>,               // per worker: grinder down, auto-respawning (shown in WORKERS)
+    last_tick: Option<Instant>,        // engine heartbeat — the UI flags ENGINE STALLED if it stops while connected
     mode: PoolMode,                    // what the coinbase does on the active stratum (LOTTO / CHIRP / CAROUSEL)
     chirp: Option<ChirpInfo>,          // CHIRP: everyone in the coinbase draw (kept while polling, cleared on switch)
     carousel: Option<CarouselInfo>,    // CAROUSEL: templates in rotation + the one being mined right now
+    worker: String,                    // worker suffix in use (header shows addr.worker)
+    alerts: AlertCfg,                  // live alert settings (SETUP edits them; alert() reads them)
+    ring_bell: bool,                   // set by alert(), consumed by the UI loop → \x07
+    alerts_sent: u64,
+    log_file: Option<std::fs::File>,   // miner.log (timestamped copy of every log line)
+    api_port: u16,
 }
 impl Stats {
     fn logline(&mut self, s: String) {
+        if let Some(f) = self.log_file.as_mut() { let _ = writeln!(f, "{}  {}", fmt_ts(now_unix()), s); }
         self.log.push_back(s);
         while self.log.len() > 300 { self.log.pop_front(); }
     }
+}
+// "2026-09-05 14:03:21" from unix seconds (civil-from-days, H. Hinnant) — no chrono for one timestamp
+fn fmt_ts(t: u64) -> String {
+    let (days, rem) = ((t / 86_400) as i64, t % 86_400);
+    let z = days + 719_468; let era = z.div_euclid(146_097); let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1; let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+// <config dir>/miner.log, append; rotated to miner.log.1 past 5 MB so it can never eat the disk
+fn open_log_file() -> Option<std::fs::File> {
+    let p = config_path().parent()?.join("miner.log");
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    if std::fs::metadata(&p).map(|m| m.len() > 5_000_000).unwrap_or(false) { let _ = std::fs::rename(&p, p.with_extension("log.1")); }
+    std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+}
+// Fire an alert: log line (🔔) + bell flag for the UI + desktop / Telegram / webhook on a throwaway thread so the
+// engine never waits on the network. Takes the already-locked Stats so callers holding the lock can't deadlock.
+fn alert(st: &mut Stats, title: &str, body: &str) {
+    st.logline(format!("🔔 {} — {}", title, body));
+    st.alerts_sent += 1;
+    if st.alerts.bell { st.ring_bell = true; }
+    let (cfg, title, body) = (st.alerts.clone(), title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        if cfg.desktop {
+            #[cfg(target_os = "linux")]
+            { let _ = Command::new("notify-send").args(["-a", "pyblockMiner", &format!("⛏ {}", title), &body]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
+            #[cfg(target_os = "macos")]
+            { let script = format!("display notification \"{}\" with title \"pyblockMiner · {}\"", body.replace('"', "'"), title.replace('"', "'"));
+              let _ = Command::new("osascript").args(["-e", &script]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
+        }
+        if !cfg.telegram_token.is_empty() && !cfg.telegram_chat.is_empty() {
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", cfg.telegram_token);
+            let payload = json!({"chat_id": cfg.telegram_chat, "text": format!("⛏ pyblockMiner · {}\n{}", title, body)}).to_string();
+            let _ = ureq::post(&url).timeout(Duration::from_secs(10)).set("Content-Type", "application/json").send_string(&payload);
+        }
+        if !cfg.webhook_url.is_empty() {
+            let payload = json!({"source": "pyblockMiner", "version": VERSION, "title": title, "body": body, "ts": now_unix()}).to_string();
+            let _ = ureq::post(&cfg.webhook_url).timeout(Duration::from_secs(10)).set("Content-Type", "application/json").send_string(&payload);
+        }
+    });
 }
 
 fn floor_pot(diff: f64) -> u32 {
@@ -413,7 +484,18 @@ fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32
     out.into_inner().unwrap()
 }
 
-struct Daemon { _child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout>, name: String, weight: f64, dead: bool }
+// One GPU grinder process. Its stdout is drained by a reader thread into `rx`, so the engine waits for results with a
+// TIMEOUT — a hung OpenCL/Metal driver used to block read_line forever, freezing the whole engine while the UI kept
+// saying LIVE. A daemon that dies or hangs is killed, marked dead, and RESPAWNED with backoff (10s → 5 min); before,
+// a dead GPU stayed dead until the user restarted the miner.
+struct Daemon {
+    child: Child, stdin: ChildStdin, rx: std::sync::mpsc::Receiver<String>,
+    name: String, dev: u32, weight: f64, dead: bool, died_at: Instant, since: Instant, fails: u32,
+}
+impl Daemon {
+    fn kill(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); self.dead = true; self.weight = 0.0; self.died_at = Instant::now(); }
+    fn retry_in(&self) -> Duration { Duration::from_secs((10u64 << self.fails.saturating_sub(1).min(5)).min(300)) }   // 10 · 20 · 40 · 80 · 160 · 300s
+}
 fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     let mut child = Command::new(gpu_bin())
         .args(["daemon", &dev.to_string()])
@@ -436,13 +518,21 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
         Some(l) if l.starts_with("READY") => {
             let dn = l.strip_prefix("READY").unwrap_or("").trim();
             let name = if dn.is_empty() { name } else { dn.to_string() };
-            Some(Daemon { _child: child, stdin, stdout, name, weight: 1.0, dead: false })
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || { for l in stdout.lines() { match l { Ok(l) => { if tx.send(l).is_err() { break; } } Err(_) => break } } });
+            // start with a SMALL assumed rate (50 MH/s) so the first sweep is short on any GPU — the real rate
+            // arrives with the first END and sizes the next sweep. (1 GH/s assumed on a slow iGPU = a multi-second
+            // first sweep, which the hang watchdog would mistake for a hung driver.)
+            Some(Daemon { child, stdin, rx, name, dev, weight: 0.05, dead: false, died_at: Instant::now(), since: Instant::now(), fails: 0 })
         }
-        _ => { let _ = child.kill(); None }
+        _ => { let _ = child.kill(); let _ = child.wait(); None }
     }
 }
-fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
-             prevhash: &str, ntime: &str, work_root: &str, bits: u32, secs: f64) -> (Vec<String>, Vec<f64>, f64) {
+// the header fields a sweep needs (one struct instead of 4 loose args)
+struct Work<'a> { prevhash: &'a str, ntime: &'a str, work_root: &'a str, bits: u32 }
+// Returns (winning nonces, per-GPU GH/s, CPU GH/s, events to log). A GPU that exits or doesn't answer within the
+// deadline is killed + marked dead here; the engine respawns it later (see Daemon).
+fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work, secs: f64) -> (Vec<String>, Vec<f64>, f64, Vec<String>) {
     let space: u64 = 1u64 << 32;
     let gpu_caps: Vec<u64> = ds.iter().map(|d| if d.dead { 0 } else { ((d.weight * 1e9 * secs) as u64).max(1 << 22) }).collect();
     let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
@@ -452,40 +542,54 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64,
     for (i, d) in ds.iter_mut().enumerate() {
         if d.dead || gpu_caps[i] == 0 { continue; }   // dead daemons get no job; their nonce share went to live workers via `total`
         let span = if total > 0 { (sweep as u128 * gpu_caps[i] as u128 / total as u128) as u64 } else { 0 };
-        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", prevhash, ntime, work_root, bits, cursor, span.max(1));
+        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", w.prevhash, w.ntime, w.work_root, w.bits, cursor, span.max(1));
         let _ = d.stdin.flush();
         cursor += span;
     }
     let mut nonces: Vec<String> = vec![];
+    let mut events: Vec<String> = vec![];
     let mut cpu_ghs = 0.0f64;
     if cpu_threads > 0 && cursor < sweep {
         let cpu_span = sweep - cursor;
         let t0 = Instant::now();
-        let w = cpu_grind(prevhash, ntime, work_root, bits, cpu_threads, cursor, cpu_span);
+        let won = cpu_grind(w.prevhash, w.ntime, w.work_root, w.bits, cpu_threads, cursor, cpu_span);
         let dt = t0.elapsed().as_secs_f64();
         cpu_ghs = if dt > 0.0 { cpu_span as f64 / dt / 1e9 } else { 0.0 };
         if cpu_ghs > 0.0 { *cpu_rate = cpu_ghs; }
-        nonces.extend(w);
+        nonces.extend(won);
     }
     let mut gpu_ghs = vec![0.0f64; ds.len()];
+    // a sweep sized to `secs` that takes 6× longer (+5s slack) is a hung driver, not a slow GPU
+    let deadline = Duration::from_secs_f64(secs * 6.0 + 5.0);
     for (i, d) in ds.iter_mut().enumerate() {
         if d.dead { continue; }   // no job was sent to a dead daemon
+        let t0 = Instant::now();
         loop {
-            let mut line = String::new();
-            match d.stdout.read_line(&mut line) {
-                Ok(0) | Err(_) => { d.dead = true; d.weight = 0.0; break; }   // daemon died → mark dead so its nonce range redistributes next cycle
-                Ok(_) => {
+            let left = deadline.checked_sub(t0.elapsed()).unwrap_or(Duration::ZERO);
+            match d.rx.recv_timeout(left) {
+                Ok(line) => {
                     let t = line.trim();
                     if let Some(rest) = t.strip_prefix("END ") {
                         gpu_ghs[i] = rest.parse().unwrap_or(0.0);
                         if gpu_ghs[i] > 0.0 { d.weight = gpu_ghs[i]; }
+                        if d.since.elapsed() > Duration::from_secs(300) { d.fails = 0; }   // stable for 5 min → forget old crashes (backoff resets)
                         break;
                     } else if !t.is_empty() { nonces.push(t.to_string()); }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    d.kill(); d.fails += 1;
+                    events.push(format!("⚠ {} unresponsive for {:.0}s — killed · respawning in {}s", d.name, deadline.as_secs_f64(), d.retry_in().as_secs()));
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    d.kill(); d.fails += 1;
+                    events.push(format!("⚠ {} grinder exited — respawning in {}s", d.name, d.retry_in().as_secs()));
+                    break;
                 }
             }
         }
     }
-    (nonces, gpu_ghs, cpu_ghs)
+    (nonces, gpu_ghs, cpu_ghs, events)
 }
 
 fn send(stream: &mut TcpStream, v: &Value) {
@@ -509,13 +613,29 @@ fn send(stream: &mut TcpStream, v: &Value) {
     }
 }
 
+// TCP connect with a real timeout. Plain TcpStream::connect uses the OS default (minutes against a blackholed
+// host), which made a stratum switch to a dead pool look like the miner hung.
+fn tcp_connect(pool: &str, secs: u64) -> Option<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = pool.to_socket_addrs().ok()?.collect();
+    addrs.iter().find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(secs)).ok())
+}
+// sleep `secs`, but return at once if the user switched stratum/address meanwhile (backoff must not delay a switch)
+fn sleep_unless_switched(tgt: &Arc<Mutex<Target>>, pool: &str, addr: &str, secs: u64) {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(secs) {
+        { let t = tgt.lock().unwrap(); if t.pool != pool || t.addr != addr { return; } }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 struct Conn {
     stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
-    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64)>, subid: u64, addr: String, is_dev: bool, idle: Instant, last_notify: Instant,
+    job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64, Instant)>, subid: u64, addr: String, is_dev: bool, idle: Instant, last_notify: Instant,
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
-        let mut stream = TcpStream::connect(pool).ok()?;
+        let mut stream = tcp_connect(pool, 8)?;
         stream.set_nonblocking(true).ok();
         let sub_ua = if is_dev { format!("PyBLOCK-GPU/BLAKE2b-donate/{}", VERSION) } else { format!("PyBLOCK-GPU/BLAKE2b/{}", VERSION) };
         send(&mut stream, &json!({"id":1,"method":"mining.subscribe","params":[sub_ua]}));
@@ -563,7 +683,7 @@ impl Conn {
                 self.job = m.get("params").and_then(|v| v.as_array()).cloned();
                 self.last_notify = Instant::now();   // fresh work arrived → feeds the job-freshness watchdog
             } else if let Some(idv) = id {
-                if let Some((nonce, is_block, height)) = self.pending.remove(&idv) {
+                if let Some((nonce, is_block, height, _)) = self.pending.remove(&idv) {
                     let hs = if height > 0 { format!("height {} ", height) } else { String::new() };
                     let mut st = stats.lock().unwrap();
                     if m.get("result") == Some(&Value::Bool(true)) {
@@ -577,6 +697,8 @@ impl Conn {
                             if is_block {
                                 st.blocks += 1; let n = st.blocks;
                                 st.logline(format!("🎉 BLOCK FOUND {}(#{})  paid to your address · nonce {}", hs, n, nonce));
+                                let body = format!("{}block #{} this session · paid to {}", hs, n, st.addr);
+                                alert(&mut st, "🎉 BLOCK FOUND", &body);
                             } else {
                                 let a = st.accepted;
                                 st.logline(format!("✓ share accepted (#{}) · nonce {}", a, nonce));
@@ -591,6 +713,8 @@ impl Conn {
                 }
             }
         }
+        // submits the pool never answered would otherwise pile up forever (weeks-long sessions on a flaky pool)
+        self.pending.retain(|_, v| v.3.elapsed() < Duration::from_secs(120));
         true
     }
     fn ready(&self) -> Option<(String, Vec<Value>)> {
@@ -645,6 +769,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
 
     let mut donate_credit = 0.0f64;
     let mut dev_retry = Instant::now();
+    let mut conn_fails = 0u32;   // consecutive connect failures / instant drops → exponential backoff 3s…60s
     // adaptive sweep length: track the observed block cadence (from the user's prevhash changes) so sweeps
     // stay short on fast chains (switch to new work sooner → far fewer stale shares + less wasted hashrate)
     // but keep the efficient default on normal-speed chains.
@@ -654,32 +779,56 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
 
     loop {
         // read current live target (pool/addr/donate change when the user switches stratum)
-        let (pool, addr, donate, network) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.donate, t.network.clone()) };
+        let (pool, addr, worker, donate, network) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.worker.clone(), t.donate, t.network.clone()) };
         if addr.is_empty() {
             { let mut st = stats.lock().unwrap(); st.connected = false;
               st.logline("no address set — go to SETUP [5] to set/generate one".into()); }
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
-        let mut user = match Conn::connect(&pool, &addr, false) {
+        stats.lock().unwrap().last_tick = Some(Instant::now());
+        let mut user = match Conn::connect(&pool, &login(&addr, &worker), false) {
             Some(c) => c,
             None => {
-                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("connection failed to {} — retrying in 3s…", pool)); }
-                std::thread::sleep(Duration::from_secs(3));
+                conn_fails += 1;
+                let wait = (3u64 << (conn_fails - 1).min(4)).min(60);   // 3 · 6 · 12 · 24 · 48 · 60s
+                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("connection failed to {} — retry in {}s (attempt {})", pool, wait, conn_fails));
+                  if conn_fails == 3 { alert(&mut st, "pool unreachable", &format!("{} — 3 failed attempts, retrying with backoff · not mining", pool)); } }
+                sleep_unless_switched(&tgt, &pool, &addr, wait);
                 continue;
             }
         };
         let mut dev: Option<Conn> = if donate > 0.0 { Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true) } else { None };
         { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
-          st.logline(format!("connected to {}", pool));
+          st.logline(format!("connected to {} as {}", pool, login(&addr, &worker)));
+          if conn_fails >= 3 { alert(&mut st, "pool reachable again", &format!("connected to {} after {} attempts · mining", pool, conn_fails)); }
           if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
+        let session_start = Instant::now();
+        let mut switched = false;
 
         loop {
+            stats.lock().unwrap().last_tick = Some(Instant::now());   // heartbeat: every path through this loop ticks
             // live switch: if the shared target's pool/addr changed, drop + reconnect
             { let t = tgt.lock().unwrap();
-              if t.pool != pool || t.addr != addr || t.network != network || t.donate != donate {
-                stats.lock().unwrap().logline(format!("switching stratum → {}", t.pool)); break;
+              if t.pool != pool || t.addr != addr || t.worker != worker || t.network != network || t.donate != donate {
+                stats.lock().unwrap().logline(format!("switching stratum → {}", t.pool)); switched = true; break;
               } }
+            // dead grinders: respawn once their backoff has elapsed (keeps index/name so the WORKERS rows stay put)
+            let mut respawn_tried = false;
+            for d in daemons.iter_mut() {
+                if d.dead && d.died_at.elapsed() >= d.retry_in() {
+                    respawn_tried = true;
+                    match spawn_daemon(d.dev, d.name.clone()) {
+                        Some(mut nd) => { nd.fails = d.fails; *d = nd; let mut st = stats.lock().unwrap(); alert(&mut st, "GPU back online", &format!("{} is hashing again", d.name)); }
+                        None => { d.died_at = Instant::now(); d.fails += 1;
+                                  stats.lock().unwrap().logline(format!("✗ {} still not starting — next try in {}s", d.name, d.retry_in().as_secs())); }
+                    }
+                }
+            }
+            if respawn_tried {
+                let mut st = stats.lock().unwrap();
+                st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
+            }
             if !user.pump(&stats) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); } break; }
             if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
             if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
@@ -748,9 +897,12 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 last_block_at = Instant::now();
             }
             let sweep_secs = (block_interval_ema * 0.15).clamp(0.06, 0.35);
-            let (nonces, gpu_ghs, cpu_ghs) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &prevhash, &ntime, &work_root, bits, sweep_secs);
+            let work = Work { prevhash: &prevhash, ntime: &ntime, work_root: &work_root, bits };
+            let (nonces, gpu_ghs, cpu_ghs, events) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &work, sweep_secs);
             {
                 let mut st = stats.lock().unwrap();
+                for e in events { alert(&mut st, "GPU down", &e); }
+                st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
                 let mut all = gpu_ghs.clone();
                 if cpu_threads > 0 { all.push(cpu_ghs); }
                 st.gpu_ghs = all;
@@ -785,17 +937,29 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             let mut sweep_best = 0.0f64;
             let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
             for nh in nonces {
-                let is_block = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
-                    Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; } nbits != 0 && hash_le_target(&h, &net_target) }
-                    None => false,
+                // The grinders filter at floor_pot(diff) — a power of two. On a pool diff that ISN'T a power of two
+                // (vardiff 3000 → kernel bits 11 = 2048) some winners are below the real share target and the pool
+                // would reject them → check the exact difficulty here and only send what can be accepted.
+                let (is_block, meets_diff) = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
+                    Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; }
+                                 (nbits != 0 && hash_le_target(&h, &net_target), d >= diff * 0.999) }
+                    None => (false, true),
                 };
-                if !still_current { continue; }   // stale sweep (a block landed mid-grind) — don't submit worthless shares
+                if !still_current || !meets_diff { continue; }   // stale sweep (a block landed mid-grind) or sub-target → don't submit
                 conn.subid += 1; let sid = conn.subid;
-                conn.pending.insert(sid, (nh.clone(), is_block, job_height));
+                conn.pending.insert(sid, (nh.clone(), is_block, job_height, Instant::now()));
                 send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
             }
             if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
         }
+        // a session that died within 10s of connecting (pool accepts TCP then drops us) counts as a failure → back off,
+        // instead of hammering the pool in a tight reconnect loop. A user-driven switch never waits.
+        if !switched && session_start.elapsed() < Duration::from_secs(10) {
+            conn_fails += 1;
+            let wait = (3u64 << (conn_fails - 1).min(4)).min(60);
+            stats.lock().unwrap().logline(format!("session dropped early — reconnecting in {}s", wait));
+            sleep_unless_switched(&tgt, &pool, &addr, wait);
+        } else { conn_fails = 0; }
     }
 }
 
@@ -851,7 +1015,8 @@ fn now_unix() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as
 fn poll_chirp() -> Option<ChirpInfo> {
     let list = get_json(&format!("{}?mode=miners&chain=blake2b", CHIRP_API), 10)?;
     let mut members: Vec<ChirpMember> = list.as_array()?.iter().map(|m| ChirpMember {
-        addr: m.get("address").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        // addresses are base58/bech32 → anything else is noise (or an attempt to draw on the terminal)
+        addr: m.get("address").and_then(|x| x.as_str()).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric()).take(90).collect(),
         days: m.get("days").and_then(|x| x.as_f64()).unwrap_or(0.0),
         power: m.get("power").and_then(|x| x.as_f64()).unwrap_or(0.0),
         weight: m.get("weight").and_then(|x| x.as_f64()).unwrap_or(0.0),
@@ -878,20 +1043,90 @@ fn poll_chirp() -> Option<ChirpInfo> {
     }
     Some(info)
 }
+// Supplier names are typed by THIRD PARTIES on the pool → strip control chars / escape sequences and cap the length
+// before they reach the terminal. Printable Unicode (emoji, accents) stays.
+fn clean_label(s: &str) -> String { s.chars().filter(|c| !c.is_control()).take(40).collect::<String>().trim().to_string() }
 fn poll_carousel() -> Option<CarouselInfo> {
     let v = get_json(CAROUSEL_API, 10)?;
     let strs = |k: &str| -> Vec<String> { v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|e| {
         // suppliers: ["name", …] · recent: [["name"], …] or [["name", ts], …]
-        e.as_str().map(|s| s.to_string()).or_else(|| e.as_array().and_then(|i| i.first()).and_then(|s| s.as_str()).map(|s| s.to_string()))
+        e.as_str().map(clean_label).or_else(|| e.as_array().and_then(|i| i.first()).and_then(|s| s.as_str()).map(clean_label))
     }).collect()).unwrap_or_default() };
     Some(CarouselInfo {
         suppliers: strs("suppliers"), recent: strs("recent"),
-        current: v.get("current").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        current: clean_label(v.get("current").and_then(|x| x.as_str()).unwrap_or("")),
         miners: v.get("miners").and_then(|x| x.as_u64()).unwrap_or(0),
         hashrate_ths: v.get("hashrate").and_then(|x| x.as_f64()).unwrap_or(0.0) / 1e12,   // endpoint returns H/s
         live: v.get("live").and_then(|x| x.as_bool()).unwrap_or(false),
         fetched: now_unix(),
     })
+}
+
+// ── local stats API: GET / → JSON · GET /metrics → Prometheus text. 127.0.0.1 only, one tiny HTTP/1.0 server. ──
+fn stats_json(st: &Stats) -> Value {
+    let workers: Vec<Value> = st.gpu_names.iter().enumerate().map(|(i, n)| json!({
+        "name": n, "ghs": st.gpu_ghs.get(i).copied().unwrap_or(0.0), "offline": st.gpu_dead.get(i).copied().unwrap_or(false) })).collect();
+    let chirp = st.chirp.as_ref().map(|c| json!({
+        "listed": c.me(&st.addr).is_some(), "eligible": c.me(&st.addr).map(|m| m.eligible).unwrap_or(false),
+        "slice_pct": c.my_pct(&st.addr), "tenure_days": c.me(&st.addr).map(|m| m.days),
+        "candidates": c.candidates, "workers": c.workers, "hashrate_ths": c.hashrate_ths, "blocks": c.blocks,
+        "reward_btc": c.reward_sats as f64 / 1e8, "expected_btc_day": c.my_pct(&st.addr).map(|p| chirp_btc_per_day(st, c, p)) }));
+    let carousel = st.carousel.as_ref().map(|k| json!({ "current": k.current, "suppliers": k.suppliers, "miners": k.miners, "hashrate_ths": k.hashrate_ths }));
+    json!({
+        "version": VERSION, "ts": now_unix(), "uptime_s": st.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
+        "pool": st.endpoint, "mode": st.mode.label(), "network": st.network, "address": st.addr, "worker": st.worker,
+        "connected": st.connected, "paused": st.paused, "blake2b_active": st.blake2b_active,
+        "hashrate_ghs": st.hr_total, "workers": workers,
+        "blocks": st.blocks, "shares_accepted": st.accepted, "shares_rejected": st.rejected, "donation_blocks": st.donated,
+        "difficulty": st.diff, "best_share_diff": st.best_diff,
+        "balance_btc": if st.balance_ok { Some(st.balance_btc) } else { None },
+        "net": { "ok": st.net_ok, "miners": st.net_miners, "hashrate_ghs": st.net_ghs, "height": st.net_height },
+        "chirp": chirp, "carousel": carousel, "alerts_sent": st.alerts_sent,
+    })
+}
+fn metrics_text(st: &Stats) -> String {
+    let mut o = String::new();
+    let g = |o: &mut String, name: &str, help: &str, v: f64| { o.push_str(&format!("# HELP {n} {h}\n# TYPE {n} gauge\n{n} {v}\n", n = name, h = help, v = v)); };
+    g(&mut o, "pyblock_hashrate_ghs", "total hashrate in GH/s", st.hr_total);
+    g(&mut o, "pyblock_connected", "1 if the stratum session is up", if st.connected { 1.0 } else { 0.0 });
+    g(&mut o, "pyblock_paused", "1 if mining is paused", if st.paused { 1.0 } else { 0.0 });
+    g(&mut o, "pyblock_blocks_found", "blocks found this session", st.blocks as f64);
+    g(&mut o, "pyblock_shares_accepted", "shares accepted this session", st.accepted as f64);
+    g(&mut o, "pyblock_shares_rejected", "shares rejected this session", st.rejected as f64);
+    g(&mut o, "pyblock_best_share_diff", "best share difficulty this session", st.best_diff);
+    g(&mut o, "pyblock_difficulty", "current share difficulty", st.diff);
+    g(&mut o, "pyblock_net_hashrate_ghs", "pyblockMiner network hashrate in GH/s", st.net_ghs);
+    g(&mut o, "pyblock_net_miners", "pyblockMiner miners online", st.net_miners as f64);
+    g(&mut o, "pyblock_uptime_seconds", "seconds since first connect", st.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0));
+    if st.balance_ok { g(&mut o, "pyblock_balance_btc", "address balance on the BLAKE2b chain", st.balance_btc); }
+    if let Some(c) = st.chirp.as_ref() {
+        g(&mut o, "pyblock_chirp_slice_pct", "your share of every CHIRP block (0 if not eligible)", c.my_pct(&st.addr).unwrap_or(0.0));
+        g(&mut o, "pyblock_chirp_candidates", "eligible miners in the CHIRP coinbase", c.candidates as f64);
+        g(&mut o, "pyblock_chirp_hashrate_ths", "CHIRP syndicate hashrate in TH/s", c.hashrate_ths);
+    }
+    o.push_str("# HELP pyblock_worker_hashrate_ghs per-worker hashrate in GH/s\n# TYPE pyblock_worker_hashrate_ghs gauge\n");
+    for (i, n) in st.gpu_names.iter().enumerate() {
+        o.push_str(&format!("pyblock_worker_hashrate_ghs{{worker=\"{}\",index=\"{}\"}} {}\n", n.replace('"', "'"), i, st.gpu_ghs.get(i).copied().unwrap_or(0.0)));
+    }
+    o
+}
+fn api_server(port: u16, stats: Arc<Mutex<Stats>>) {
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => { stats.lock().unwrap().logline(format!("api: cannot bind 127.0.0.1:{} — {}", port, e)); return; }
+    };
+    stats.lock().unwrap().logline(format!("api: http://127.0.0.1:{}/  (JSON)  ·  /metrics  (Prometheus)", port));
+    for s in listener.incoming() {
+        let Ok(mut s) = s else { continue };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = [0u8; 2048];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req.split_whitespace().nth(1).unwrap_or("/");
+        let (ctype, body) = { let st = stats.lock().unwrap();
+            if path.starts_with("/metrics") { ("text/plain; version=0.0.4", metrics_text(&st)) } else { ("application/json", stats_json(&st).to_string()) } };
+        let _ = write!(s, "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", ctype, body.len(), body);
+    }
 }
 
 // ═══════════════════════ TABS / UI ═══════════════════════
@@ -902,7 +1137,7 @@ const TABS: [(Tab, &str); 7] = [
     (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"),
 ];
 
-enum Input { AddStratum, EditAddr }
+enum Input { AddStratum, EditAddr, EditWorker, EditTelegram }
 struct App {
     tab: Tab,
     cfg: Config,
@@ -988,7 +1223,8 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     }
     // footer
     let foot = if let Some(k) = &app.input {
-        let label = match k { Input::AddStratum => "new stratum (name,host:port,network)", Input::EditAddr => "address" };
+        let label = match k { Input::AddStratum => "new stratum (name,host:port,network)", Input::EditAddr => "address",
+                              Input::EditWorker => "worker name (letters · digits · - _ · empty = none)", Input::EditTelegram => "telegram  bot_token,chat_id  (empty = off)" };
         Line::from(vec![Span::styled(format!(" {} > ", label), Style::new().fg(Color::Black).bg(YLW)),
                         Span::styled(format!("{}_", app.buf), Style::new().fg(YLW)),
                         Span::styled("   Enter=ok  Esc=cancel", Style::new().fg(MUT))])
@@ -1030,8 +1266,11 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     let mut glines: Vec<Line> = vec![];
     for (i, g) in st.gpu_ghs.iter().enumerate() {
         let name = st.gpu_names.get(i).cloned().unwrap_or_else(|| format!("GPU {}", i));
-        glines.push(Line::from(vec![dim(&format!("  {:>2}  ", i)), Span::styled(format!("{:<28}", name), Style::new().fg(WHT)),
-            bold(format!("{:>7.2}", g), GRN), dim(" GH/s")]));
+        let down = st.gpu_dead.get(i).copied().unwrap_or(false);
+        let mut sp = vec![dim(&format!("  {:>2}  ", i)), Span::styled(format!("{:<28}", name), Style::new().fg(if down { MUT } else { WHT }))];
+        if down { sp.push(Span::styled("○ offline · auto-respawning", Style::new().fg(Color::Red))); }
+        else { sp.push(bold(format!("{:>7.2}", g), GRN)); sp.push(dim(" GH/s")); }
+        glines.push(Line::from(sp));
     }
     if glines.is_empty() { glines.push(Line::from(dim("  warming up…"))); }
     f.render_widget(Paragraph::new(Text::from(glines)).block(card("WORKERS", MUT)), c[4]);
@@ -1052,8 +1291,12 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
 fn header_rows(width: u16) -> u16 { if width < 132 { 5 } else { 4 } }
 fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
     let m = st.mode; let ac = m.accent();
+    // engine heartbeat: connected + unpaused + not gated, yet no loop iteration for 20s → something blocked the engine
+    let stalled = st.connected && !st.paused && st.blake2b_active != Some(false)
+        && st.last_tick.map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(false);
     let dot = if st.paused { bold("⏸ PAUSED".into(), YLW) }
               else if st.blake2b_active == Some(false) { bold("⏳ WAITING · SHA-256d".into(), AMB) }
+              else if stalled { bold("⚠ ENGINE STALLED".into(), Color::Red) }
               else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
               else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
     let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
@@ -1066,7 +1309,9 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
     if st.update_available { l1.push(bold(format!("   ⬆ v{} — git pull && ./build.sh", st.latest_version), PNK)); }
     let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
     let narrow = header_rows(area.width) == 5;
-    let mut l2 = vec![dim("your address  "), Span::styled(st.addr.clone(), Style::new().fg(CYN)), Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::raw("   ")];
+    let mut l2 = vec![dim("your address  "), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
+        dim(&if st.worker.is_empty() { String::new() } else { format!(".{}", st.worker) }),
+        Span::styled(format!("   {}", bal), Style::new().fg(GRN)), Span::raw("   ")];
     let mut l3 = vec![dim("payout        ")];
     if narrow { std::mem::swap(&mut l2, &mut l3); }   // narrow: l3 is now the address row, l2 collects the payout
     match m {
@@ -1195,6 +1440,14 @@ fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
     out.push(Line::from(vec![dim("  payout      "), Span::styled("finder keeps 98% · supplier 1% · PyBLØCK 1% · split on-chain in the coinbase · non-custodial", Style::new().fg(PNK))]));
     out
 }
+// Expected BTC/day for a CHIRP member holding `pct`% of the split: syndicate blocks/day (mean, from its hashrate vs
+// the network target) × reward × slice × (1 − fee). An honest mean — real luck swings wildly around it.
+fn chirp_btc_per_day(st: &Stats, c: &ChirpInfo, pct: f64) -> f64 {
+    let eta = eta_to_block(st.net_nbits, c.hashrate_ths * 1e3);
+    if !eta.is_finite() || eta <= 0.0 || c.reward_sats == 0 { return 0.0; }
+    (86_400.0 / eta) * (c.reward_sats as f64 / 1e8) * pct / 100.0 * (1.0 - c.fee_bps as f64 / 10_000.0)
+}
+fn fmt_btc(x: f64) -> String { if x <= 0.0 { "—".into() } else if x < 1e-4 { format!("{:.0} sats", x * 1e8) } else { format!("{:.5} BTC", x) } }
 // ── CHIRP: EVERY miner in the coinbase draw — rank · address · tenure · power · share of the next block · status.
 //    Your row is marked ▶. Eligible miners first (by weight), then the ones still earning their 7 days. ↑↓ scrolls. ──
 fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
@@ -1222,6 +1475,7 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
     head.push(match c.me(&st.addr) {
         Some(m) if m.eligible => { let p = if sum > 0.0 { m.weight / sum * 100.0 } else { 0.0 };
             Line::from(vec![bold("  you  ".into(), PUR), bold(format!("{:.2}% of every block ≈ {:.5} BTC", p, reward * p / 100.0 * keep), WHT),
+                Span::styled(format!(" · ≈ {} / day expected", fmt_btc(chirp_btc_per_day(st, c, p))), Style::new().fg(PUR)),
                 dim(&format!(" · tenure {:.1} d · power {}", m.days, fmt_num(m.power)))]) }
         Some(m) => Line::from(vec![bold("  you  ".into(), AMB), Span::styled(format!("joining the draw · {:.1} of {:.0} days  {}  keep mining, stay connected",
                 m.days, c.min_days, bar(m.days / c.min_days.max(0.1), 10)), Style::new().fg(AMB))]),
@@ -1326,7 +1580,7 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
     let per_day = if eta.is_finite() && eta > 0.0 { 86_400.0 / eta } else { 0.0 };
     let kv = |k: &str, v: String, col: Color| Line::from(vec![
         Span::styled(format!("  {:<22}", k), Style::new().fg(MUT)), Span::styled(v, Style::new().fg(col))]);
-    let lines = vec![
+    let mut lines = vec![
         kv("uptime", fmt_dur(up), GRN),
         kv("shares accepted", format!("{}", st.accepted), GRN),
         kv("shares rejected", format!("{}  ({:.1}%)", st.rejected, rej_rate), if rej_rate > 5.0 { AMB } else { MUT }),
@@ -1338,6 +1592,19 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
         kv("expected blocks / day", if per_day > 0.0 { format!("{:.4}", per_day) } else { "—".into() }, CYN),
         kv("hashrate donated", format!("{} blocks → PyBLØCK", st.donated), AMB),
     ];
+    // CHIRP: the number that matters is not YOUR time-to-block but the syndicate's, times your slice
+    if let (PoolMode::Chirp, Some(c)) = (st.mode, st.chirp.as_ref()) {
+        let s_eta = eta_to_block(st.net_nbits, c.hashrate_ths * 1e3);
+        let s_day = if s_eta.is_finite() && s_eta > 0.0 { 86_400.0 / s_eta } else { 0.0 };
+        let pct = c.my_pct(&st.addr);
+        lines.push(Line::from(""));
+        lines.push(kv("CHIRP syndicate", format!("{} · ~{} per block · ~{:.3} blocks/day", fmt_ths(c.hashrate_ths), fmt_dur(s_eta), s_day), PUR));
+        lines.push(kv("your slice", pct.map(|p| format!("{:.2}% of every block", p)).unwrap_or_else(|| "not eligible yet".into()), PUR));
+        lines.push(kv("expected income", pct.map(|p| format!("≈ {} / day · ≈ {} / month  (mean — high variance)", fmt_btc(chirp_btc_per_day(st, c, p)), fmt_btc(chirp_btc_per_day(st, c, p) * 30.0)))
+            .unwrap_or_else(|| "—".into()), PUR));
+    }
+    lines.push(Line::from(""));
+    lines.push(kv("alerts sent", format!("{}  (log: {})", st.alerts_sent, if st.log_file.is_some() { "miner.log" } else { "off" }), MUT));
     f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true })
         .block(card("ANÁLISIS · session data (press p to pause mining while you review)", CYN)), c[2]);
 }
@@ -1433,24 +1700,35 @@ fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
 fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     let net = app.network();
     let addr = app.addr();
-    let addr_disp = if addr.is_empty() { "— not set —".to_string() } else { addr };
+    let addr_disp = if addr.is_empty() { "— not set —".to_string() } else { addr.clone() };
     let donate_disp = if net_cfg(&net).donate { format!("{:.1}% (mainnet)", app.cfg.donate) } else { "off (testnet/regtest)".into() };
     let gpus_disp = app.cfg.gpus.map(|n| n.to_string()).unwrap_or_else(|| "auto".into());
+    let a = &app.cfg.alerts;
+    let onoff = |b: bool| if b { "on" } else { "off" };
+    let row = |label: &str, v: Vec<Span<'static>>| { let mut sp = vec![dim(&format!("  {:<18}", label))]; sp.extend(v); Line::from(sp) };
+    let key = |k: &str, what: &str| vec![Span::styled(format!("  {}", k), Style::new().fg(GRN)), dim(&format!(" {}", what))];
+    let worker_v = if app.cfg.worker.is_empty() { vec![dim("— none — mining as the bare address  (w to name this rig)")] }
+        else { vec![Span::styled(app.cfg.worker.clone(), Style::new().fg(GRN)), dim(&format!("   → login {}", login(&addr, &app.cfg.worker)))] };
+    let tg = if a.telegram_token.is_empty() { "off".to_string() } else { format!("on → chat {}", a.telegram_chat) };
+    let wh = if a.webhook_url.is_empty() { "off".to_string() } else { "on".to_string() };
+    let logp = if app.cfg.log_file { config_path().parent().map(|p| p.join("miner.log").to_string_lossy().into_owned()).unwrap_or_default() } else { "off (--no-log-file)".into() };
+    let api = if app.cfg.api_port > 0 { format!("http://127.0.0.1:{}/  ·  /metrics for Prometheus", app.cfg.api_port) } else { "off  (--api-port <port>)".into() };
     let lines = vec![
-        Line::from(vec![Span::styled("  selected stratum  ", Style::new().fg(MUT)), Span::styled(app.cfg.stratums.get(app.cfg.selected).map(|s| s.name.clone()).unwrap_or_default(), Style::new().fg(GRN)),
-            Span::styled(format!("  [{}]", net), Style::new().fg(AMB))]),
-        Line::from(vec![Span::styled("  your address      ", Style::new().fg(MUT)), Span::styled(addr_disp, Style::new().fg(CYN))]),
-        Line::from(vec![Span::styled("  donation          ", Style::new().fg(MUT)), Span::styled(donate_disp, Style::new().fg(AMB))]),
-        Line::from(vec![Span::styled("  gpus              ", Style::new().fg(MUT)), Span::styled(gpus_disp, Style::new().fg(GRN)),
-            Span::styled(format!("   cpu: {}", if app.cfg.cpu { "on" } else { "off" }), Style::new().fg(GRN))]),
+        row("selected stratum", vec![Span::styled(app.cfg.stratums.get(app.cfg.selected).map(|s| s.name.clone()).unwrap_or_default(), Style::new().fg(GRN)), Span::styled(format!("  [{}]", net), Style::new().fg(AMB))]),
+        row("your address", vec![Span::styled(addr_disp, Style::new().fg(CYN))]),
+        row("worker name", worker_v),
+        row("donation", vec![Span::styled(donate_disp, Style::new().fg(AMB))]),
+        row("gpus", vec![Span::styled(gpus_disp, Style::new().fg(GRN)), Span::styled(format!("   cpu: {}", onoff(app.cfg.cpu)), Style::new().fg(GRN))]),
+        row("alerts", vec![Span::styled(format!("bell {} · desktop {} · telegram {} · webhook {}", onoff(a.bell), onoff(a.desktop), tg, wh), Style::new().fg(AMB)),
+                           dim("   (blocks · GPU down/up · pool outage · CHIRP eligibility)")]),
+        row("log file", vec![dim(&logp)]),
+        row("local api", vec![dim(&api)]),
         Line::from(""),
-        Line::from(vec![Span::styled("  g", Style::new().fg(GRN)), Span::styled(" generate a new address for this network   ", Style::new().fg(MUT)),
-            Span::styled("e", Style::new().fg(GRN)), Span::styled(" edit/paste an address", Style::new().fg(MUT))]),
-        Line::from(vec![Span::styled("  c", Style::new().fg(GRN)), Span::styled(" toggle CPU   ", Style::new().fg(MUT)),
-            Span::styled("+/-", Style::new().fg(GRN)), Span::styled(" donation (mainnet)   ", Style::new().fg(MUT)),
-            Span::styled("changes auto-save + apply live", Style::new().fg(MUT))]),
+        Line::from([key("g", "generate address   "), key("e", "edit/paste address   "), key("w", "worker name   "), key("c", "toggle CPU   "), key("+/-", "donation")].concat()),
+        Line::from([key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "send a test alert")].concat()),
+        Line::from(dim("  changes auto-save + apply live · devices, log file and api port apply on restart")),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("SETUP · address, network, config (saved)", GRN)), area);
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("SETUP · address, worker, alerts, config (saved)", GRN)), area);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
@@ -1462,8 +1740,15 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("DATA", "session analytics: avg/peak hashrate, net share, per-worker split, solo ETA-to-block"),
         l("q / Esc", "quit (Esc also cancels an input)"),
         l("STRATUMS", "↑↓ move · Enter switch live · a add · d delete custom"),
-        l("SETUP", "g generate address · e edit address · c toggle CPU · +/- donation"),
+        l("SETUP", "g generate · e edit address · w worker name · c CPU · +/- donation · b bell · n desktop · t telegram · x test alert"),
         l("MINE / NETWORK", "on CHIRP: ↑↓ PgUp PgDn Home scroll the coinbase list (everyone in the draw)"),
+        Line::from(""),
+        Line::from(Span::styled(" Alerts · log · API", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
+        l("alerts", "block found · GPU down / back · pool unreachable / back · CHIRP: on the list, in the draw, falling out, dropped"),
+        l("channels", "terminal bell · desktop (notify-send / macOS) · Telegram (SETUP t, or --telegram token,chat) · --webhook <url> (POST JSON)"),
+        l("log file", "every log line, timestamped → <config dir>/miner.log (rotates at 5 MB) · --no-log-file"),
+        l("--api-port N", "http://127.0.0.1:N/ live stats as JSON · /metrics for Prometheus/Grafana · localhost only"),
+        l("--worker NAME", "login as addr.NAME so the pool tells your rigs apart"),
         Line::from(""),
         Line::from(Span::styled(" Pools — same BLAKE2b chain, three ways to get paid", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
         l("🎰 LOTTO :4445", PoolMode::Lotto.payout()),
@@ -1494,8 +1779,10 @@ fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) 
     let s = match app.cfg.stratums.get(app.cfg.selected) { Some(s) => s.clone(), None => return };
     let addr = app.addr();
     let donate = if net_cfg(&s.network).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
-    { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.addr = addr.clone(); t.network = s.network.clone(); t.donate = donate; }
-    { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false;
+    let worker = clean_worker(&app.cfg.worker);
+    { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.addr = addr.clone(); t.worker = worker.clone(); t.network = s.network.clone(); t.donate = donate; }
+    { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.worker = worker; st.alerts = app.cfg.alerts.clone();
+      st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false;
       // pool mode drives the MINE/NETWORK panels; drop the old mode's data so the new one starts clean (poller refills within ~1s)
       st.mode = pool_mode(&s.url, &s.name); st.chirp = None; st.carousel = None; }
 }
@@ -1552,6 +1839,22 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                             app.cfg.addrs.insert(net, buf.trim().to_string());
                             save_config(&app.cfg); apply_target(app, tgt, stats); app.msg = "address saved".into();
                         } else { app.msg = format!("not a valid {} address", app.network()); }
+                    }
+                    Input::EditWorker => {
+                        app.cfg.worker = clean_worker(buf.trim()); save_config(&app.cfg); apply_target(app, tgt, stats);
+                        app.msg = if app.cfg.worker.is_empty() { "worker cleared — mining as your bare address".into() }
+                                  else { format!("worker saved — mining as {}", login(&app.addr(), &app.cfg.worker)) };
+                    }
+                    Input::EditTelegram => {
+                        let parts: Vec<&str> = buf.split(',').map(|s| s.trim()).collect();
+                        if buf.trim().is_empty() { app.cfg.alerts.telegram_token.clear(); app.cfg.alerts.telegram_chat.clear(); app.msg = "telegram alerts off".into(); }
+                        else if parts.len() == 2 && parts[0].contains(':') && !parts[1].is_empty() {
+                            app.cfg.alerts.telegram_token = parts[0].into(); app.cfg.alerts.telegram_chat = parts[1].into();
+                            app.msg = "telegram alerts on — a test message is on its way".into();
+                            let mut st = stats.lock().unwrap(); st.alerts = app.cfg.alerts.clone();
+                            alert(&mut st, "alerts armed", "pyblockMiner will notify you here: blocks, GPU down/up, pool outages, CHIRP eligibility");
+                        } else { app.msg = "format: <bot_token>,<chat_id>   (empty to disable)".into(); }
+                        save_config(&app.cfg); apply_target(app, tgt, stats);
                     }
                 }
                 app.input = None; app.buf.clear();
@@ -1623,6 +1926,13 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                 }
                 KeyCode::Char('e') => { app.input = Some(Input::EditAddr); app.buf.clear(); }
                 KeyCode::Char('c') => { app.cfg.cpu = !app.cfg.cpu; save_config(&app.cfg); app.msg = "cpu toggled (restart to apply devices)".into(); }
+                KeyCode::Char('w') => { app.input = Some(Input::EditWorker); app.buf = app.cfg.worker.clone(); }
+                KeyCode::Char('t') => { app.input = Some(Input::EditTelegram); app.buf.clear(); }
+                KeyCode::Char('b') => { app.cfg.alerts.bell = !app.cfg.alerts.bell; save_config(&app.cfg); apply_target(app, tgt, stats);
+                                        app.msg = format!("bell {}", if app.cfg.alerts.bell { "on" } else { "off" }); }
+                KeyCode::Char('n') => { app.cfg.alerts.desktop = !app.cfg.alerts.desktop; save_config(&app.cfg); apply_target(app, tgt, stats);
+                                        app.msg = format!("desktop notifications {}", if app.cfg.alerts.desktop { "on" } else { "off" }); }
+                KeyCode::Char('x') => { let mut st = stats.lock().unwrap(); alert(&mut st, "test alert", "if you can read this, alerts work"); app.msg = "test alert sent — check bell / desktop / telegram".into(); }
                 KeyCode::Char('+') => { app.cfg.donate += 1.0; save_config(&app.cfg); apply_target(app, tgt, stats); }
                 KeyCode::Char('-') => { app.cfg.donate = (app.cfg.donate - 1.0).max(DONATE_MIN); save_config(&app.cfg); apply_target(app, tgt, stats); }
                 _ => {}
@@ -1644,9 +1954,27 @@ fn main() {
         match args[i].as_str() {
             "--addr" => { i += 1; if i < args.len() { let net = cfg.stratums.get(cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()); cfg.addrs.insert(net, args[i].clone()); } }
             "--network" | "--net" | "--chain" => { i += 1; if i < args.len() { let n = net_cfg(&args[i]).name; if let Some(idx) = cfg.stratums.iter().position(|s| s.network == n) { cfg.selected = idx; } } }
-            "--pool" => { i += 1; if i < args.len() { if let Some(s) = cfg.stratums.get_mut(cfg.selected) { s.url = args[i].clone(); } } }
+            "--pool" => { i += 1; if i < args.len() {
+                // An ad-hoc pool becomes a CUSTOM stratum (deduped by URL) and is selected. Overwriting the selected
+                // default's URL in place got persisted on the next auto-save, and reconcile_defaults then re-added the
+                // real default → duplicated LOTTO entries.
+                let url = args[i].clone();
+                let net = cfg.stratums.get(cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into());
+                cfg.selected = match cfg.stratums.iter().position(|s| s.url == url) {
+                    Some(idx) => idx,
+                    None => { cfg.stratums.push(Stratum { name: format!("--pool {}", url), url, network: net, custom: true }); cfg.stratums.len() - 1 }
+                };
+            } }
             "--gpus" => { i += 1; if i < args.len() { cfg.gpus = args[i].parse().ok(); } }
             "--cpu" => { cfg.cpu = true; }
+            "--worker" => { i += 1; if i < args.len() { cfg.worker = clean_worker(&args[i]); } }
+            "--api-port" => { i += 1; if i < args.len() { cfg.api_port = args[i].parse().unwrap_or(0); } }
+            "--telegram" => { i += 1; if i < args.len() { let mut p = args[i].splitn(2, ',');
+                cfg.alerts.telegram_token = p.next().unwrap_or("").trim().to_string(); cfg.alerts.telegram_chat = p.next().unwrap_or("").trim().to_string(); } }
+            "--webhook" => { i += 1; if i < args.len() { cfg.alerts.webhook_url = args[i].clone(); } }
+            "--no-log-file" => { cfg.log_file = false; }
+            "--no-bell" => { cfg.alerts.bell = false; }
+            "--no-desktop" => { cfg.alerts.desktop = false; }
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             "--genaddr" | "--newaddr" => { let n = if i + 1 < args.len() && !args[i + 1].starts_with("--") { i += 1; net_cfg(&args[i]).name.to_string() } else { "mainnet".to_string() }; genaddr_net = Some(n); }
             "--version" | "-V" => { println!("pyblockMiner {}", VERSION); return; }
@@ -1695,22 +2023,52 @@ fn main() {
     let donate0 = if net_cfg(&net0).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
     let tgt = Arc::new(Mutex::new(Target {
         pool: app.cfg.stratums.get(app.cfg.selected).map(|s| s.url.clone()).unwrap_or_default(),
-        addr: app.addr(), network: net0.clone(), donate: donate0,
+        addr: app.addr(), worker: clean_worker(&app.cfg.worker), network: net0.clone(), donate: donate0,
     }));
     { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0;
-      st.mode = app.cfg.stratums.get(app.cfg.selected).map(|s| pool_mode(&s.url, &s.name)).unwrap_or_default(); }
+      st.mode = app.cfg.stratums.get(app.cfg.selected).map(|s| pool_mode(&s.url, &s.name)).unwrap_or_default();
+      st.worker = clean_worker(&app.cfg.worker); st.alerts = app.cfg.alerts.clone(); st.api_port = app.cfg.api_port;
+      st.log_file = if app.cfg.log_file { open_log_file() } else { None };
+      let banner = format!("pyblockMiner v{} starting · {} · login {}", VERSION, st.endpoint, login(&st.addr, &st.worker));
+      st.logline(banner); }
 
     { let stats = stats.clone(); let tgt = tgt.clone(); let paused = paused.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads, paused)); }
+    if app.cfg.api_port > 0 { let stats = stats.clone(); let port = app.cfg.api_port; std::thread::spawn(move || api_server(port, stats)); }
     // mode poller: CHIRP coinbase draw / CAROUSEL rotation for the ACTIVE stratum. Refreshes every 15s (the pool's
     // own pages do the same) and immediately on a stratum switch. A failed poll keeps the last good data on screen.
     { let stats = stats.clone(); std::thread::spawn(move || {
         let mut last_mode: Option<PoolMode> = None; let mut last_poll = Instant::now();
+        // your CHIRP state at the previous poll: (listed, eligible, stale>1h) — transitions become alerts
+        let mut chirp_prev: Option<(bool, bool, bool)> = None;
         loop {
             let mode = stats.lock().unwrap().mode;
             if last_mode != Some(mode) || last_poll.elapsed() >= Duration::from_secs(15) {
+                if last_mode != Some(mode) { chirp_prev = None; }
                 last_mode = Some(mode); last_poll = Instant::now();
                 match mode {
-                    PoolMode::Chirp => { let r = poll_chirp(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Chirp && r.is_some() { st.chirp = r; } }
+                    PoolMode::Chirp => {
+                        let r = poll_chirp();
+                        let mut st = stats.lock().unwrap();
+                        if st.mode == PoolMode::Chirp { if let Some(c) = r {
+                            let now = now_unix();
+                            let me = c.me(&st.addr).map(|m| (m.eligible, now.saturating_sub(m.last_seen) > 3600, m.days));
+                            let cur = me.map(|(e, s, _)| (true, e, s)).unwrap_or((false, false, false));
+                            if let Some(prev) = chirp_prev { if prev != cur {
+                                let pct = c.my_pct(&st.addr).unwrap_or(0.0);
+                                let days = me.map(|m| m.2).unwrap_or(0.0);
+                                match (prev, cur) {
+                                    ((_, false, _), (true, true, _)) => alert(&mut st, "CHIRP · you're IN the coinbase draw", &format!("your slice of every block: {:.2}%", pct)),
+                                    ((false, _, _), (true, false, _)) => alert(&mut st, "CHIRP · you're on the list", &format!("{:.1} of {:.0} days to the coinbase draw — keep mining", days, c.min_days)),
+                                    ((true, _, _), (false, _, _))     => alert(&mut st, "CHIRP · dropped off the list", "the pool no longer lists your address — reconnect and mine to re-enter"),
+                                    ((_, true, _), (true, false, _))  => alert(&mut st, "CHIRP · eligibility lost", &format!("tenure {:.1} d · check your power / connection", days)),
+                                    ((_, _, false), (true, _, true))  => alert(&mut st, "CHIRP · falling out", "no shares from you for 1h+ — you drop off the list 24h after your last share"),
+                                    _ => {}
+                                }
+                            } }
+                            chirp_prev = Some(cur);
+                            st.chirp = Some(c);
+                        } }
+                    }
                     PoolMode::Carousel => { let r = poll_carousel(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Carousel && r.is_some() { st.carousel = r; } }
                     _ => {}
                 }
@@ -1767,7 +2125,8 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| { ratatui::restore(); default_hook(info); }));
     let mut terminal = ratatui::init();
     loop {
-        { let st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); }
+        let ring = { let mut st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); std::mem::take(&mut st.ring_bell) };
+        if ring { let mut o = std::io::stdout(); let _ = o.write_all(b"\x07"); let _ = o.flush(); }   // alert → terminal bell
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
                 // Windows consoles emit Press AND Release (and Repeat) for one physical keypress; Unix emits
@@ -1778,4 +2137,83 @@ fn main() {
         }
     }
     ratatui::restore();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_pot_is_log2_floor() {
+        assert_eq!(floor_pot(1.0), 0); assert_eq!(floor_pot(2.0), 1); assert_eq!(floor_pot(3.0), 1);
+        assert_eq!(floor_pot(4096.0), 12); assert_eq!(floor_pot(0.5), 0);
+    }
+    #[test]
+    fn share_target_matches_difficulty() {
+        // diff 1 ⇔ bits 0 ⇔ target 2^224-1 : top 4 bytes zero, rest 0xff
+        let t = target_be(0);
+        assert_eq!(&t[..4], &[0, 0, 0, 0]); assert!(t[4..].iter().all(|&b| b == 0xff));
+        // each extra bit halves the target (shifts the 0xff run right by one bit)
+        let t1 = target_be(1); assert_eq!(t1[4], 0x7f);
+        let t12 = target_be(12); assert_eq!(&t12[..5], &[0, 0, 0, 0, 0]); assert_eq!(t12[5], 0x0f);
+    }
+    #[test]
+    fn nbits_decodes_like_bitcoin() {
+        // 0x1d00ffff (genesis): mantissa 0x00ffff at byte offset 32-29=3
+        let t = nbits_to_target(0x1d00ffff);
+        assert_eq!(&t[..3], &[0, 0, 0]); assert_eq!(&t[3..6], &[0x00, 0xff, 0xff]); assert!(t[6..].iter().all(|&b| b == 0));
+    }
+    #[test]
+    fn hash_diff_is_monotonic_and_calibrated() {
+        // a hash exactly at the diff-1 boundary (top 32 bits zero, then 0xff…) ≈ diff 1
+        let mut h = [0xffu8; 32]; h[..4].copy_from_slice(&[0, 0, 0, 0]);
+        let d1 = hash_diff(&h); assert!((d1 - 1.0).abs() < 1e-6, "{}", d1);
+        let mut h2 = h; h2[4] = 0x7f;   // one more leading zero bit → diff ≈ 2
+        assert!(hash_diff(&h2) > 1.99 && hash_diff(&h2) < 2.01);
+        assert!(hash_le_target(&h, &target_be(0)) && !hash_le_target(&h, &target_be(1)));
+    }
+    #[test]
+    fn pool_mode_from_port_then_name() {
+        assert_eq!(pool_mode("pool.pyblock.xyz:5574", "x"), PoolMode::Chirp);
+        assert_eq!(pool_mode("pool.pyblock.xyz:30110", "x"), PoolMode::Carousel);
+        assert_eq!(pool_mode("pool.pyblock.xyz:4445", "x"), PoolMode::Lotto);
+        assert_eq!(pool_mode("10.0.0.5:3333", "my CHIRP relay"), PoolMode::Chirp);
+        assert_eq!(pool_mode("10.0.0.5:3333", "home node"), PoolMode::Custom);
+    }
+    #[test]
+    fn version_compare_is_semver() {
+        assert!(is_newer("0.2.20", "0.2.19")); assert!(is_newer("v0.3.0", "0.2.99")); assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(!is_newer("0.2.19", "0.2.19")); assert!(!is_newer("0.2.18", "0.2.19")); assert!(!is_newer("", "0.2.19"));
+    }
+    #[test]
+    fn address_masking_and_labels() {
+        assert_eq!(mask_addr("bc1qjdqlvwfxum8dh4t5v9mvskdarjvlek2a9g5pw2", false), "bc1qjd…5pw2");
+        assert_eq!(mask_addr("bc1qjdqlvwfxum8dh4t5v9mvskdarjvlek2a9g5pw2", true).len(), 42);
+        assert_eq!(mask_addr("short", false), "short");
+        assert_eq!(clean_label("  Ec1ipse\x1b[31m\u{7f} "), "Ec1ipse[31m");   // control chars gone, text kept
+        assert_eq!(clean_label(&"a".repeat(100)).len(), 40);
+    }
+    #[test]
+    fn formatting_helpers() {
+        assert_eq!(fmt_ths(8.42), "8.42 TH/s"); assert_eq!(fmt_ths(0.5), "500.00 GH/s"); assert_eq!(fmt_ths(1500.0), "1.50 PH/s"); assert_eq!(fmt_ths(0.0), "—");
+        assert_eq!(bar(0.0, 10), "▱▱▱▱▱▱▱▱▱▱"); assert_eq!(bar(1.0, 4), "▰▰▰▰"); assert_eq!(bar(0.5, 4), "▰▰▱▱"); assert_eq!(bar(7.0, 3), "▰▰▰");
+        assert_eq!(fmt_num(57_302_984.0), "57.3M"); assert_eq!(fmt_ago(59), "59s"); assert_eq!(fmt_ago(7200), "2h");
+    }
+    #[test]
+    fn timestamps_and_logins() {
+        assert_eq!(fmt_ts(0), "1970-01-01 00:00:00");
+        assert_eq!(fmt_ts(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(fmt_ts(951_782_400), "2000-02-29 00:00:00");   // leap day
+        assert_eq!(clean_worker("rig #1 (garage)!"), "rig1garage");
+        assert_eq!(clean_worker(&"x".repeat(40)).len(), 24);
+        assert_eq!(login("bc1qabc", ""), "bc1qabc"); assert_eq!(login("bc1qabc", "rig1"), "bc1qabc.rig1");
+        assert_eq!(fmt_btc(0.0), "—"); assert_eq!(fmt_btc(0.00005), "5000 sats"); assert_eq!(fmt_btc(0.0123), "0.01230 BTC");
+    }
+    #[test]
+    fn chirp_share_math() {
+        let mk = |a: &str, w: f64, e: bool| ChirpMember { addr: a.into(), weight: w, eligible: e, ..Default::default() };
+        let c = ChirpInfo { members: vec![mk("A", 75.0, true), mk("B", 25.0, true), mk("C", 999.0, false)], ..Default::default() };
+        assert_eq!(c.sum_weight(), 100.0);                       // ineligible weight doesn't count
+        assert_eq!(c.my_pct("B"), Some(25.0)); assert_eq!(c.my_pct("C"), None); assert_eq!(c.my_pct(""), None);
+    }
 }
