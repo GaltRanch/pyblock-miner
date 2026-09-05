@@ -30,7 +30,7 @@ PyBLØCK  1·MINE  2·DATA  3·STRATUMS  4·LEARN  5·NETWORK  6·SETUP  7·HELP
 |------|------|------------------------|---------------------|
 | 🎰 **LOTTO** | `4445` | solo lottery — every block you find pays **your** address · you keep 99.1% · fee 0.9% | your odds: expected time-to-block at your hashrate |
 | 🌌 **CHIRP** | `5574` | syndicate — every block is **split on-chain among ALL eligible miners** by weight (7-day loyalty) · fee 0.9% | **everyone in the coinbase draw**: rank, address, tenure, power, share % and status, your row marked `▶ you`, your live slice + cut in BTC · `↑↓` scrolls |
-| 🎠 **CAROUSEL** | `30110` | rotating **clean templates** from independent suppliers — finder keeps 98% · supplier 1% · PyBLØCK 1% | the template being mined **right now**, the whole rotation, the recent trail |
+| 🎠 **CAROUSEL** | `30110` | rotating **clean templates** from independent suppliers — finder keeps 96% · supplier 3% · PyBLØCK 1% | the template being mined **right now**, the whole rotation, the recent trail |
 
 The header, the network tiles and the panel all follow the selected stratum. **NETWORK** (`5`) shows the same mode panel full-height. Data comes from the pool's own APIs (`chirp_api.php?chain=blake2b`, `carousel.php?carrousel=1`), refreshed every 15 s.
 

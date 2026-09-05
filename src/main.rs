@@ -106,14 +106,14 @@ impl PoolMode {
         match self {
             PoolMode::Lotto    => "every block you find pays YOUR address · you keep 99.1% · PyBLØCK fee 0.9%",
             PoolMode::Chirp    => "every block is split on-chain among ALL eligible miners by weight · 7-day loyalty · fee 0.9%",
-            PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 98% · supplier 1% · PyBLØCK 1%",
+            PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 96% · supplier 3% · PyBLØCK 1%",
             PoolMode::Custom   => "payout rules are the pool operator's — check their site",
         }
     }
     fn payout_short(self) -> &'static str {
         match self {
             PoolMode::Lotto => "keep 99.1% · fee 0.9%", PoolMode::Chirp => "weighted split · fee 0.9%",
-            PoolMode::Carousel => "keep 98% · supplier 1% · fee 1%", PoolMode::Custom => "operator's rules",
+            PoolMode::Carousel => "keep 96% · supplier 3% · fee 1%", PoolMode::Custom => "operator's rules",
         }
     }
 }
@@ -1437,7 +1437,7 @@ fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
     // recent is oldest → newest; show the last few so the trail ends at what's being mined now
     let trail: Vec<String> = k.recent.iter().rev().take(10).rev().cloned().collect();
     out.push(Line::from(vec![dim("  recent      "), Span::styled(trail.join(" › "), Style::new().fg(Color::Rgb(150, 150, 165)))]));
-    out.push(Line::from(vec![dim("  payout      "), Span::styled("finder keeps 98% · supplier 1% · PyBLØCK 1% · split on-chain in the coinbase · non-custodial", Style::new().fg(PNK))]));
+    out.push(Line::from(vec![dim("  payout      "), Span::styled("finder keeps 96% · supplier 3% · PyBLØCK 1% · split on-chain in the coinbase · non-custodial", Style::new().fg(PNK))]));
     out
 }
 // Expected BTC/day for a CHIRP member holding `pct`% of the split: syndicate blocks/day (mean, from its hashrate vs
