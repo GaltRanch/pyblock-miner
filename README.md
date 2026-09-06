@@ -114,6 +114,7 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | `--telegram <token>,<chat_id>` | off | alerts to a Telegram chat (also SETUP → `t`) |
 | `--webhook <url>` | off | alerts as a JSON `POST {source,title,body,ts}` |
 | `--no-log-file` · `--no-bell` · `--no-desktop` | on | turn off the timestamped `miner.log`, the terminal bell, or desktop notifications |
+| `--sweep-ms <ms>` · `--gpu-iter <n>` | adaptive · 512 | work-size knobs for mixed-speed rigs, flaky power or Windows TDR: cap each sweep's length (smaller nonce range per device) and/or the nonces per GPU work-item (smaller kernel launches: 512 = 2^31 nonces per launch, 128 = 2^29). Costs a little hashrate; try `--gpu-iter 128` first. Persist in config. |
 | `--update` | | `git pull` + build in this checkout, then exit (same as pressing `u` twice in the app) |
 | `--auto-update` | off | headless services: when the pool announces a newer version, pull + build + relaunch on their own |
 

@@ -168,6 +168,8 @@ struct Config {
     #[serde(default)] api_port: u16,                   // 0 = off · else JSON at http://127.0.0.1:<port>/ and Prometheus at /metrics
     #[serde(default)] alerts: AlertCfg,
     #[serde(default)] auto_update: bool,               // headless: pull + build + relaunch by itself when the pool publishes a newer version
+    #[serde(default)] sweep_ms: u32,                   // 0 = adaptive; else cap each sweep to this many ms (smaller per-device nonce ranges)
+    #[serde(default)] gpu_iter: u32,                   // 0 = grinder default (512); else nonces per work-item → PYBLOCK_GPU_ITER (smaller launches)
 }
 // ── alerts: what a miner wants to know without watching the screen ──
 #[derive(Serialize, Deserialize, Clone)]
@@ -184,7 +186,7 @@ fn d_true() -> bool { true }
 impl Default for Config {
     fn default() -> Self {
         Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false,
-                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default(), auto_update: false }
+                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default(), auto_update: false, sweep_ms: 0, gpu_iter: 0 }
     }
 }
 // worker names travel inside the stratum username → keep them plain: [A-Za-z0-9-_], max 24
@@ -780,7 +782,9 @@ fn build_work(conn: &mut Conn, en1v: &str, jobv: &[Value]) -> (String, String, S
 }
 
 // engine reads the shared Target; when pool/addr changes (live stratum switch) it reconnects.
-fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_threads: usize, paused: Arc<AtomicBool>) {
+// `sweep_ms`: 0 = adaptive (60–350ms from the block cadence); else a hard cap on sweep length → smaller nonce ranges
+// per device per sweep (a gentler, more even load on mixed-speed rigs; pair with --gpu-iter for smaller launches).
+fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_threads: usize, paused: Arc<AtomicBool>, sweep_ms: u32) {
     let names = gpu_names();
     let mut daemons: Vec<Daemon> = Vec::new();
     for dev in 0..ngpu {
@@ -932,7 +936,8 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 last_prevhash = prevhash.clone();
                 last_block_at = Instant::now();
             }
-            let sweep_secs = (block_interval_ema * 0.15).clamp(0.06, 0.35);
+            let mut sweep_secs = (block_interval_ema * 0.15).clamp(0.06, 0.35);
+            if sweep_ms > 0 { sweep_secs = sweep_secs.min((sweep_ms as f64 / 1000.0).max(0.02)); }
             let work = Work { prevhash: &prevhash, ntime: &ntime, work_root: &work_root, bits };
             let (nonces, gpu_ghs, cpu_ghs, events) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &work, sweep_secs);
             {
@@ -1922,6 +1927,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("log file", "every log line, timestamped → <config dir>/miner.log (rotates at 5 MB) · --no-log-file"),
         l("--api-port N", "http://127.0.0.1:N/ live stats as JSON · /metrics for Prometheus/Grafana · localhost only"),
         l("--worker NAME", "login as addr.NAME so the pool tells your rigs apart"),
+        l("--sweep-ms N", "cap each sweep to N ms (smaller nonce range per device per sweep) · --gpu-iter N: nonces per work-item, default 512 (smaller launches)"),
         Line::from(""),
         Line::from(Span::styled(" Pools — same BLAKE2b chain, three ways to get paid", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
         l("🎰 LOTTO :4445", &PoolMode::Lotto.payout()),
@@ -2165,6 +2171,8 @@ fn main() {
             "--no-bell" => { cfg.alerts.bell = false; }
             "--no-desktop" => { cfg.alerts.desktop = false; }
             "--auto-update" => { cfg.auto_update = true; }
+            "--sweep-ms" => { i += 1; if i < args.len() { cfg.sweep_ms = args[i].parse().unwrap_or(0); } }
+            "--gpu-iter" => { i += 1; if i < args.len() { cfg.gpu_iter = args[i].parse().unwrap_or(0); } }
             "--update" => { update_now = true; }
             "--update-to" => { i += 1; if i < args.len() { update_now = true; update_to = args[i].trim_start_matches('v').to_string(); } }   // pin a release (support / rollback / testing)
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
@@ -2239,7 +2247,15 @@ fn main() {
       let banner = format!("pyblockMiner v{} starting · {} · login {}", VERSION, st.endpoint, login(&st.addr, &st.worker));
       st.logline(banner); }
 
-    { let stats = stats.clone(); let tgt = tgt.clone(); let paused = paused.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads, paused)); }
+    // work-size knobs (mixed-speed rigs / flaky power / TDR): --gpu-iter reaches the grinders through their environment
+    if app.cfg.gpu_iter > 0 { std::env::set_var("PYBLOCK_GPU_ITER", app.cfg.gpu_iter.to_string()); }
+    if app.cfg.gpu_iter > 0 || app.cfg.sweep_ms > 0 {
+        stats.lock().unwrap().logline(format!("work size: sweep cap {} · nonces per work-item {}",
+            if app.cfg.sweep_ms > 0 { format!("{} ms", app.cfg.sweep_ms) } else { "adaptive".into() },
+            if app.cfg.gpu_iter > 0 { app.cfg.gpu_iter.to_string() } else { "grinder default".into() }));
+    }
+    let sweep_ms = app.cfg.sweep_ms;
+    { let stats = stats.clone(); let tgt = tgt.clone(); let paused = paused.clone(); std::thread::spawn(move || engine(stats, tgt, ngpu, cpu_threads, paused, sweep_ms)); }
     if app.cfg.api_port > 0 { let stats = stats.clone(); let port = app.cfg.api_port; std::thread::spawn(move || api_server(port, stats)); }
     // mode poller: CHIRP coinbase draw / CAROUSEL rotation for the ACTIVE stratum. Refreshes every 15s (the pool's
     // own pages do the same) and immediately on a stratum switch. A failed poll keeps the last good data on screen.

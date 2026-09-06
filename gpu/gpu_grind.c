@@ -126,7 +126,12 @@ static Gpu gpu_setup(int didx){
 // grind [nstart, nstart+nspan) with the given 80-byte header + target. Prints verified winners to stdout. Returns GH/s.
 static double gpu_grind_range(Gpu*g, const uint8_t hdr[80], cl_ulong T0,cl_ulong T1,cl_ulong T2,cl_ulong T3, const uint8_t tgt_be[32], cl_ulong nstart, cl_ulong nspan){
   chk(clEnqueueWriteBuffer(g->q,g->mhdr,CL_TRUE,0,80,hdr,0,0,0),"whdr");
-  cl_uint iter=512; size_t per=((size_t)1<<22)*iter;
+  // work per launch: 2^22 work-items × `iter` nonces each = 2^31 nonces per kernel launch by default (~0.3s on a
+  // ~7 GH/s card). PYBLOCK_GPU_ITER=<16..4096> shrinks/grows the launch — smaller launches mean shorter, gentler
+  // bursts (mixed-speed rigs, flaky PSUs/risers, Windows TDR) at the cost of a little launch overhead.
+  static cl_uint iter=0;
+  if(!iter){ const char*e=getenv("PYBLOCK_GPU_ITER"); long v=e?strtol(e,0,10):0; iter=(v>=16&&v<=4096)?(cl_uint)v:512; }
+  size_t per=((size_t)1<<22)*iter;
   clSetKernelArg(g->ks,0,sizeof(g->mhdr),&g->mhdr);
   clSetKernelArg(g->ks,2,sizeof(cl_uint),&iter);
   clSetKernelArg(g->ks,3,sizeof(cl_ulong),&T0); clSetKernelArg(g->ks,4,sizeof(cl_ulong),&T1);
@@ -168,6 +173,7 @@ int main(int argc,char**argv){
   if(argc>=3 && !strcmp(argv[1],"daemon")){
     Gpu g=gpu_setup(atoi(argv[2]));
     fprintf(stderr,"READY %s\n",g.dn); fflush(stderr);
+    { const char*e=getenv("PYBLOCK_GPU_ITER"); if(e) fprintf(stderr,"gpu_grind: PYBLOCK_GPU_ITER=%s → %s nonces per launch\n",e,(strtol(e,0,10)>=16&&strtol(e,0,10)<=4096)?"custom":"out of range, using 512"); fflush(stderr); }
     char line[512];
     while(fgets(line,sizeof(line),stdin)){
       char ph[80],nt[48],wr[80]; int bits; unsigned long long ns=0,sp=0;

@@ -110,7 +110,9 @@ static Gpu gpu_setup(int didx, const char* argv0){
 static double gpu_grind_range(Gpu*g, const uint8_t hdr[80], uint64_t T0,uint64_t T1,uint64_t T2,uint64_t T3,
                              const uint8_t tgt_be[32], uint64_t nstart, uint64_t nspan){
   memcpy([g->mhdr contents], hdr, 80);
-  uint32_t iter=256; uint64_t per=((uint64_t)1<<23)*iter;   // iter=256/tg=128: óptimo medido en M5 Max (sweep 64..1024 × 64..256)
+  uint32_t iter=256;   // iter=256/tg=128: óptimo medido en M5 Max (sweep 64..1024 × 64..256)
+  { const char*e=getenv("PYBLOCK_GPU_ITER"); long v=e?strtol(e,0,10):0; if(v>=16&&v<=4096) iter=(uint32_t)v; }   // same knob as gpu_grind
+  uint64_t per=((uint64_t)1<<23)*iter;
   uint64_t T[4]={T0,T1,T2,T3};
   uint64_t done=0, base=nstart; double t0=now();
   NSUInteger tg=g->pso.maxTotalThreadsPerThreadgroup; if(tg>128) tg=128; if(tg<1) tg=1;
