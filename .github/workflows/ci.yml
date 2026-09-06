@@ -52,7 +52,9 @@ jobs:
         shell: msys2 {0}
         run: |
           gcc -O2 -static-libgcc -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind.exe -lOpenCL
-          cp /mingw64/bin/libOpenCL.dll gpu/
+          # bundle the Khronos ICD loader the grinder links against (MSYS2 names it OpenCL.dll or libOpenCL.dll)
+          ls /mingw64/bin | grep -i opencl || true
+          cp /mingw64/bin/*[Oo]pen[Cc][Ll]*.dll gpu/
           echo "gpu_grind.exe depends on:"; ldd gpu/gpu_grind.exe | grep -vi 'windows/system32' || true
 
       - name: Build miner (Windows)
@@ -73,7 +75,7 @@ jobs:
           PKG="pyblockMiner-$V-${{ matrix.name }}"
           mkdir -p "dist/$PKG/gpu"
           case "$RUNNER_OS" in
-            Windows) cp target/release/pyblockMiner.exe "dist/$PKG/"; cp gpu/gpu_grind.exe gpu/libOpenCL.dll gpu/blake2b.cl "dist/$PKG/gpu/" ;;
+            Windows) cp target/release/pyblockMiner.exe "dist/$PKG/"; cp gpu/gpu_grind.exe gpu/*.dll gpu/blake2b.cl "dist/$PKG/gpu/" ;;
             macOS)   cp target/release/pyblockMiner "dist/$PKG/";     cp gpu/metal_grind gpu/blake2b.metal "dist/$PKG/gpu/" ;;
             *)       cp target/release/pyblockMiner "dist/$PKG/";     cp gpu/gpu_grind gpu/blake2b.cl "dist/$PKG/gpu/" ;;
           esac

@@ -1,6 +1,6 @@
 # pyblockMiner
 
-**A GPU/CPU miner for the PyBLØCK LOTTO BLAKE2b pool — Bitcoin BLAKE2b, solo lottery, non-custodial.**
+**A GPU/CPU miner for PyBLØCK's Bitcoin BLAKE2b pools — LOTTO · CHIRP · CAROUSEL — live on mainnet, non-custodial.**
 
 A terminal (TUI) miner: you mine to **your own** Bitcoin address and keep **99.1%** of every block you find, straight in your address (PyBLØCK pool fee 0.9%). No accounts, no custody. It saturates all your GPUs — NVIDIA, AMD or Intel (and/or CPU cores) — and shows live cards for your hashrate, blocks and difficulty — plus **live network cards**: how many miners are online and the network's total hashrate.
 
@@ -36,9 +36,11 @@ The header, the network tiles and the panel all follow the selected stratum. **N
 
 - **STRATUMS** — pick a pool and **switch it live, without leaving the miner.** Each pool says in one line what it does with the coinbase. PyBLØCK's pools are there by default (LOTTO / CHIRP / CAROUSEL / testnet4 / regtest); add your own custom stratums too.
 - **SETUP** — generate or paste your address, per network; toggle CPU and the donation. Everything **auto-saves** to a config file, so you don't re-type flags.
-- **LEARN / HELP** — what BLAKE2b is, the honest hardfork status, and troubleshooting (incl. the OpenCL-headers fix).
+- **LEARN / HELP** — what BLAKE2b is, where the chain stands, and troubleshooting (incl. the OpenCL-headers fix).
 
-> ⚠️ **Honest framing — read this.** BLAKE2b is a *proposed* proof-of-work change for Bitcoin (Bitcoin Knots [PR #359](https://github.com/bitcoinknots/bitcoin/pull/359)). It is **not merged and not active on Bitcoin mainnet — there is no activation date.** Mainnet is still SHA-256. The **first public chain** where you can actually mine BLAKE2b is **testnet4**, where the change activates at **block 149460** (Bitcoin Knots 29.4.1 RC) — but **testnet4 coins have no monetary value.** `pool.pyblock.xyz:23110` is a **regtest demo** (coin is not real Bitcoin, no value). This exists so miners can test BLAKE2b mining and see they get paid to their own address, **ready for the day (if ever) mainnet changes its PoW.** Each network needs its own address type (`bc1…` mainnet · `tb1…` testnet4 · `bcrt1…` regtest); the dev donation applies **only on mainnet**. Don't trust, verify.
+> ✅ **Mainnet is live.** Bitcoin BLAKE2b — the proof-of-work change born in Bitcoin Knots [PR #359](https://github.com/bitcoinknots/bitcoin/pull/359) — is **running on mainnet and mining is working optimally.** As of September 2026 the chain is past block 968,000, PyBLØCK's pools have found **1,100+ blocks** (≈3.125 BTC each) and the network hashes at **≈1.2 PH/s** across 120+ miners, GPUs and ASICs alike. The miner's default stratums are the three **mainnet** pools (LOTTO · CHIRP · CAROUSEL); every block pays real BTC to **your** address. **testnet4** (`:23111`) and **regtest** (`:23110`) remain available for testing and carry no value. Each network needs its own address type (`bc1…` mainnet · `tb1…` testnet4 · `bcrt1…` regtest); the dev donation applies **only on mainnet**. Live numbers: [b.pyblock.xyz](https://b.pyblock.xyz:8443/). Don't trust, verify.
+>
+> **A word on odds.** With ASICs on the network, a single GPU on LOTTO is a true lottery (the DATA tab shows your expected time-to-block honestly). If you'd rather earn a steady, weighted share of every block the syndicate finds, mine on **CHIRP**.
 
 ---
 

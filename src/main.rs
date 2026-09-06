@@ -1746,19 +1746,19 @@ fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
 fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
     let pages: Vec<(&str, Vec<&str>)> = vec![
         ("What is this?", vec![
-            "pyblockMiner mines BLAKE2b — a *proposed* new Proof-of-Work for Bitcoin (Bitcoin Knots PR #359).",
-            "It's solo-lottery: you mine to YOUR OWN address and keep 99.1% of any block you find,",
-            "straight to that address. Non-custodial — the pool never holds your coins. PyBLØCK fee 0.9%.",
+            "pyblockMiner mines Bitcoin BLAKE2b — the Proof-of-Work change born in Bitcoin Knots PR #359, now LIVE on mainnet.",
+            "You mine to YOUR OWN address, non-custodial — the pool never holds your coins. Three pools, one chain:",
+            "LOTTO (solo, keep 99.1%) · CHIRP (syndicate, every block split by weight) · CAROUSEL (rotating clean templates).",
             "",
             "It saturates your GPU (NVIDIA / AMD / Intel via OpenCL on Linux & Windows, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
         ]),
-        ("The hardfork — honest status", vec![
-            "BLAKE2b is NOT merged and NOT active on Bitcoin mainnet — there is no activation date.",
-            "MAINNET is still SHA-256. Do not expect real rewards on mainnet yet.",
+        ("Mainnet status", vec![
+            "MAINNET is live and mining is working optimally: every block pays real BTC (≈3.125 + fees) to your address.",
+            "The network is past block 968,000 with ≈1.2 PH/s from 120+ miners — GPUs and ASICs. PyBLØCK's pools have found 1,100+ blocks.",
             "",
-            "TESTNET4: the change activates on the public testnet4 chain at a flag-day block (Knots 29.4.1 RC).",
-            "That is the FIRST place you can actually mine BLAKE2b on a public chain.",
-            "⚠ testnet4 coins have NO monetary value — it's for testing / being ready.",
+            "A single GPU on LOTTO is a true lottery next to ASICs — DATA [2] shows your honest expected time-to-block.",
+            "Want a steady, weighted slice of every block instead? Mine on CHIRP [3 → STRATUMS].",
+            "⚠ testnet4 / regtest stay available for testing — their coins have NO value.",
         ]),
         ("How solo-lottery mining works", vec![
             "Every share your GPU finds that beats the block target IS a block — paid entirely to your address.",
@@ -1770,7 +1770,7 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
         ("Get started", vec![
             "1. SETUP [5]: pick your network + generate (or paste) an address for it.",
             "2. STRATUMS [2]: pick a pool (PyBLØCK defaults are there; add custom ones).",
-            "3. MINE [1]: it connects and mines. Leave it running — on testnet4 it starts the moment BLAKE2b activates.",
+            "3. MINE [1]: it connects and mines. Leave it running — it reconnects, respawns GPUs and updates itself.",
             "",
             "No GPU? it falls back to CPU. Multiple GPUs are auto-detected and all saturated.",
         ]),
