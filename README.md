@@ -42,6 +42,17 @@ The header, the network tiles and the panel all follow the selected stratum. **N
 
 ---
 
+## Download (no toolchain needed)
+
+Prebuilt packages for every release are on the [Releases page](https://github.com/GaltRanch/pyblock-miner/releases): `linux-x86_64` (OpenCL), `macos-arm64` (Apple Silicon, Metal) and `windows-x86_64` (OpenCL). Unpack and run `pyblockMiner` — the `gpu/` folder next to it holds the grinder and kernel.
+
+- **Linux** needs the OpenCL ICD loader at runtime (`libOpenCL.so.1` — comes with your GPU driver, or `apt install ocl-icd-libopencl1`).
+- **macOS**: the binary is not notarized; the first run may need `xattr -dr com.apple.quarantine pyblockMiner-*/`.
+- **Windows**: `gpu\libOpenCL.dll` (the Khronos ICD loader) is bundled; your GPU driver provides the actual OpenCL.
+- Verify downloads with `SHA256SUMS.txt`. Release binaries **update themselves**: press `u` twice (or `--update`) and the miner fetches the matching release, swaps itself in place and relaunches.
+
+Building from source is fully supported too:
+
 ## Requirements
 
 - **Rust** (`cargo`) — https://rustup.rs

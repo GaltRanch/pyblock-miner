@@ -1074,9 +1074,75 @@ fn repo_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     if is_repo(&cwd) { Some(cwd) } else { None }
 }
-// Runs with the TUI already restored so the user sees git + cargo output. Ok = a new binary is in place.
-fn run_update() -> Result<PathBuf, String> {
-    let dir = repo_dir().ok_or("can't find the pyblock-miner checkout (needs .git + build.sh above the binary) — update by hand: git pull && ./build.sh")?;
+// Release binaries (built by CI on every v* tag): one archive per platform, unpacked next to the running binary.
+const RELEASE_BASE: &str = "https://github.com/GaltRanch/pyblock-miner/releases/download";
+fn release_asset(ver: &str) -> Option<String> {
+    let plat = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64")   => "linux-x86_64.tar.gz",
+        ("macos", "aarch64")  => "macos-arm64.tar.gz",
+        ("windows", "x86_64") => "windows-x86_64.zip",
+        _ => return None,
+    };
+    if ver.is_empty() { return None; }
+    Some(format!("{}/v{}/pyblockMiner-{}-{}", RELEASE_BASE, ver, ver, plat))
+}
+// No git checkout → this is a release binary: download the archive for `ver`, unpack, swap the binary + gpu/ in
+// place (the old binary is renamed to .old, which Windows allows while it runs; it's removed on next start).
+fn binary_update(ver: &str) -> Result<PathBuf, String> {
+    let url = release_asset(ver).ok_or_else(|| format!("no prebuilt release for {}-{} — build from source: git clone … && ./build.sh", std::env::consts::OS, std::env::consts::ARCH))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("binary has no parent dir")?.to_path_buf();
+    println!("── pyblockMiner update · release binary · {} ──", dir.display());
+    println!("→ downloading {}", url);
+    let resp = ureq::get(&url).timeout(Duration::from_secs(180)).call().map_err(|e| format!("download failed: {}", e))?;
+    let mut bytes = Vec::new();
+    resp.into_reader().take(300_000_000).read_to_end(&mut bytes).map_err(|e| format!("download failed: {}", e))?;
+    let tmp = dir.join(".update");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("can't write next to the binary ({}): {}", dir.display(), e))?;
+    let archive = tmp.join(if url.ends_with(".zip") { "pkg.zip" } else { "pkg.tar.gz" });
+    std::fs::write(&archive, &bytes).map_err(|e| e.to_string())?;
+    println!("→ unpacking ({} MB)", bytes.len() / 1_000_000);
+    // `tar` reads .tar.gz everywhere and .zip on Windows 10+ (bsdtar) and macOS — no archive crate needed
+    let ok = Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&tmp).status().map(|s| s.success()).unwrap_or(false);
+    if !ok { return Err("unpack failed (is `tar` installed?)".into()); }
+    let pkg = std::fs::read_dir(&tmp).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).find(|p| p.is_dir())
+        .ok_or("archive has no package folder")?;
+    let name = exe.file_name().ok_or("bad exe name")?.to_os_string();
+    let new_exe = pkg.join(&name);
+    if !new_exe.exists() { return Err(format!("archive has no {}", name.to_string_lossy())); }
+    println!("→ installing");
+    let old = exe.with_extension("old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(&exe, &old).map_err(|e| format!("can't move the running binary aside: {}", e))?;
+    std::fs::copy(&new_exe, &exe).map_err(|e| format!("can't install the new binary: {}", e))?;
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)); }
+    let gpu_src = pkg.join("gpu"); let gpu_dst = dir.join("gpu");
+    if gpu_src.is_dir() {
+        let _ = std::fs::create_dir_all(&gpu_dst);
+        for f in std::fs::read_dir(&gpu_src).map_err(|e| e.to_string())?.flatten() {
+            let dst = gpu_dst.join(f.file_name());
+            let _ = std::fs::rename(&dst, dst.with_extension("old"));   // a running grinder on Windows can't be overwritten either
+            let _ = std::fs::copy(f.path(), &dst);
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)); }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(dir)
+}
+// leftovers of a previous binary update (the running-binary-renamed-aside trick) — cleaned on the next start
+fn cleanup_old_binaries() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("old"));
+        if let Some(dir) = exe.parent() { if let Ok(rd) = std::fs::read_dir(dir.join("gpu")) {
+            for f in rd.flatten() { if f.path().extension().map(|e| e == "old").unwrap_or(false) { let _ = std::fs::remove_file(f.path()); } }
+        } }
+    }
+}
+// Runs with the TUI already restored so the user sees the progress. Git checkout → pull + build; release binary →
+// download + swap. Ok = a new binary is in place.
+fn run_update(latest: &str) -> Result<PathBuf, String> {
+    let Some(dir) = repo_dir() else { return binary_update(latest); };
     println!("── pyblockMiner update · {} ──", dir.display());
     let ok = |st: std::io::Result<std::process::ExitStatus>| st.map(|s| s.success()).unwrap_or(false);
     println!("→ git pull --ff-only");
@@ -1922,9 +1988,11 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
         KeyCode::Char('u') => {
             let (avail, latest) = { let st = stats.lock().unwrap(); (st.update_available, st.latest_version.clone()) };
             if !avail { app.msg = format!("you're on the latest version (v{})", VERSION); }
-            else if repo_dir().is_none() { app.msg = "can't find the git checkout this binary was built from — update by hand: git pull && ./build.sh".into(); }
+            else if repo_dir().is_none() && release_asset(&latest).is_none() { app.msg = "no git checkout and no prebuilt release for this platform — build from source: git clone … && ./build.sh".into(); }
             else if update_armed { app.do_update = true; return true; }
-            else { app.update_armed = true; app.msg = format!("⬆ update to v{}: git pull + build + relaunch — mining pauses ~1–2 min · press u again to confirm", latest); }
+            else { app.update_armed = true;
+                   let how = if repo_dir().is_some() { "git pull + build + relaunch — mining pauses ~1–2 min" } else { "download the release binary + relaunch — mining pauses a few seconds" };
+                   app.msg = format!("⬆ update to v{}: {} · press u again to confirm", latest, how); }
         }
         _ => match app.tab {
             Tab::Stratums => match code {
@@ -1999,6 +2067,8 @@ fn main() {
     let mut cfg = load_config();
     let mut headless = false;
     let mut update_now = false;
+    let mut update_to = String::new();
+    cleanup_old_binaries();
     let mut genaddr_net: Option<String> = None;
     // CLI overrides (optional; config is the source of truth otherwise)
     let mut i = 1;
@@ -2029,6 +2099,7 @@ fn main() {
             "--no-desktop" => { cfg.alerts.desktop = false; }
             "--auto-update" => { cfg.auto_update = true; }
             "--update" => { update_now = true; }
+            "--update-to" => { i += 1; if i < args.len() { update_now = true; update_to = args[i].trim_start_matches('v').to_string(); } }   // pin a release (support / rollback / testing)
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             "--genaddr" | "--newaddr" => { let n = if i + 1 < args.len() && !args[i + 1].starts_with("--") { i += 1; net_cfg(&args[i]).name.to_string() } else { "mainnet".to_string() }; genaddr_net = Some(n); }
             "--version" | "-V" => { println!("pyblockMiner {}", VERSION); return; }
@@ -2058,7 +2129,13 @@ fn main() {
     }
     // --update: pull + build in this checkout, report the new version, exit (no TUI, no mining)
     if update_now {
-        match run_update() {
+        // a release binary needs to know the version to fetch → ask the pool (a git checkout just pulls HEAD)
+        let latest = if !update_to.is_empty() { update_to.clone() } else if repo_dir().is_some() { String::new() } else {
+            println!("→ asking the pool for the latest version…");
+            net_stats_url("mainnet").and_then(poll_network_stats).map(|n| n.latest).unwrap_or_default() };
+        if update_to.is_empty() && repo_dir().is_none() && !is_newer(&latest, VERSION) { println!("you're on the latest version (v{}){}", VERSION, if latest.is_empty() { " — or the pool didn't answer" } else { "" }); return; }
+        if !update_to.is_empty() && repo_dir().is_some() { println!("(git checkout: --update-to is ignored, pulling HEAD)"); }
+        match run_update(&latest) {
             Ok(_) => { let v = Command::new(std::env::current_exe().unwrap_or_else(|_| "pyblockMiner".into())).arg("--version").output()
                            .ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
                        println!("✓ updated → {}   (relaunch the miner)", v); return; }
@@ -2196,7 +2273,7 @@ fn main() {
             if app.cfg.auto_update && avail && auto_update_tried != latest {
                 auto_update_tried = latest.clone();
                 println!("⬆ v{} published — auto-update: pulling + building…", latest);
-                match run_update() { Ok(_) => relaunch(), Err(e) => println!("✗ auto-update failed: {} — still mining on v{}", e, VERSION) }
+                match run_update(&latest) { Ok(_) => relaunch(), Err(e) => println!("✗ auto-update failed: {} — still mining on v{}", e, VERSION) }
             }
         }
     }
@@ -2220,8 +2297,9 @@ fn main() {
     ratatui::restore();
     // confirmed in-app update: the TUI is gone, the user watches git + cargo, then the new binary takes over
     if app.do_update {
-        match run_update() {
-            Ok(_) => { println!("✓ built — relaunching…"); relaunch(); }
+        let latest = stats.lock().unwrap().latest_version.clone();
+        match run_update(&latest) {
+            Ok(_) => { println!("✓ updated — relaunching…"); relaunch(); }
             Err(e) => { eprintln!("✗ update failed: {}\n  update by hand: cd pyblock-miner && git pull && ./build.sh", e); std::process::exit(1); }
         }
     }

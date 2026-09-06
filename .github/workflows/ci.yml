@@ -1,0 +1,119 @@
+# pyblockMiner CI — build + test on Linux (OpenCL), macOS Apple Silicon (Metal) and Windows (OpenCL via MinGW),
+# package a ready-to-run folder per platform, and publish them as a GitHub Release when a `v*` tag is pushed.
+#
+# Package layout (what the miner expects next to its binary):
+#   pyblockMiner[.exe]      the TUI miner
+#   gpu/gpu_grind[.exe]     OpenCL grinder (Linux/Windows)  ·  gpu/metal_grind (macOS)
+#   gpu/blake2b.cl|.metal   the kernel the grinder compiles at start
+#   gpu/libOpenCL.dll       (Windows only) Khronos ICD loader the MinGW grinder links against
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-22.04,   ext: tar.gz }   # 22.04 → older glibc → runs on more distros
+          - { name: macos-arm64,    os: macos-14,       ext: tar.gz }   # Apple Silicon runner → Metal grinder
+          - { name: windows-x86_64, os: windows-latest, ext: zip }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: OpenCL headers + ICD loader (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev opencl-headers
+
+      - name: MSYS2 + OpenCL (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-headers mingw-w64-x86_64-opencl-icd
+
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: ./build.sh
+
+      - name: Build grinder (Windows · MinGW)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -static-libgcc -DCL_TARGET_OPENCL_VERSION=120 gpu/gpu_grind.c -o gpu/gpu_grind.exe -lOpenCL
+          cp /mingw64/bin/libOpenCL.dll gpu/
+          echo "gpu_grind.exe depends on:"; ldd gpu/gpu_grind.exe | grep -vi 'windows/system32' || true
+
+      - name: Build miner (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
+            *)            V="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)-${GITHUB_SHA::7}" ;;
+          esac
+          PKG="pyblockMiner-$V-${{ matrix.name }}"
+          mkdir -p "dist/$PKG/gpu"
+          case "$RUNNER_OS" in
+            Windows) cp target/release/pyblockMiner.exe "dist/$PKG/"; cp gpu/gpu_grind.exe gpu/libOpenCL.dll gpu/blake2b.cl "dist/$PKG/gpu/" ;;
+            macOS)   cp target/release/pyblockMiner "dist/$PKG/";     cp gpu/metal_grind gpu/blake2b.metal "dist/$PKG/gpu/" ;;
+            *)       cp target/release/pyblockMiner "dist/$PKG/";     cp gpu/gpu_grind gpu/blake2b.cl "dist/$PKG/gpu/" ;;
+          esac
+          cp README.md LICENSE "dist/$PKG/"
+          cd dist
+          if [ "${{ matrix.ext }}" = zip ]; then 7z a -tzip "$PKG.zip" "$PKG" > /dev/null; else tar -czf "$PKG.tar.gz" "$PKG"; fi
+          (sha256sum "$PKG.${{ matrix.ext }}" 2>/dev/null || shasum -a 256 "$PKG.${{ matrix.ext }}") > "$PKG.${{ matrix.ext }}.sha256"
+          ls -la
+
+      - name: Smoke test the packaged binary
+        shell: bash
+        run: |
+          set -e
+          cd dist/pyblockMiner-*-${{ matrix.name }}
+          ./pyblockMiner* --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyblockMiner-${{ matrix.name }}
+          path: dist/*.${{ matrix.ext }}*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Combined checksums
+        run: cd dist && cat *.sha256 > SHA256SUMS.txt && ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
