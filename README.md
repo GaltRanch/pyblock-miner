@@ -50,7 +50,7 @@ Prebuilt packages for every release are on the [Releases page](https://github.co
 
 - **Linux** needs the OpenCL ICD loader at runtime (`libOpenCL.so.1` — comes with your GPU driver, or `apt install ocl-icd-libopencl1`).
 - **macOS**: the binary is not notarized; the first run may need `xattr -dr com.apple.quarantine pyblockMiner-*/`.
-- **Windows**: `gpu\libOpenCL.dll` (the Khronos ICD loader) is bundled; your GPU driver provides the actual OpenCL.
+- **Windows**: `gpu\OpenCL.dll` (the Khronos ICD loader) is bundled; your GPU driver provides the actual OpenCL.
 - Verify downloads with `SHA256SUMS.txt`. Release binaries **update themselves**: press `u` twice (or `--update`) and the miner fetches the matching release, swaps itself in place and relaunches.
 
 Building from source is fully supported too:
