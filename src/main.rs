@@ -153,6 +153,7 @@ struct Config {
     #[serde(default = "d_true")] log_file: bool,       // append every log line to <config dir>/miner.log
     #[serde(default)] api_port: u16,                   // 0 = off · else JSON at http://127.0.0.1:<port>/ and Prometheus at /metrics
     #[serde(default)] alerts: AlertCfg,
+    #[serde(default)] auto_update: bool,               // headless: pull + build + relaunch by itself when the pool publishes a newer version
 }
 // ── alerts: what a miner wants to know without watching the screen ──
 #[derive(Serialize, Deserialize, Clone)]
@@ -169,7 +170,7 @@ fn d_true() -> bool { true }
 impl Default for Config {
     fn default() -> Self {
         Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false,
-                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default() }
+                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default(), auto_update: false }
     }
 }
 // worker names travel inside the stratum username → keep them plain: [A-Za-z0-9-_], max 24
@@ -1062,6 +1063,41 @@ fn poll_carousel() -> Option<CarouselInfo> {
     })
 }
 
+// ── in-app update: git pull + build in the checkout this binary was built from, then relaunch ──
+// The binary normally lives at <repo>/target/release/pyblockMiner → walk up to find .git + build.sh/build.bat.
+fn repo_dir() -> Option<PathBuf> {
+    let is_repo = |p: &Path| p.join(".git").exists() && (p.join("build.sh").exists() || p.join("build.bat").exists());
+    if let Ok(exe) = std::env::current_exe() {
+        let mut p = exe.parent().map(|d| d.to_path_buf());
+        for _ in 0..4 { match p { Some(d) => { if is_repo(&d) { return Some(d); } p = d.parent().map(|x| x.to_path_buf()); } None => break } }
+    }
+    let cwd = std::env::current_dir().ok()?;
+    if is_repo(&cwd) { Some(cwd) } else { None }
+}
+// Runs with the TUI already restored so the user sees git + cargo output. Ok = a new binary is in place.
+fn run_update() -> Result<PathBuf, String> {
+    let dir = repo_dir().ok_or("can't find the pyblock-miner checkout (needs .git + build.sh above the binary) — update by hand: git pull && ./build.sh")?;
+    println!("── pyblockMiner update · {} ──", dir.display());
+    let ok = |st: std::io::Result<std::process::ExitStatus>| st.map(|s| s.success()).unwrap_or(false);
+    println!("→ git pull --ff-only");
+    if !ok(Command::new("git").args(["pull", "--ff-only"]).current_dir(&dir).status()) { return Err("git pull failed (local changes? no network?)".into()); }
+    println!("→ build");
+    let built = if cfg!(windows) { ok(Command::new("cmd").args(["/C", "build.bat"]).current_dir(&dir).status()) }
+                else { ok(Command::new("sh").arg("build.sh").current_dir(&dir).status()) };
+    if !built { return Err("build failed — see the output above".into()); }
+    Ok(dir)
+}
+// replace this process with the freshly built binary, same arguments (minus a one-shot --update)
+fn relaunch() -> ! {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "pyblockMiner".into());
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--update").collect();
+    println!("→ relaunching {}", exe.display());
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; let err = Command::new(&exe).args(&args).exec(); eprintln!("relaunch failed: {}", err); std::process::exit(1); }
+    #[cfg(not(unix))]
+    { let code = Command::new(&exe).args(&args).status().map(|s| s.code().unwrap_or(0)).unwrap_or(1); std::process::exit(code); }
+}
+
 // ── local stats API: GET / → JSON · GET /metrics → Prometheus text. 127.0.0.1 only, one tiny HTTP/1.0 server. ──
 fn stats_json(st: &Stats) -> Value {
     let workers: Vec<Value> = st.gpu_names.iter().enumerate().map(|(i, n)| json!({
@@ -1148,6 +1184,8 @@ struct App {
     msg: String,          // transient status line
     paused: Arc<AtomicBool>,   // shared with the engine: `p` toggles pause/resume of mining
     list_scroll: usize,   // ↑↓ offset into the CHIRP coinbase list (MINE + NETWORK tabs)
+    update_armed: bool,   // first `u` arms, second `u` confirms the in-app update (any other key disarms)
+    do_update: bool,      // set by the confirmed `u` → main leaves the TUI and runs the update
 }
 impl App {
     fn network(&self) -> String { self.cfg.stratums.get(self.cfg.selected).map(|s| s.network.clone()).unwrap_or_else(|| "mainnet".into()) }
@@ -1237,6 +1275,7 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
         if st.mode == PoolMode::Chirp && matches!(app.tab, Tab::Mine | Tab::Network) {
             sp.push(Span::styled("↑↓", Style::new().fg(GRN))); sp.push(Span::styled(" coinbase list · ", Style::new().fg(MUT)));
         }
+        if st.update_available { sp.push(bold("u".into(), PNK)); sp.push(Span::styled(format!(" update to v{} · ", st.latest_version), Style::new().fg(PNK))); }
         sp.extend([Span::styled("p", Style::new().fg(GRN)),
                         Span::styled(if st.paused { " resume · " } else { " pause · " }, Style::new().fg(MUT)),
                         Span::styled("q", Style::new().fg(GRN)), Span::styled(" quit", Style::new().fg(MUT))]);
@@ -1306,7 +1345,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
     if st.blake2b_active == Some(false) {
         l1.push(Span::styled(format!("   ⛔ BLAKE2b @ {} ({} to go) — not mining, saving power", st.activation_height, st.blocks_until_act), Style::new().fg(AMB)));
     }
-    if st.update_available { l1.push(bold(format!("   ⬆ v{} — git pull && ./build.sh", st.latest_version), PNK)); }
+    if st.update_available { l1.push(bold(format!("   ⬆ v{} available — press u to update", st.latest_version), PNK)); }
     let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
     let narrow = header_rows(area.width) == 5;
     let mut l2 = vec![dim("your address  "), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
@@ -1723,6 +1762,7 @@ fn render_setup(f: &mut Frame, area: Rect, app: &App) {
                            dim("   (blocks · GPU down/up · pool outage · CHIRP eligibility)")]),
         row("log file", vec![dim(&logp)]),
         row("local api", vec![dim(&api)]),
+        row("updates", vec![dim(&format!("the pool announces new versions → alert + ⬆ in the header · press u to update in-app · headless auto-update {}", onoff(app.cfg.auto_update)))]),
         Line::from(""),
         Line::from([key("g", "generate address   "), key("e", "edit/paste address   "), key("w", "worker name   "), key("c", "toggle CPU   "), key("+/-", "donation")].concat()),
         Line::from([key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "send a test alert")].concat()),
@@ -1765,8 +1805,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(" Update", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
-        l("new version", "the MINE header shows ⬆ v<x> when a newer release is published on the pool"),
-        l("update command", "cd pyblock-miner && git pull && ./build.sh    (then relaunch the miner)"),
+        l("new version", "the pool announces it → you get an alert (bell/desktop/telegram) and ⬆ v<x> in the header"),
+        l("u", "update in-app: press u twice → git pull + build in this checkout, then the miner relaunches itself"),
+        l("--update", "same from the shell, then exits · --auto-update: headless services update + relaunch on their own"),
+        l("by hand", "cd pyblock-miner && git pull && ./build.sh    (then relaunch the miner)"),
         Line::from(""),
         Line::from(vec![Span::styled("  GitHub   ", Style::new().fg(MUT)), Span::styled("github.com/GaltRanch/pyblock-miner", Style::new().fg(CYN))]),
         Line::from(vec![Span::styled("  Pool     ", Style::new().fg(MUT)), Span::styled("pool.pyblock.xyz  ·  MIT licensed", Style::new().fg(CYN))]),
@@ -1817,6 +1859,7 @@ fn gen_address(net: &str) -> Option<(String, String)> {
 
 fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) -> bool {
     app.msg.clear();
+    let update_armed = std::mem::take(&mut app.update_armed);   // only a second consecutive `u` confirms
     // input mode: type into the buffer
     if let Some(kind) = &app.input {
         match code {
@@ -1874,6 +1917,14 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
             let v = !app.paused.load(Ordering::Relaxed);
             app.paused.store(v, Ordering::Relaxed);
             app.msg = if v { "⏸ mining paused — press p to resume".into() } else { "▶ mining resumed".into() };
+        }
+        // in-app update: u arms, u again pulls + builds + relaunches (mining stops for the build, ~1–2 min)
+        KeyCode::Char('u') => {
+            let (avail, latest) = { let st = stats.lock().unwrap(); (st.update_available, st.latest_version.clone()) };
+            if !avail { app.msg = format!("you're on the latest version (v{})", VERSION); }
+            else if repo_dir().is_none() { app.msg = "can't find the git checkout this binary was built from — update by hand: git pull && ./build.sh".into(); }
+            else if update_armed { app.do_update = true; return true; }
+            else { app.update_armed = true; app.msg = format!("⬆ update to v{}: git pull + build + relaunch — mining pauses ~1–2 min · press u again to confirm", latest); }
         }
         _ => match app.tab {
             Tab::Stratums => match code {
@@ -1947,6 +1998,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut cfg = load_config();
     let mut headless = false;
+    let mut update_now = false;
     let mut genaddr_net: Option<String> = None;
     // CLI overrides (optional; config is the source of truth otherwise)
     let mut i = 1;
@@ -1975,6 +2027,8 @@ fn main() {
             "--no-log-file" => { cfg.log_file = false; }
             "--no-bell" => { cfg.alerts.bell = false; }
             "--no-desktop" => { cfg.alerts.desktop = false; }
+            "--auto-update" => { cfg.auto_update = true; }
+            "--update" => { update_now = true; }
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
             "--genaddr" | "--newaddr" => { let n = if i + 1 < args.len() && !args[i + 1].starts_with("--") { i += 1; net_cfg(&args[i]).name.to_string() } else { "mainnet".to_string() }; genaddr_net = Some(n); }
             "--version" | "-V" => { println!("pyblockMiner {}", VERSION); return; }
@@ -2002,10 +2056,19 @@ fn main() {
         }
         return;
     }
+    // --update: pull + build in this checkout, report the new version, exit (no TUI, no mining)
+    if update_now {
+        match run_update() {
+            Ok(_) => { let v = Command::new(std::env::current_exe().unwrap_or_else(|_| "pyblockMiner".into())).arg("--version").output()
+                           .ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                       println!("✓ updated → {}   (relaunch the miner)", v); return; }
+            Err(e) => { eprintln!("✗ update failed: {}", e); std::process::exit(1); }
+        }
+    }
     if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
     let paused = Arc::new(AtomicBool::new(false));   // shared pause flag: `p` toggles, engine idles the grinders
-    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone(), list_scroll: 0 };
+    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone(), list_scroll: 0, update_armed: false, do_update: false };
     app.strat_cur = app.cfg.selected;
 
     // devices — attempt the GPU grinder even if no GPU is name-detected (it enumerates OpenCL/Metal and
@@ -2077,16 +2140,25 @@ fn main() {
         }
     }); }
     // network-stats poller (per current network)
-    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
-        let net = tgt.lock().unwrap().network.clone();
-        match net_stats_url(&net).and_then(poll_network_stats) {
-            Some(ns) => { let mut st = stats.lock().unwrap();
-                st.net_ok = true; st.net_miners = ns.miners; st.net_ghs = ns.ghs; st.net_height = ns.height;
-                st.blake2b_active = ns.blake2b_active; st.activation_height = ns.activation_height; st.blocks_until_act = ns.blocks_until;
-                if !ns.latest.is_empty() { st.update_available = is_newer(&ns.latest, VERSION); st.latest_version = ns.latest; } }
-            None => { stats.lock().unwrap().net_ok = false; }
+    { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || {
+        let mut announced = String::new();   // version already alerted → one alert per new version, not one per poll
+        loop {
+            let net = tgt.lock().unwrap().network.clone();
+            match net_stats_url(&net).and_then(poll_network_stats) {
+                Some(ns) => { let mut st = stats.lock().unwrap();
+                    st.net_ok = true; st.net_miners = ns.miners; st.net_ghs = ns.ghs; st.net_height = ns.height;
+                    st.blake2b_active = ns.blake2b_active; st.activation_height = ns.activation_height; st.blocks_until_act = ns.blocks_until;
+                    if !ns.latest.is_empty() {
+                        st.update_available = is_newer(&ns.latest, VERSION); st.latest_version = ns.latest.clone();
+                        if st.update_available && announced != ns.latest {
+                            announced = ns.latest.clone();
+                            alert(&mut st, &format!("⬆ pyblockMiner v{} available", ns.latest), &format!("you run v{} · press u in the miner to update in-app, or: git pull && ./build.sh", VERSION));
+                        }
+                    } }
+                None => { stats.lock().unwrap().net_ok = false; }
+            }
+            std::thread::sleep(Duration::from_secs(8));   // match blake_stats' ~8s cache so POOL HEIGHT (+ the BLOCK FOUND height) stay fresh on fast chains
         }
-        std::thread::sleep(Duration::from_secs(8));   // match blake_stats' ~8s cache so POOL HEIGHT (+ the BLOCK FOUND height) stay fresh on fast chains
     }); }
     // balance poller (per current network + address)
     { let stats = stats.clone(); let tgt = tgt.clone(); std::thread::spawn(move || loop {
@@ -2104,6 +2176,7 @@ fn main() {
             app.network(), tgt.lock().unwrap().pool, app.addr(), donate0);
         let _ = std::io::stdout().flush();
         let mut last_printed = 0usize;
+        let mut auto_update_tried = String::new();
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let (net, conn, hr, nworkers, blk, acc, rej, neth, bd, newlogs) = {
@@ -2117,6 +2190,14 @@ fn main() {
             println!("{} · {} · {:.1} GH/s ({}w) · blocks {} · {} acc (rej {}) · net_h {} · best {}",
                 net, if conn { "LIVE" } else { "waiting" }, hr, nworkers, blk, acc, rej, neth, fmt_diff(bd));
             let _ = std::io::stdout().flush();
+            // --auto-update: a service that keeps itself current. One attempt per announced version; on failure it
+            // keeps mining on the old build and says so (journald), instead of retrying every 5s.
+            let (avail, latest) = { let st = stats.lock().unwrap(); (st.update_available, st.latest_version.clone()) };
+            if app.cfg.auto_update && avail && auto_update_tried != latest {
+                auto_update_tried = latest.clone();
+                println!("⬆ v{} published — auto-update: pulling + building…", latest);
+                match run_update() { Ok(_) => relaunch(), Err(e) => println!("✗ auto-update failed: {} — still mining on v{}", e, VERSION) }
+            }
         }
     }
 
@@ -2137,6 +2218,13 @@ fn main() {
         }
     }
     ratatui::restore();
+    // confirmed in-app update: the TUI is gone, the user watches git + cargo, then the new binary takes over
+    if app.do_update {
+        match run_update() {
+            Ok(_) => { println!("✓ built — relaunching…"); relaunch(); }
+            Err(e) => { eprintln!("✗ update failed: {}\n  update by hand: cd pyblock-miner && git pull && ./build.sh", e); std::process::exit(1); }
+        }
+    }
 }
 
 #[cfg(test)]

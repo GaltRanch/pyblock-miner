@@ -101,6 +101,12 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | `--telegram <token>,<chat_id>` | off | alerts to a Telegram chat (also SETUP → `t`) |
 | `--webhook <url>` | off | alerts as a JSON `POST {source,title,body,ts}` |
 | `--no-log-file` · `--no-bell` · `--no-desktop` | on | turn off the timestamped `miner.log`, the terminal bell, or desktop notifications |
+| `--update` | | `git pull` + build in this checkout, then exit (same as pressing `u` twice in the app) |
+| `--auto-update` | off | headless services: when the pool announces a newer version, pull + build + relaunch on their own |
+
+### Updates
+
+The pool announces the latest miner version. When yours is older you get an **alert** (bell / desktop / Telegram) and the header shows `⬆ v0.2.x available — press u to update`. Press **`u` twice** and the miner leaves the screen, runs `git pull` and the build in the checkout it was built from, and **relaunches itself** on the new version (mining pauses for the build, one to two minutes). From the shell: `pyblockMiner --update`. For a systemd/headless service, `--auto-update` does it unattended.
 
 ### Alerts, log file, local API
 
