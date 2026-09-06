@@ -99,13 +99,13 @@ impl PoolMode {
     fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Custom => "⛏" } }
     fn accent(self) -> Color { match self { PoolMode::Lotto => YLW, PoolMode::Chirp => PUR, PoolMode::Carousel => WHT, PoolMode::Custom => CYN } }
     fn tagline(self) -> &'static str {
-        match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · weighted split", PoolMode::Carousel => "rotating clean templates", PoolMode::Custom => "custom stratum" }
+        match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · supplier templates", PoolMode::Carousel => "rotating clean templates", PoolMode::Custom => "custom stratum" }
     }
     // who gets paid — one honest line, shown in STRATUMS and in the MINE header
     fn payout(self) -> &'static str {
         match self {
             PoolMode::Lotto    => "every block you find pays YOUR address · you keep 99.1% · PyBLØCK fee 0.9%",
-            PoolMode::Chirp    => "every block is split on-chain among ALL eligible miners by weight · 7-day loyalty · fee 0.9%",
+            PoolMode::Chirp    => "mines the suppliers' clean templates · every block split on-chain among ALL eligible miners by weight · 7-day loyalty · fee 0.9%",
             PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 96% · supplier 3% · PyBLØCK 1%",
             PoolMode::Custom   => "payout rules are the pool operator's — check their site",
         }
@@ -492,10 +492,17 @@ fn cpu_grind(prevhash_hex: &str, ntime_hex: &str, work_root_hex: &str, bits: u32
 struct Daemon {
     child: Child, stdin: ChildStdin, rx: std::sync::mpsc::Receiver<String>,
     name: String, dev: u32, weight: f64, dead: bool, died_at: Instant, since: Instant, fails: u32,
+    err_rx: std::sync::mpsc::Receiver<String>,   // the grinder's stderr (driver errors, crash reasons) → miner.log
+    last_dur: f64,                               // seconds the last completed sweep took → adaptive silence budget
+    timeouts: u32,                               // watchdog kills (silence) — separate from crashes, never escalate
+    retry_secs: u64,                             // when to respawn after the last death
 }
+// crash backoff: 10 · 20 · 40 · 80 · 160 · 300s. Watchdog (silence) kills always retry in 10s — a slow-but-alive GPU
+// must never be parked for minutes (that is what 0.2.20–0.2.24 did to healthy GPUs, e.g. an RTX 4070 Ti SUPER).
+fn crash_backoff(fails: u32) -> u64 { (10u64 << fails.saturating_sub(1).min(5)).min(300) }
 impl Daemon {
-    fn kill(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); self.dead = true; self.weight = 0.0; self.died_at = Instant::now(); }
-    fn retry_in(&self) -> Duration { Duration::from_secs((10u64 << self.fails.saturating_sub(1).min(5)).min(300)) }   // 10 · 20 · 40 · 80 · 160 · 300s
+    fn kill(&mut self, retry_secs: u64) { let _ = self.child.kill(); let _ = self.child.wait(); self.dead = true; self.weight = 0.0; self.died_at = Instant::now(); self.retry_secs = retry_secs; }
+    fn retry_in(&self) -> Duration { Duration::from_secs(self.retry_secs) }
 }
 fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     let mut child = Command::new(gpu_bin())
@@ -508,23 +515,21 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
     // Wait for the grinder's "READY <device>" on stderr before trusting it. Both grinders do all device/
     // kernel setup AFTER exec and exit on failure, so a spawn success alone doesn't mean a working GPU.
     // If it never signals READY (died/hung), drop it → the engine falls back to CPU instead of hashing zero.
+    // stderr is read for the whole life of the grinder (not just the READY line): whatever the driver or the grinder
+    // prints when it dies lands in miner.log next to the "grinder exited" line — that's how a GPU crash gets diagnosed.
     let stderr = child.stderr.take()?;
-    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let got = BufReader::new(stderr).read_line(&mut line).ok().filter(|&n| n > 0).map(|_| line.trim().to_string());
-        let _ = tx.send(got);
-    });
-    match rx.recv_timeout(Duration::from_secs(8)).ok().flatten() {
-        Some(l) if l.starts_with("READY") => {
-            let dn = l.strip_prefix("READY").unwrap_or("").trim();
+    let (etx, err_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || { for l in BufReader::new(stderr).lines() { match l { Ok(l) => { if etx.send(l).is_err() { break; } } Err(_) => break } } });
+    match err_rx.recv_timeout(Duration::from_secs(8)) {
+        Ok(l) if l.trim().starts_with("READY") => {
+            let dn = l.trim().strip_prefix("READY").unwrap_or("").trim();
             let name = if dn.is_empty() { name } else { dn.to_string() };
             let (tx, rx) = std::sync::mpsc::channel::<String>();
             std::thread::spawn(move || { for l in stdout.lines() { match l { Ok(l) => { if tx.send(l).is_err() { break; } } Err(_) => break } } });
             // start with a SMALL assumed rate (50 MH/s) so the first sweep is short on any GPU — the real rate
             // arrives with the first END and sizes the next sweep. (1 GH/s assumed on a slow iGPU = a multi-second
             // first sweep, which the hang watchdog would mistake for a hung driver.)
-            Some(Daemon { child, stdin, rx, name, dev, weight: 0.05, dead: false, died_at: Instant::now(), since: Instant::now(), fails: 0 })
+            Some(Daemon { child, stdin, rx, name, dev, weight: 0.05, dead: false, died_at: Instant::now(), since: Instant::now(), fails: 0, err_rx, last_dur: 0.0, timeouts: 0, retry_secs: 10 })
         }
         _ => { let _ = child.kill(); let _ = child.wait(); None }
     }
@@ -533,7 +538,8 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
 struct Work<'a> { prevhash: &'a str, ntime: &'a str, work_root: &'a str, bits: u32 }
 // Returns (winning nonces, per-GPU GH/s, CPU GH/s, events to log). A GPU that exits or doesn't answer within the
 // deadline is killed + marked dead here; the engine respawns it later (see Daemon).
-fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work, secs: f64) -> (Vec<String>, Vec<f64>, f64, Vec<String>) {
+// events: (log line, alert?) — the FIRST death in a chain alerts, repeats while backing off only log (no alert storms)
+fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work, secs: f64) -> (Vec<String>, Vec<f64>, f64, Vec<(String, bool)>) {
     let space: u64 = 1u64 << 32;
     let gpu_caps: Vec<u64> = ds.iter().map(|d| if d.dead { 0 } else { ((d.weight * 1e9 * secs) as u64).max(1 << 22) }).collect();
     let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
@@ -548,7 +554,8 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work
         cursor += span;
     }
     let mut nonces: Vec<String> = vec![];
-    let mut events: Vec<String> = vec![];
+    let mut events: Vec<(String, bool)> = vec![];
+    let dispatched = Instant::now();   // sweeps run in parallel from here; each GPU's duration is measured from this point
     let mut cpu_ghs = 0.0f64;
     if cpu_threads > 0 && cursor < sweep {
         let cpu_span = sweep - cursor;
@@ -560,34 +567,46 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work
         nonces.extend(won);
     }
     let mut gpu_ghs = vec![0.0f64; ds.len()];
-    // a sweep sized to `secs` that takes 6× longer (+5s slack) is a hung driver, not a slow GPU
-    let deadline = Duration::from_secs_f64(secs * 6.0 + 5.0);
     for (i, d) in ds.iter_mut().enumerate() {
         if d.dead { continue; }   // no job was sent to a dead daemon
-        let t0 = Instant::now();
+        // Hang watchdog. "Hung" means SILENT: every line the grinder sends (a winning nonce, the END) proves it is
+        // alive and resets the clock. The silence budget is generous — 30s, or 10× this GPU's last sweep + 5s —
+        // because killing a GPU that is merely slow (TDR recovery, a shared display, a driver batching launches)
+        // costs far more hashrate than waiting out a real stall. Timing from dispatch with a 7s budget (0.2.20–0.2.24)
+        // killed healthy GPUs mid-sweep and then parked them with an escalating backoff.
+        let budget = Duration::from_secs_f64(30f64.max(d.last_dur * 10.0 + 5.0));
+        let mut last_activity = dispatched;
         loop {
-            let left = deadline.checked_sub(t0.elapsed()).unwrap_or(Duration::ZERO);
+            let left = budget.checked_sub(last_activity.elapsed()).unwrap_or(Duration::ZERO);
             match d.rx.recv_timeout(left) {
                 Ok(line) => {
+                    last_activity = Instant::now();
                     let t = line.trim();
                     if let Some(rest) = t.strip_prefix("END ") {
                         gpu_ghs[i] = rest.parse().unwrap_or(0.0);
                         if gpu_ghs[i] > 0.0 { d.weight = gpu_ghs[i]; }
-                        if d.since.elapsed() > Duration::from_secs(300) { d.fails = 0; }   // stable for 5 min → forget old crashes (backoff resets)
+                        d.last_dur = dispatched.elapsed().as_secs_f64();
+                        if d.since.elapsed() > Duration::from_secs(300) { d.fails = 0; d.timeouts = 0; }   // stable for 5 min → forget old trouble
                         break;
                     } else if !t.is_empty() { nonces.push(t.to_string()); }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    d.kill(); d.fails += 1;
-                    events.push(format!("⚠ {} unresponsive for {:.0}s — killed · respawning in {}s", d.name, deadline.as_secs_f64(), d.retry_in().as_secs()));
+                    d.timeouts += 1; d.kill(10);
+                    events.push((format!("⚠ {} silent for {:.0}s (sweep started {:.0}s ago · last sweep {:.2}s) — killed · respawning in 10s",
+                        d.name, budget.as_secs_f64(), dispatched.elapsed().as_secs_f64(), d.last_dur), d.timeouts == 1));
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    d.kill(); d.fails += 1;
-                    events.push(format!("⚠ {} grinder exited — respawning in {}s", d.name, d.retry_in().as_secs()));
+                    d.fails += 1; d.kill(crash_backoff(d.fails));
+                    events.push((format!("⚠ {} grinder exited (crash #{}) — respawning in {}s", d.name, d.fails, d.retry_in().as_secs()), d.fails == 1));
                     break;
                 }
             }
+        }
+        // whatever the grinder said on stderr since the last sweep (driver errors, the reason it died) → log
+        for l in d.err_rx.try_iter().take(20) {
+            let l: String = l.chars().filter(|c| !c.is_control()).take(200).collect::<String>().trim().to_string();
+            if !l.is_empty() { events.push((format!("  {} stderr: {}", d.name, l), false)); }
         }
     }
     (nonces, gpu_ghs, cpu_ghs, events)
@@ -820,8 +839,10 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 if d.dead && d.died_at.elapsed() >= d.retry_in() {
                     respawn_tried = true;
                     match spawn_daemon(d.dev, d.name.clone()) {
-                        Some(mut nd) => { nd.fails = d.fails; *d = nd; let mut st = stats.lock().unwrap(); alert(&mut st, "GPU back online", &format!("{} is hashing again", d.name)); }
-                        None => { d.died_at = Instant::now(); d.fails += 1;
+                        Some(mut nd) => { nd.fails = d.fails; nd.timeouts = d.timeouts; *d = nd; let mut st = stats.lock().unwrap();
+                                          if d.fails <= 1 && d.timeouts <= 1 { alert(&mut st, "GPU back online", &format!("{} is hashing again", d.name)); }
+                                          else { st.logline(format!("✓ {} back online", d.name)); } }
+                        None => { d.died_at = Instant::now(); d.fails += 1; d.retry_secs = crash_backoff(d.fails);
                                   stats.lock().unwrap().logline(format!("✗ {} still not starting — next try in {}s", d.name, d.retry_in().as_secs())); }
                     }
                 }
@@ -902,7 +923,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             let (nonces, gpu_ghs, cpu_ghs, events) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &work, sweep_secs);
             {
                 let mut st = stats.lock().unwrap();
-                for e in events { alert(&mut st, "GPU down", &e); }
+                for (e, al) in events { if al { alert(&mut st, "GPU down", &e); } else { st.logline(e); } }
                 st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
                 let mut all = gpu_ghs.clone();
                 if cpu_threads > 0 { all.push(cpu_ghs); }
@@ -1484,12 +1505,14 @@ fn mode_panel_rows(st: &Stats, width: u16) -> usize {
     let w = (width.saturating_sub(2) as usize).max(20);
     let wrapped = |len: usize| (len.max(1) + w - 1) / w;   // rows a `len`-char line takes once wrapped
     match st.mode {
-        PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len() + 3).unwrap_or(1),
+        // summary · you · template · rotation (all may wrap) · column header · members
+        PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len() + 1 + wrapped(112) + wrapped(120)
+            + st.carousel.as_ref().map(|k| wrapped(60 + k.recent.iter().rev().take(6).map(|s| s.chars().count() + 3).sum::<usize>())
+                + if w >= 120 { wrapped(rotation_len(k) + 8) } else { 0 }).unwrap_or(2)).unwrap_or(1),
         PoolMode::Carousel => match st.carousel.as_ref() {
             Some(k) => {
-                let rot = 14 + k.suppliers.iter().map(|s| s.chars().count() + 3).sum::<usize>() + 2;
                 let trail = 14 + k.recent.iter().rev().take(10).map(|s| s.chars().count() + 3).sum::<usize>();
-                1 + wrapped(rot) + wrapped(trail) + wrapped(14 + 92)
+                1 + wrapped(rotation_len(k) + 10) + wrapped(trail) + wrapped(14 + 92)
             }
             None => 1,
         },
@@ -1499,7 +1522,7 @@ fn mode_panel_rows(st: &Stats, width: u16) -> usize {
 }
 fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     match st.mode {
-        PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll),
+        PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll, app.tab == Tab::Network),
         PoolMode::Carousel => {
             let upd = st.carousel.as_ref().map(|k| format!(" · updated {} ago", fmt_ago(now_unix().saturating_sub(k.fetched)))).unwrap_or_default();
             f.render_widget(Paragraph::new(Text::from(carousel_lines(st))).wrap(Wrap { trim: false })
@@ -1527,18 +1550,22 @@ fn lotto_lines(st: &Stats) -> Vec<Line<'static>> {
         Line::from(vec![dim("  payout       "), Span::styled("you keep 99.1% · PyBLØCK fee 0.9% · non-custodial", Style::new().fg(PNK))]),
     ]
 }
+// the wheel: every supplier in the rotation, the live one lit (shared by the CAROUSEL and CHIRP panels)
+fn rotation_spans(k: &CarouselInfo) -> Vec<Span<'static>> {
+    let mut rot = vec![dim("  rotation  ")];
+    for (i, s) in k.suppliers.iter().enumerate() {
+        if i > 0 { rot.push(Span::styled(" · ", Style::new().fg(DIM))); }
+        if *s == k.current { rot.push(bold(format!("▶ {}", s), WHT)); } else { rot.push(dim(s)); }
+    }
+    rot
+}
+fn rotation_len(k: &CarouselInfo) -> usize { 12 + k.suppliers.iter().map(|s| s.chars().count() + 3).sum::<usize>() + 2 }
 fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
     let Some(k) = st.carousel.as_ref() else { return vec![Line::from(dim("  loading the rotation from the pool…"))]; };
     let mut out = vec![Line::from(vec![dim("  now mining  "),
         bold(if k.current.is_empty() { "—".to_string() } else { format!("{}'s clean template", k.current) }, WHT),
         dim(&format!("   · {} suppliers · {} miners · {}{}", k.suppliers.len(), k.miners, fmt_ths(k.hashrate_ths), if k.live { "" } else { " · rotation paused" }))])];
-    // the wheel: every supplier in the rotation, the live one lit
-    let mut rot = vec![dim("  rotation    ")];
-    for (i, s) in k.suppliers.iter().enumerate() {
-        if i > 0 { rot.push(Span::styled(" · ", Style::new().fg(DIM))); }
-        if *s == k.current { rot.push(bold(format!("▶ {}", s), WHT)); } else { rot.push(dim(s)); }
-    }
-    out.push(Line::from(rot));
+    out.push(Line::from(rotation_spans(k)));
     // recent is oldest → newest; show the last few so the trail ends at what's being mined now
     let trail: Vec<String> = k.recent.iter().rev().take(10).rev().cloned().collect();
     out.push(Line::from(vec![dim("  recent      "), Span::styled(trail.join(" › "), Style::new().fg(Color::Rgb(150, 150, 165)))]));
@@ -1555,7 +1582,7 @@ fn chirp_btc_per_day(st: &Stats, c: &ChirpInfo, pct: f64) -> f64 {
 fn fmt_btc(x: f64) -> String { if x <= 0.0 { "—".into() } else if x < 1e-4 { format!("{:.0} sats", x * 1e8) } else { format!("{:.5} BTC", x) } }
 // ── CHIRP: EVERY miner in the coinbase draw — rank · address · tenure · power · share of the next block · status.
 //    Your row is marked ▶. Eligible miners first (by weight), then the ones still earning their 7 days. ↑↓ scrolls. ──
-fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
+fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize, full_view: bool) {
     let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let Some(c) = st.chirp.as_ref() else {
@@ -1586,8 +1613,28 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
                 m.days, c.min_days, bar(m.days / c.min_days.max(0.1), 10)), Style::new().fg(AMB))]),
         None => Line::from(vec![dim("  you  "), dim(&format!("not in the draw yet — mine here {:.0} days to enter · the pool lists you once it sees your shares", c.min_days))]),
     });
-    head.push(Line::from(Span::styled(format!("    {:>2}  {:<aw$}  {:>7}  {}{:<10} {:>7}   STATUS", "#", "MINER", "TENURE",
-        if show_power { format!("{:>9}  ", "POWER 24h") } else { String::new() }, "SHARE", "", aw = aw), Style::new().fg(DIM))));
+    // CHIRP + CAROUSEL: the syndicate mines the suppliers' clean templates — say which one is live right now
+    head.push(match st.carousel.as_ref() {
+        Some(k) if !k.current.is_empty() => {
+            let trail: Vec<String> = k.recent.iter().rev().take(6).rev().cloned().collect();
+            Line::from(vec![dim("  template  "), bold(format!("▶ {}", k.current), WHT),
+                dim(&format!("'s clean template · {} suppliers in rotation · recent {}", k.suppliers.len(), trail.join(" › ")))])
+        }
+        _ => Line::from(vec![dim("  template  "), dim("loading the supplier rotation…")]),
+    });
+    // the whole rotation, the live template lit — wraps over as many rows as it needs
+    // MINE on a narrow terminal: the full wheel would eat the member list — the `template` line above already
+    // names the live one; NETWORK (full) and wide terminals get the whole rotation.
+    if full_view || inner_w >= 120 {
+        match st.carousel.as_ref() {
+            Some(k) if !k.suppliers.is_empty() => head.push(Line::from(rotation_spans(k))),
+            _ => head.push(Line::from(vec![dim("  rotation  "), dim("—")])),
+        }
+    }
+    // rows the head takes once wrapped (word-wrap can spill one extra row per line → +8 chars of slack each)
+    let head_h: usize = head.iter().map(|l| (l.width() + 8 + inner_w - 1) / inner_w.max(1)).sum();
+    let col_header = Line::from(Span::styled(format!("    {:>2}  {:<aw$}  {:>7}  {}{:<10} {:>7}   STATUS", "#", "MINER", "TENURE",
+        if show_power { format!("{:>9}  ", "POWER 24h") } else { String::new() }, "SHARE", "", aw = aw), Style::new().fg(DIM)));
     // ── rows ──
     let rows: Vec<Line<'static>> = c.members.iter().enumerate().map(|(i, m)| {
         let is_me = !st.addr.is_empty() && m.addr == st.addr;
@@ -1615,14 +1662,19 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
         if is_me { sp.push(bold("  you".into(), PUR)); }
         Line::from(sp)
     }).collect();
-    // ── scroll window ──
-    let vis = inner_h.saturating_sub(head.len());
+    // ── scroll window (the head wraps; the member rows never do, so the offsets stay exact) ──
+    let vis = inner_h.saturating_sub(head_h + 1);
     let off = scroll.min(rows.len().saturating_sub(vis));
     let shown: Vec<Line<'static>> = rows.iter().skip(off).take(vis).cloned().collect();
     let scroll_hint = if rows.len() > vis && vis > 0 { format!(" · ↑↓ {}–{} of {}", off + 1, (off + vis).min(rows.len()), rows.len()) } else { String::new() };
     let title = format!("🌌 CHIRP · who is in the coinbase · {} miners{} · updated {} ago", c.members.len(), scroll_hint, fmt_ago(now.saturating_sub(c.fetched)));
-    let mut lines = head; lines.extend(shown);
-    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&title, PUR)), area);
+    let block = card(&title, PUR);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let parts = Layout::vertical([Constraint::Length(head_h as u16), Constraint::Min(0)]).split(inner);
+    f.render_widget(Paragraph::new(Text::from(head)).wrap(Wrap { trim: false }), parts[0]);
+    let mut body = vec![col_header]; body.extend(shown);
+    f.render_widget(Paragraph::new(Text::from(body)), parts[1]);
 }
 
 // human-readable duration (for uptime + solo-lottery ETA)
@@ -1732,7 +1784,7 @@ fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(if s.custom { "custom  " } else { "        " }, Style::new().fg(DIM)),
             Span::styled(if active { "● LIVE" } else { "" }, Style::new().fg(GRN)),
         ]);
-        let mut l2 = Line::from(vec![Span::raw("      "), Span::styled(format!("{:<28}", m.tagline()), Style::new().fg(ac)), dim(m.payout())]);
+        let mut l2 = Line::from(vec![Span::raw("      "), Span::styled(format!("{:<30}  ", m.tagline()), Style::new().fg(ac)), dim(m.payout())]);
         if cur { l1 = l1.style(row_bg); l2 = l2.style(row_bg); }
         items.push(ListItem::new(Text::from(vec![l1, l2, Line::from("")])));
     }
@@ -1748,7 +1800,7 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
         ("What is this?", vec![
             "pyblockMiner mines Bitcoin BLAKE2b — the Proof-of-Work change born in Bitcoin Knots PR #359, now LIVE on mainnet.",
             "You mine to YOUR OWN address, non-custodial — the pool never holds your coins. Three pools, one chain:",
-            "LOTTO (solo, keep 99.1%) · CHIRP (syndicate, every block split by weight) · CAROUSEL (rotating clean templates).",
+            "LOTTO (solo, keep 99.1%) · CHIRP (syndicate: every block split by weight, mining the suppliers' clean templates) · CAROUSEL (rotating templates, solo).",
             "",
             "It saturates your GPU (NVIDIA / AMD / Intel via OpenCL on Linux & Windows, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
         ]),
@@ -2188,7 +2240,9 @@ fn main() {
                 match mode {
                     PoolMode::Chirp => {
                         let r = poll_chirp();
+                        let k = poll_carousel();   // CHIRP mines the suppliers' templates too → show the live rotation
                         let mut st = stats.lock().unwrap();
+                        if st.mode == PoolMode::Chirp && k.is_some() { st.carousel = k; }
                         if st.mode == PoolMode::Chirp { if let Some(c) = r {
                             let now = now_unix();
                             let me = c.me(&st.addr).map(|m| (m.eligible, now.saturating_sub(m.last_seen) > 3600, m.days));
