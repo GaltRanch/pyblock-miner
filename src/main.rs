@@ -24,6 +24,16 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph, Sparkline, 
 const DONATE_POOL: &str = "pool.pyblock.xyz:4445";
 const DEV_DONATION_ADDR: &str = "1PyBLoCKdiaC46vD9CWcmxa3ey2VzSc5Q2";
 const DONATE_MIN: f64 = 2.0;
+// ── coinbase splits, in basis points (source of truth for what the miner shows) ──
+//    LOTTO    : you 99.1% · PyBLØCK 0.9%
+//    CHIRP    : syndicate (weighted split) 98% · template supplier 1% · PyBLØCK 1%
+//    CAROUSEL : finder 96% · template supplier 3% · PyBLØCK 1%
+//    chirp_api `fee_bps` still reports the old 0.9% and has no supplier field; once the pool publishes BOTH
+//    `fee_bps` and `supplier_bps` (or template_bps / supplier_fee_bps) the API values take over.
+const POOL_FEE_BPS: u64 = 90;          // LOTTO pool fee
+const CHIRP_FEE_BPS: u64 = 100;        // PyBLØCK on CHIRP blocks
+const CHIRP_SUPPLIER_BPS: u64 = 100;   // template supplier on CHIRP blocks
+fn pct(bps: u64) -> String { let v = bps as f64 / 100.0; if v.fract().abs() < 1e-9 { format!("{:.0}%", v) } else { format!("{:.1}%", v) } }
 const VERSION: &str = env!("CARGO_PKG_VERSION");   // from Cargo.toml — shown in TUI footer, --version, and the stratum UA
 
 // PyBLØCK palette
@@ -101,19 +111,20 @@ impl PoolMode {
     fn tagline(self) -> &'static str {
         match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · supplier templates", PoolMode::Carousel => "rotating clean templates", PoolMode::Custom => "custom stratum" }
     }
-    // who gets paid — one honest line, shown in STRATUMS and in the MINE header
-    fn payout(self) -> &'static str {
+    // who gets paid — one honest line, shown in STRATUMS and in the MINE header (numbers come from the constants above)
+    fn payout(self) -> String {
         match self {
-            PoolMode::Lotto    => "every block you find pays YOUR address · you keep 99.1% · PyBLØCK fee 0.9%",
-            PoolMode::Chirp    => "mines the suppliers' clean templates · every block split on-chain among ALL eligible miners by weight · 7-day loyalty · fee 0.9%",
-            PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 96% · supplier 3% · PyBLØCK 1%",
-            PoolMode::Custom   => "payout rules are the pool operator's — check their site",
+            PoolMode::Lotto    => format!("every block you find pays YOUR address · you keep {} · PyBLØCK fee {}", pct(10_000 - POOL_FEE_BPS), pct(POOL_FEE_BPS)),
+            PoolMode::Chirp    => format!("{} of every block split among ALL eligible miners by weight · suppliers' templates · supplier {} · PyBLØCK {} · 7d loyalty", pct(10_000 - CHIRP_FEE_BPS - CHIRP_SUPPLIER_BPS), pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)),
+            PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 96% · supplier 3% · PyBLØCK 1%".into(),
+            PoolMode::Custom   => "payout rules are the pool operator's — check their site".into(),
         }
     }
-    fn payout_short(self) -> &'static str {
+    fn payout_short(self) -> String {
         match self {
-            PoolMode::Lotto => "keep 99.1% · fee 0.9%", PoolMode::Chirp => "weighted split · fee 0.9%",
-            PoolMode::Carousel => "keep 96% · supplier 3% · fee 1%", PoolMode::Custom => "operator's rules",
+            PoolMode::Lotto => format!("keep {} · fee {}", pct(10_000 - POOL_FEE_BPS), pct(POOL_FEE_BPS)),
+            PoolMode::Chirp => format!("syndicate keeps {} · supplier {} · fee {}", pct(10_000 - CHIRP_FEE_BPS - CHIRP_SUPPLIER_BPS), pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)),
+            PoolMode::Carousel => "keep 96% · supplier 3% · fee 1%".into(), PoolMode::Custom => "operator's rules".into(),
         }
     }
 }
@@ -125,9 +136,12 @@ struct ChirpMember { addr: String, days: f64, power: f64, weight: f64, eligible:
 struct ChirpInfo {
     members: Vec<ChirpMember>,   // sorted: eligible by weight desc, then the rest by tenure desc
     candidates: u64, workers: u64, blocks: u64, hashrate_ths: f64, min_days: f64, min_power: f64,
-    reward_sats: u64, height: u64, fee_bps: u64, fetched: u64,
+    reward_sats: u64, height: u64, fee_bps: u64, supplier_bps: u64, fetched: u64,
 }
 impl ChirpInfo {
+    // what an eligible miner keeps of their slice after the pool fee and the template supplier's cut
+    fn keep(&self) -> f64 { 1.0 - (self.fee_bps + self.supplier_bps) as f64 / 10_000.0 }
+    fn fee_text(&self) -> String { format!("supplier {} · PyBLØCK fee {}", pct(self.supplier_bps), pct(self.fee_bps)) }
     fn sum_weight(&self) -> f64 { self.members.iter().filter(|m| m.eligible).map(|m| m.weight).sum() }
     fn me(&self, addr: &str) -> Option<&ChirpMember> { if addr.is_empty() { None } else { self.members.iter().find(|m| m.addr == addr) } }
     // your share of the next coinbase (0..100) — only if you're eligible
@@ -1047,7 +1061,7 @@ fn poll_chirp() -> Option<ChirpInfo> {
     }).collect();
     let f = |a: f64, b: f64| b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal);
     members.sort_by(|a, b| b.eligible.cmp(&a.eligible).then(f(a.weight, b.weight)).then(f(a.days, b.days)));
-    let mut info = ChirpInfo { members, fetched: now_unix(), min_days: 7.0, ..Default::default() };
+    let mut info = ChirpInfo { members, fetched: now_unix(), min_days: 7.0, fee_bps: CHIRP_FEE_BPS, supplier_bps: CHIRP_SUPPLIER_BPS, ..Default::default() };
     if let Some(p) = get_json(&format!("{}?mode=pool&chain=blake2b", CHIRP_API), 8) {
         info.candidates = p.get("candidates").and_then(|x| x.as_u64()).unwrap_or(0);
         info.workers = p.get("workers").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1061,7 +1075,10 @@ fn poll_chirp() -> Option<ChirpInfo> {
     if let Some(c) = get_json(&format!("{}?mode=coinbase&chain=blake2b", CHIRP_API), 8) {
         info.reward_sats = c.get("reward_sats").and_then(|x| x.as_u64()).unwrap_or(0);
         info.height = c.get("height").and_then(|x| x.as_u64()).unwrap_or(0);
-        info.fee_bps = c.get("fee_bps").and_then(|x| x.as_u64()).unwrap_or(90);
+        // the API's split is trusted only once it describes the whole split (pool fee AND supplier cut); a lone
+        // `fee_bps` is the pre-template-era value and would understate the fees
+        let api_supplier = ["supplier_bps", "template_bps", "supplier_fee_bps"].iter().find_map(|k| c.get(*k).and_then(|x| x.as_u64()));
+        if let (Some(s), Some(f)) = (api_supplier, c.get("fee_bps").and_then(|x| x.as_u64())) { info.supplier_bps = s; info.fee_bps = f; }
     }
     Some(info)
 }
@@ -1451,10 +1468,10 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
                     None => Span::styled("not in the coinbase draw yet · mine here to enter", Style::new().fg(AMB)),
                 },
             });
-            l2.push(dim(" · fee 0.9%"));
+            l2.push(dim(&match st.chirp.as_ref() { Some(c) => format!(" · {}", c.fee_text()), None => format!(" · supplier {} · fee {}", pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)) }));
         }
-        PoolMode::Custom => l2.push(dim(m.payout_short())),
-        _ => l2.push(Span::styled(m.payout_short().to_string(), Style::new().fg(PNK))),
+        PoolMode::Custom => l2.push(dim(&m.payout_short())),
+        _ => l2.push(Span::styled(m.payout_short(), Style::new().fg(PNK))),
     }
     if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
     let lines = if narrow { vec![Line::from(l1), Line::from(l3), Line::from(l2)] } else { vec![Line::from(l1), Line::from(l2)] };
@@ -1477,7 +1494,7 @@ fn render_net_tiles(f: &mut Frame, area: Rect, st: &Stats) {
     match (st.mode, st.chirp.as_ref(), st.carousel.as_ref()) {
         (PoolMode::Chirp, Some(c), _) => {
             let reward = c.reward_sats as f64 / 1e8;
-            let cut = c.my_pct(&st.addr).map(|p| format!("your cut ≈ {:.5} BTC", reward * p / 100.0 * (1.0 - c.fee_bps as f64 / 10_000.0)))
+            let cut = c.my_pct(&st.addr).map(|p| format!("your cut ≈ {:.5} BTC", reward * p / 100.0 * c.keep()))
                 .unwrap_or_else(|| "split by weight among eligible miners".into());
             f.render_widget(tile("◈ IN THE COINBASE", Line::from(bold(format!("{}", c.candidates), PUR)), &format!("eligible miners · {} workers", c.workers), PUR), r[0]);
             f.render_widget(tile("◈ SYNDICATE HASHRATE", Line::from(bold(fmt_ths(c.hashrate_ths), PUR)), &format!("{} blocks found together", c.blocks), PUR), r[1]);
@@ -1505,10 +1522,9 @@ fn mode_panel_rows(st: &Stats, width: u16) -> usize {
     let w = (width.saturating_sub(2) as usize).max(20);
     let wrapped = |len: usize| (len.max(1) + w - 1) / w;   // rows a `len`-char line takes once wrapped
     match st.mode {
-        // summary · you · template · rotation (all may wrap) · column header · members
-        PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len() + 1 + wrapped(112) + wrapped(120)
-            + st.carousel.as_ref().map(|k| wrapped(60 + k.recent.iter().rev().take(6).map(|s| s.chars().count() + 3).sum::<usize>())
-                + if w >= 120 { wrapped(rotation_len(k) + 8) } else { 0 }).unwrap_or(2)).unwrap_or(1),
+        // summary · you · template (each may wrap) · column header · members
+        PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len() + 1 + wrapped(140) + wrapped(120)
+            + st.carousel.as_ref().map(|k| wrapped(48 + k.current.chars().count() * 2 + k.recent.iter().rev().take(6).map(|s| s.chars().count() + 3).sum::<usize>())).unwrap_or(1)).unwrap_or(1),
         PoolMode::Carousel => match st.carousel.as_ref() {
             Some(k) => {
                 let trail = 14 + k.recent.iter().rev().take(10).map(|s| s.chars().count() + 3).sum::<usize>();
@@ -1522,7 +1538,7 @@ fn mode_panel_rows(st: &Stats, width: u16) -> usize {
 }
 fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     match st.mode {
-        PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll, app.tab == Tab::Network),
+        PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll),
         PoolMode::Carousel => {
             let upd = st.carousel.as_ref().map(|k| format!(" · updated {} ago", fmt_ago(now_unix().saturating_sub(k.fetched)))).unwrap_or_default();
             f.render_widget(Paragraph::new(Text::from(carousel_lines(st))).wrap(Wrap { trim: false })
@@ -1532,7 +1548,7 @@ fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
             .block(card("🎰 LOTTO · solo lottery", YLW)), area),
         PoolMode::Custom => f.render_widget(Paragraph::new(Text::from(vec![
             Line::from(vec![dim("  stratum  "), Span::styled(st.endpoint.clone(), Style::new().fg(WHT))]),
-            Line::from(vec![dim("  payout   "), dim(PoolMode::Custom.payout())]),
+            Line::from(vec![dim("  payout   "), dim(&PoolMode::Custom.payout())]),
         ])).block(card("⛏ CUSTOM STRATUM", CYN)), area),
     }
 }
@@ -1547,7 +1563,7 @@ fn lotto_lines(st: &Stats) -> Vec<Line<'static>> {
         } else {
             Line::from(vec![dim("  your odds    "), dim("waiting for hashrate + a network target to estimate your time-to-block…")])
         },
-        Line::from(vec![dim("  payout       "), Span::styled("you keep 99.1% · PyBLØCK fee 0.9% · non-custodial", Style::new().fg(PNK))]),
+        Line::from(vec![dim("  payout       "), Span::styled(format!("you keep {} · PyBLØCK fee {} · non-custodial", pct(10_000 - POOL_FEE_BPS), pct(POOL_FEE_BPS)), Style::new().fg(PNK))]),
     ]
 }
 // the wheel: every supplier in the rotation, the live one lit (shared by the CAROUSEL and CHIRP panels)
@@ -1560,6 +1576,20 @@ fn rotation_spans(k: &CarouselInfo) -> Vec<Span<'static>> {
     rot
 }
 fn rotation_len(k: &CarouselInfo) -> usize { 12 + k.suppliers.iter().map(|s| s.chars().count() + 3).sum::<usize>() + 2 }
+// compact template line (CHIRP): `🎠 template  Mooseman   Iowa Mining › John Galt › PyBLOCK Crew › ▶ Mooseman   · 26 suppliers`
+fn template_spans(k: Option<&CarouselInfo>) -> Vec<Span<'static>> {
+    let Some(k) = k.filter(|k| !k.current.is_empty()) else { return vec![dim("  🎠 template  "), dim("loading the supplier rotation…")]; };
+    let mut trail: Vec<String> = k.recent.iter().rev().take(6).rev().cloned().collect();
+    if trail.last() == Some(&k.current) { trail.pop(); }   // the trail ENDS at the live one — don't print it twice
+    let mut sp = vec![dim("  🎠 template  "), bold(k.current.clone(), WHT), Span::raw("   ")];
+    if !trail.is_empty() {
+        sp.push(Span::styled(trail.join(" › "), Style::new().fg(Color::Rgb(150, 150, 165))));
+        sp.push(Span::styled(" › ", Style::new().fg(DIM)));
+    }
+    sp.push(bold(format!("▶ {}", k.current), WHT));
+    sp.push(dim(&format!("   · {} suppliers on the wheel", k.suppliers.len())));
+    sp
+}
 fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
     let Some(k) = st.carousel.as_ref() else { return vec![Line::from(dim("  loading the rotation from the pool…"))]; };
     let mut out = vec![Line::from(vec![dim("  now mining  "),
@@ -1577,12 +1607,12 @@ fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
 fn chirp_btc_per_day(st: &Stats, c: &ChirpInfo, pct: f64) -> f64 {
     let eta = eta_to_block(st.net_nbits, c.hashrate_ths * 1e3);
     if !eta.is_finite() || eta <= 0.0 || c.reward_sats == 0 { return 0.0; }
-    (86_400.0 / eta) * (c.reward_sats as f64 / 1e8) * pct / 100.0 * (1.0 - c.fee_bps as f64 / 10_000.0)
+    (86_400.0 / eta) * (c.reward_sats as f64 / 1e8) * pct / 100.0 * c.keep()
 }
 fn fmt_btc(x: f64) -> String { if x <= 0.0 { "—".into() } else if x < 1e-4 { format!("{:.0} sats", x * 1e8) } else { format!("{:.5} BTC", x) } }
 // ── CHIRP: EVERY miner in the coinbase draw — rank · address · tenure · power · share of the next block · status.
 //    Your row is marked ▶. Eligible miners first (by weight), then the ones still earning their 7 days. ↑↓ scrolls. ──
-fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize, full_view: bool) {
+fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
     let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let Some(c) = st.chirp.as_ref() else {
@@ -1594,7 +1624,7 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize, full
     let aw = if full { 62 } else { 13 };
     let sum = c.sum_weight(); let now = now_unix();
     let reward = c.reward_sats as f64 / 1e8;
-    let keep = 1.0 - c.fee_bps as f64 / 10_000.0;
+    let keep = c.keep();
     let soft = Color::Rgb(120, 80, 170);
     // bars are relative to the leader (leader = full bar) so the distribution reads at a glance; the % is the truth
     let top_w = c.members.iter().filter(|m| m.eligible).map(|m| m.weight).fold(0.0f64, f64::max).max(1e-9);
@@ -1602,7 +1632,7 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize, full
     let mut head: Vec<Line<'static>> = vec![Line::from(vec![
         bold(format!("  {} ", c.candidates), PUR), dim("eligible miners share every block · "),
         Span::styled(fmt_ths(c.hashrate_ths), Style::new().fg(WHT)),
-        dim(&format!(" · {} workers · {} blocks · last reward {}", c.workers, c.blocks, if reward > 0.0 { format!("{:.4} BTC", reward) } else { "—".into() })),
+        dim(&format!(" · {} workers · {} blocks · last reward {} · {}", c.workers, c.blocks, if reward > 0.0 { format!("{:.4} BTC", reward) } else { "—".into() }, c.fee_text())),
     ])];
     head.push(match c.me(&st.addr) {
         Some(m) if m.eligible => { let p = if sum > 0.0 { m.weight / sum * 100.0 } else { 0.0 };
@@ -1613,24 +1643,9 @@ fn render_chirp_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize, full
                 m.days, c.min_days, bar(m.days / c.min_days.max(0.1), 10)), Style::new().fg(AMB))]),
         None => Line::from(vec![dim("  you  "), dim(&format!("not in the draw yet — mine here {:.0} days to enter · the pool lists you once it sees your shares", c.min_days))]),
     });
-    // CHIRP + CAROUSEL: the syndicate mines the suppliers' clean templates — say which one is live right now
-    head.push(match st.carousel.as_ref() {
-        Some(k) if !k.current.is_empty() => {
-            let trail: Vec<String> = k.recent.iter().rev().take(6).rev().cloned().collect();
-            Line::from(vec![dim("  template  "), bold(format!("▶ {}", k.current), WHT),
-                dim(&format!("'s clean template · {} suppliers in rotation · recent {}", k.suppliers.len(), trail.join(" › ")))])
-        }
-        _ => Line::from(vec![dim("  template  "), dim("loading the supplier rotation…")]),
-    });
-    // the whole rotation, the live template lit — wraps over as many rows as it needs
-    // MINE on a narrow terminal: the full wheel would eat the member list — the `template` line above already
-    // names the live one; NETWORK (full) and wide terminals get the whole rotation.
-    if full_view || inner_w >= 120 {
-        match st.carousel.as_ref() {
-            Some(k) if !k.suppliers.is_empty() => head.push(Line::from(rotation_spans(k))),
-            _ => head.push(Line::from(vec![dim("  rotation  "), dim("—")])),
-        }
-    }
+    // CHIRP + CAROUSEL: the syndicate mines the suppliers' clean templates. One quiet line: the live template in
+    // bold, then the path the rotation took to get here (oldest › … › now), then how many suppliers are on the wheel.
+    head.push(Line::from(template_spans(st.carousel.as_ref())));
     // rows the head takes once wrapped (word-wrap can spill one extra row per line → +8 chars of slack each)
     let head_h: usize = head.iter().map(|l| (l.width() + 8 + inner_w - 1) / inner_w.max(1)).sum();
     let col_header = Line::from(Span::styled(format!("    {:>2}  {:<aw$}  {:>7}  {}{:<10} {:>7}   STATUS", "#", "MINER", "TENURE",
@@ -1784,7 +1799,7 @@ fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(if s.custom { "custom  " } else { "        " }, Style::new().fg(DIM)),
             Span::styled(if active { "● LIVE" } else { "" }, Style::new().fg(GRN)),
         ]);
-        let mut l2 = Line::from(vec![Span::raw("      "), Span::styled(format!("{:<30}  ", m.tagline()), Style::new().fg(ac)), dim(m.payout())]);
+        let mut l2 = Line::from(vec![Span::raw("      "), Span::styled(format!("{:<30}  ", m.tagline()), Style::new().fg(ac)), dim(&m.payout())]);
         if cur { l1 = l1.style(row_bg); l2 = l2.style(row_bg); }
         items.push(ListItem::new(Text::from(vec![l1, l2, Line::from("")])));
     }
@@ -1909,9 +1924,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("--worker NAME", "login as addr.NAME so the pool tells your rigs apart"),
         Line::from(""),
         Line::from(Span::styled(" Pools — same BLAKE2b chain, three ways to get paid", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
-        l("🎰 LOTTO :4445", PoolMode::Lotto.payout()),
-        l("🌌 CHIRP :5574", PoolMode::Chirp.payout()),
-        l("🎠 CAROUSEL :30110", PoolMode::Carousel.payout()),
+        l("🎰 LOTTO :4445", &PoolMode::Lotto.payout()),
+        l("🌌 CHIRP :5574", &PoolMode::Chirp.payout()),
+        l("🎠 CAROUSEL :30110", &PoolMode::Carousel.payout()),
         l("coinbase panel", "MINE shows who the next block pays: CHIRP lists every eligible miner + share; CAROUSEL the live template"),
         Line::from(""),
         Line::from(Span::styled(" Troubleshooting", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
