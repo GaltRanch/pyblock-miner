@@ -59,6 +59,11 @@ const PUR: Color = Color::Rgb(185, 107, 255);   // CHIRP accent — the pool sit
 const WHT: Color = Color::Rgb(236, 236, 244);   // CAROUSEL accent + primary values (soft white)
 const DIM: Color = Color::Rgb(58, 70, 58);      // quiet card borders — the frame recedes, the numbers speak
 const BLU: Color = Color::Rgb(53, 199, 224);    // WAVICLES accent — brand cyan #35C7E0 (the Dagaz rune ᛞ; never water, never a wave)
+// The WAVICLES mark is the Dagaz rune ᛞ (two staves joined by an X). A terminal can only show characters, and U+16DE
+// (Runic block) is missing from most monospace fonts (SF Mono, Menlo, Fira Code…) → a "missing glyph" box. ⋈ (U+22C8,
+// bowtie) has the same shape and ships in practically every font, so it is the default; `--rune unicode` picks the real ᛞ.
+static REAL_RUNE: AtomicBool = AtomicBool::new(false);
+fn rune() -> &'static str { if REAL_RUNE.load(Ordering::Relaxed) { "ᛞ" } else { "⋈" } }
 
 // ── network config: mainnet | testnet4 | regtest ──
 struct NetCfg { name: &'static str, donate: bool }
@@ -103,7 +108,7 @@ fn default_stratums() -> Vec<Stratum> {
         Stratum { name: "WAVICLES · your node (DATUM)".into(), url: WAVICLES_PLACEHOLDER.into(), network: "mainnet".into(), custom: false },
         // the house gateway: PyBLØCK's node builds the block, you still get paid by the TIDES window. vardiff_min 4096 →
         // ASICs only today (a GPU would not submit a share for hours); a diff-1 twin for GPUs is the pool's call.
-        Stratum { name: "WAVICLES · via PyBLØCK's node (ASIC)".into(), url: "b.pyblock.xyz:23114".into(), network: "mainnet".into(), custom: false },
+        Stratum { name: "WAVICLES · PyBLØCK's node (ASIC)".into(), url: "b.pyblock.xyz:23114".into(), network: "mainnet".into(), custom: false },
     ]
 }
 
@@ -128,7 +133,7 @@ fn pool_mode(url: &str, name: &str) -> PoolMode {
 }
 impl PoolMode {
     fn label(self) -> &'static str { match self { PoolMode::Lotto => "LOTTO", PoolMode::Chirp => "CHIRP", PoolMode::Carousel => "CAROUSEL", PoolMode::Wavicles => "WAVICLES", PoolMode::Custom => "CUSTOM" } }
-    fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Wavicles => "ᛞ", PoolMode::Custom => "⛏" } }
+    fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Wavicles => rune(), PoolMode::Custom => "⛏" } }
     fn accent(self) -> Color { match self { PoolMode::Lotto => YLW, PoolMode::Chirp => PUR, PoolMode::Carousel => WHT, PoolMode::Wavicles => BLU, PoolMode::Custom => CYN } }
     fn tagline(self) -> &'static str {
         match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · supplier templates", PoolMode::Carousel => "rotating clean templates",
@@ -193,6 +198,17 @@ impl WaviclesInfo {
     }
     fn to_window_sats(&self) -> u64 { self.miners.iter().map(|m| m.payout_sats).sum() }
 }
+// ── a GPU group as the UI sees it: which workers, which pool, how it's doing ──
+#[derive(Clone, Default)]
+struct SessionView { name: String, pool: String, mode: PoolMode, workers: Vec<usize>, pcts: Vec<f64>, connected: bool, wrong_algo: bool, hr: f64, acc: u64, rej: u64, diff: f64,
+                     note: String }   // why it isn't mining, in one phrase ("no gateway address — STRATUMS → Enter", "unreachable · retry in 12s")
+impl Stats {
+    fn session_of(&self, worker: usize) -> Option<&SessionView> { self.sessions.iter().find(|s| s.workers.contains(&worker)) }
+    // every (group, share %) a worker mines — one entry at 100% for a plain assignment
+    fn sessions_of(&self, worker: usize) -> Vec<(&SessionView, f64)> {
+        self.sessions.iter().filter_map(|s| s.workers.iter().position(|&w| w == worker).map(|k| (s, s.pcts.get(k).copied().unwrap_or(100.0)))).collect()
+    }
+}
 // ── CAROUSEL: independent suppliers' clean templates in rotation. Source: b.pyblock.xyz carousel.php?carrousel=1 ──
 #[derive(Clone, Default)]
 struct CarouselInfo { suppliers: Vec<String>, current: String, recent: Vec<String>, miners: u64, hashrate_ths: f64, live: bool, fetched: u64 }
@@ -211,8 +227,10 @@ struct Config {
     #[serde(default)] api_port: u16,                   // 0 = off · else JSON at http://127.0.0.1:<port>/ and Prometheus at /metrics
     #[serde(default)] alerts: AlertCfg,
     #[serde(default)] auto_update: bool,               // headless: pull + build + relaunch by itself when the pool publishes a newer version
+    #[serde(default)] gpu_pools: HashMap<usize, String>, // worker index → stratum name: that GPU mines THAT pool (multi-pool rigs)
     #[serde(default)] sweep_ms: u32,                   // 0 = adaptive; else cap each sweep to this many ms (smaller per-device nonce ranges)
     #[serde(default)] gpu_iter: u32,                   // 0 = grinder default (512); else nonces per work-item → PYBLOCK_GPU_ITER (smaller launches)
+    #[serde(default)] rune: String,                    // "" / "bowtie" = ⋈ (every font) · "unicode" = the real Dagaz ᛞ (needs a font with the Runic block)
 }
 // ── alerts: what a miner wants to know without watching the screen ──
 #[derive(Serialize, Deserialize, Clone)]
@@ -229,12 +247,37 @@ fn d_true() -> bool { true }
 impl Default for Config {
     fn default() -> Self {
         Config { stratums: default_stratums(), selected: 0, addrs: HashMap::new(), donate: DONATE_MIN, gpus: None, cpu: false,
-                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default(), auto_update: false, sweep_ms: 0, gpu_iter: 0 }
+                 worker: String::new(), log_file: true, api_port: 0, alerts: AlertCfg::default(), auto_update: false, gpu_pools: HashMap::new(), sweep_ms: 0, gpu_iter: 0, rune: String::new() }
     }
 }
 // worker names travel inside the stratum username → keep them plain: [A-Za-z0-9-_], max 24
 fn clean_worker(s: &str) -> String { s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(24).collect() }
 fn login(addr: &str, worker: &str) -> String { if worker.is_empty() { addr.to_string() } else { format!("{}.{}", addr, worker) } }
+// find a stratum by name: exact (case-insensitive) first, then substring — "CHIRP" → "PyBLØCK · CHIRP"
+fn find_stratum<'a>(list: &'a [Stratum], name: &str) -> Option<&'a Stratum> {
+    let q = name.trim().to_lowercase();
+    if q.is_empty() { return None; }
+    list.iter().find(|s| s.name.to_lowercase() == q).or_else(|| list.iter().find(|s| s.name.to_lowercase().contains(&q)))
+}
+// "0=CHIRP,1=WAVICLES,2=my pool" → per-worker specs (an empty spec clears the worker's assignment). A spec may split
+// one worker's hashrate across pools: "CHIRP:70+WAVICLES:30" (percentages; missing ones share what's left equally).
+fn parse_gpu_pools(spec: &str) -> Vec<(usize, String)> {
+    spec.split(',').filter_map(|p| { let mut it = p.splitn(2, '='); let i = it.next()?.trim().parse::<usize>().ok()?; Some((i, it.next().unwrap_or("").trim().to_string())) }).collect()
+}
+// "CHIRP:70+WAVICLES:30" → [("CHIRP", 70.0), ("WAVICLES", 30.0)] · "CHIRP" → [("CHIRP", 100.0)] · "A+B" → 50/50 · sums are normalized to 100
+fn parse_split(spec: &str) -> Vec<(String, f64)> {
+    let mut parts: Vec<(String, Option<f64>)> = spec.split('+').map(|p| { let mut it = p.rsplitn(2, ':');
+        let last = it.next().unwrap_or("").trim(); match (it.next(), last.parse::<f64>()) {
+            (Some(name), Ok(pct)) => (name.trim().to_string(), Some(pct.max(0.0))), _ => (p.trim().to_string(), None) } })
+        .filter(|(n, _)| !n.is_empty()).collect();
+    if parts.is_empty() { return vec![]; }
+    let given: f64 = parts.iter().filter_map(|(_, p)| *p).sum();
+    let missing = parts.iter().filter(|(_, p)| p.is_none()).count();
+    let rest = if given < 100.0 { 100.0 - given } else { 0.0 };
+    for (_, p) in parts.iter_mut() { if p.is_none() { *p = Some(if missing > 0 { rest / missing as f64 } else { 0.0 }); } }
+    let total: f64 = parts.iter().map(|(_, p)| p.unwrap_or(0.0)).sum();
+    parts.into_iter().map(|(n, p)| (n, if total > 0.0 { p.unwrap_or(0.0) * 100.0 / total } else { 0.0 })).filter(|(_, p)| *p > 0.0).collect()
+}
 fn config_path() -> PathBuf {
     // Cross-platform config dir. On Windows HOME/XDG are usually unset → the old code fell back to "." (CWD),
     // so saves landed next to wherever the exe was launched and looked like they "didn't save". Prefer the
@@ -282,7 +325,10 @@ fn save_config(c: &Config) {
 }
 
 // ── live target shared engine↔UI: switch pools/network without restarting ──
-struct Target { pool: String, addr: String, worker: String, network: String, donate: f64 }
+// `assign`: worker index (GPUs in order, then the CPU) → the pools it mines, (url, stratum name, share %). One entry
+// at 100% = that GPU on that pool; several = its sweeps are time-sliced between them in proportion. Every unassigned
+// worker mines the selected stratum, exactly as before.
+struct Target { pool: String, name: String, addr: String, worker: String, network: String, donate: f64, assign: HashMap<usize, Vec<(String, String, f64)>> }
 
 // ── locate the GPU grinder + kernel (Linux: gpu_grind + blake2b.cl · macOS: metal_grind + blake2b.metal) ──
 fn gpu_dir() -> String {
@@ -378,6 +424,10 @@ struct Stats {
     gpu_dead: Vec<bool>,               // per worker: grinder down, auto-respawning (shown in WORKERS)
     last_tick: Option<Instant>,        // engine heartbeat — the UI flags ENGINE STALLED if it stops while connected
     wrong_algo: bool,                  // the stratum hands out SHA-256 work → not grinding (header badge)
+    sessions: Vec<SessionView>,        // one per GPU group (pool); [view] is what the header / tiles / panel show
+    view: usize,                       // `g` cycles it
+    view_all: bool,                    // multi-pool rigs: MINE shows the whole-rig overview (g drills into a group)
+    modes: Vec<PoolMode>,              // every mode with a live session → what the mode pollers fetch
     mode: PoolMode,                    // what the coinbase does on the active stratum (LOTTO / CHIRP / CAROUSEL)
     chirp: Option<ChirpInfo>,          // CHIRP: everyone in the coinbase draw (kept while polling, cleared on switch)
     carousel: Option<CarouselInfo>,    // CAROUSEL: templates in rotation + the one being mined right now
@@ -615,39 +665,57 @@ fn spawn_daemon(dev: u32, name: String) -> Option<Daemon> {
 }
 // the header fields a sweep needs (one struct instead of 4 loose args)
 struct Work<'a> { prevhash: &'a str, ntime: &'a str, work_root: &'a str, bits: u32 }
-// Returns (winning nonces, per-GPU GH/s, CPU GH/s, events to log). A GPU that exits or doesn't answer within the
-// deadline is killed + marked dead here; the engine respawns it later (see Daemon).
+// One sweep across every worker. `works[i]` is the job for worker i (GPUs in daemon order, then the CPU as the last
+// index; None = that worker idles this sweep) and `groups` lists which workers share a job — the 2^32 nonce space is
+// split inside each group in proportion to the workers' measured speed, so two GPUs on different pools never collide
+// and two on the same pool never overlap. Returns (nonces tagged with their worker, per-GPU GH/s, CPU GH/s, events).
+// A GPU that exits or doesn't answer within the silence budget is killed + marked dead here; the engine respawns it.
 // events: (log line, alert?) — the FIRST death in a chain alerts, repeats while backing off only log (no alert storms)
-fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work, secs: f64) -> (Vec<String>, Vec<f64>, f64, Vec<(String, bool)>) {
+fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, works: &[Option<Work>], groups: &[Vec<usize>], secs: f64)
+    -> (Vec<(usize, String)>, Vec<f64>, f64, Vec<(String, bool)>) {
     let space: u64 = 1u64 << 32;
-    let gpu_caps: Vec<u64> = ds.iter().map(|d| if d.dead { 0 } else { ((d.weight * 1e9 * secs) as u64).max(1 << 22) }).collect();
-    let cpu_cap: u64 = if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 };
-    let total: u64 = gpu_caps.iter().sum::<u64>() + cpu_cap;
-    let sweep: u64 = if total == 0 || total >= space { space } else { total };
-    let mut cursor: u64 = 0;
-    for (i, d) in ds.iter_mut().enumerate() {
-        if d.dead || gpu_caps[i] == 0 { continue; }   // dead daemons get no job; their nonce share went to live workers via `total`
-        let span = if total > 0 { (sweep as u128 * gpu_caps[i] as u128 / total as u128) as u64 } else { 0 };
-        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", w.prevhash, w.ntime, w.work_root, w.bits, cursor, span.max(1));
-        let _ = d.stdin.flush();
-        cursor += span;
+    let ncpu = ds.len();   // the CPU's worker index
+    let cap = |i: usize| -> u64 {
+        if works.get(i).map(|w| w.is_none()).unwrap_or(true) { return 0; }
+        if i < ds.len() { if ds[i].dead { 0 } else { ((ds[i].weight * 1e9 * secs) as u64).max(1 << 22) } }
+        else if cpu_threads > 0 { ((*cpu_rate * 1e9 * secs) as u64).max(2_000_000) } else { 0 }
+    };
+    let mut range = vec![(0u64, 0u64); ds.len() + 1];   // (start, span) per worker
+    for g in groups {
+        let total: u64 = g.iter().map(|&i| cap(i)).sum();
+        if total == 0 { continue; }
+        let sweep: u64 = if total >= space { space } else { total };
+        let mut cursor: u64 = 0;
+        for &i in g {
+            let c = cap(i); if c == 0 { continue; }
+            let span = ((sweep as u128 * c as u128 / total as u128) as u64).max(1);
+            range[i] = (cursor, span); cursor += span;
+        }
     }
-    let mut nonces: Vec<String> = vec![];
+    for (i, d) in ds.iter_mut().enumerate() {
+        let (start, span) = range[i];
+        if d.dead || span == 0 { continue; }   // dead or idle → no job; its nonce share went to its group mates via `total`
+        let w = works[i].as_ref().unwrap();
+        let _ = writeln!(d.stdin, "{} {} {} {} {} {}", w.prevhash, w.ntime, w.work_root, w.bits, start, span);
+        let _ = d.stdin.flush();
+    }
+    let mut nonces: Vec<(usize, String)> = vec![];
     let mut events: Vec<(String, bool)> = vec![];
     let dispatched = Instant::now();   // sweeps run in parallel from here; each GPU's duration is measured from this point
     let mut cpu_ghs = 0.0f64;
-    if cpu_threads > 0 && cursor < sweep {
-        let cpu_span = sweep - cursor;
+    if cpu_threads > 0 && range[ncpu].1 > 0 {
+        let (start, span) = range[ncpu];
+        let w = works[ncpu].as_ref().unwrap();
         let t0 = Instant::now();
-        let won = cpu_grind(w.prevhash, w.ntime, w.work_root, w.bits, cpu_threads, cursor, cpu_span);
+        let won = cpu_grind(w.prevhash, w.ntime, w.work_root, w.bits, cpu_threads, start, span);
         let dt = t0.elapsed().as_secs_f64();
-        cpu_ghs = if dt > 0.0 { cpu_span as f64 / dt / 1e9 } else { 0.0 };
+        cpu_ghs = if dt > 0.0 { span as f64 / dt / 1e9 } else { 0.0 };
         if cpu_ghs > 0.0 { *cpu_rate = cpu_ghs; }
-        nonces.extend(won);
+        nonces.extend(won.into_iter().map(|n| (ncpu, n)));
     }
     let mut gpu_ghs = vec![0.0f64; ds.len()];
     for (i, d) in ds.iter_mut().enumerate() {
-        if d.dead { continue; }   // no job was sent to a dead daemon
+        if d.dead || range[i].1 == 0 { continue; }   // no job was sent to a dead or idle daemon
         // Hang watchdog. "Hung" means SILENT: every line the grinder sends (a winning nonce, the END) proves it is
         // alive and resets the clock. The silence budget is generous — 30s, or 10× this GPU's last sweep + 5s —
         // because killing a GPU that is merely slow (TDR recovery, a shared display, a driver batching launches)
@@ -667,7 +735,7 @@ fn grind_all(ds: &mut [Daemon], cpu_threads: usize, cpu_rate: &mut f64, w: &Work
                         d.last_dur = dispatched.elapsed().as_secs_f64();
                         if d.since.elapsed() > Duration::from_secs(300) { d.fails = 0; d.timeouts = 0; }   // stable for 5 min → forget old trouble
                         break;
-                    } else if !t.is_empty() { nonces.push(t.to_string()); }
+                    } else if !t.is_empty() { nonces.push((i, t.to_string())); }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     d.timeouts += 1; d.kill(10);
@@ -719,18 +787,11 @@ fn tcp_connect(pool: &str, secs: u64) -> Option<TcpStream> {
     let addrs: Vec<std::net::SocketAddr> = pool.to_socket_addrs().ok()?.collect();
     addrs.iter().find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(secs)).ok())
 }
-// sleep `secs`, but return at once if the user switched stratum/address meanwhile (backoff must not delay a switch)
-fn sleep_unless_switched(tgt: &Arc<Mutex<Target>>, pool: &str, addr: &str, secs: u64) {
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(secs) {
-        { let t = tgt.lock().unwrap(); if t.pool != pool || t.addr != addr { return; } }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
 
 struct Conn {
     stream: TcpStream, buf: Vec<u8>, en1: Option<String>, en2size: usize, diff: f64,
     job: Option<Vec<Value>>, en2ctr: u64, pending: HashMap<u64, (String, bool, u64, Instant)>, subid: u64, addr: String, is_dev: bool, idle: Instant, last_notify: Instant,
+    label: String, acc: u64, rej: u64,   // which pool this session is (for the log) + its own share counters
 }
 impl Conn {
     fn connect(pool: &str, addr: &str, is_dev: bool) -> Option<Conn> {
@@ -744,7 +805,12 @@ impl Conn {
         // data to adjust DOWN → the miner "hashes but never submits". Pools that honor it start low + vardiff up.
         send(&mut stream, &json!({"id":3,"method":"mining.suggest_difficulty","params":[1]}));
         Some(Conn { stream, buf: Vec::new(), en1: None, en2size: 8, diff: 1.0, job: None,
-            en2ctr: 0, pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now(), last_notify: Instant::now() })
+            // extranonce2 starts from a per-connection seed, never from 0: the pool hands the same extranonce1 to a
+            // reconnecting miner, and restarting at 0 on the same job rebuilt the same work → the same winning nonces
+            // → `duplicate` rejects after every reconnect / RIG change
+            en2ctr: (now_unix() << 24) ^ ((std::process::id() as u64) << 8) ^ (Instant::now().elapsed().as_nanos() as u64 & 0xff),
+            pending: HashMap::new(), subid: 100, addr: addr.to_string(), is_dev, idle: Instant::now(), last_notify: Instant::now(),
+            label: String::new(), acc: 0, rej: 0 })
     }
     fn pump(&mut self, stats: &Arc<Mutex<Stats>>) -> bool {
         let mut tmp = [0u8; 8192];
@@ -792,19 +858,20 @@ impl Conn {
                                 st.logline(format!("💚 donation BLOCK {}(#{}) → developer · thank you! · nonce {}", hs, n, nonce));
                             }
                         } else {
-                            st.accepted += 1;
+                            st.accepted += 1; self.acc += 1;
+                            let on = if self.label.is_empty() { String::new() } else { format!(" on {}", self.label) };
                             if is_block {
                                 st.blocks += 1; let n = st.blocks;
-                                st.logline(format!("🎉 BLOCK FOUND {}(#{})  paid to your address · nonce {}", hs, n, nonce));
-                                let body = format!("{}block #{} this session · paid to {}", hs, n, st.addr);
+                                st.logline(format!("🎉 BLOCK FOUND {}(#{}){}  paid to your address · nonce {}", hs, n, on, nonce));
+                                let body = format!("{}block #{} this session{} · paid to {}", hs, n, on, st.addr);
                                 alert(&mut st, "🎉 BLOCK FOUND", &body);
                             } else {
                                 let a = st.accepted;
-                                st.logline(format!("✓ share accepted (#{}) · nonce {}", a, nonce));
+                                st.logline(format!("✓ share accepted (#{}){} · nonce {}", a, on, nonce));
                             }
                         }
                     } else if m.get("error").map_or(false, |e| !e.is_null()) {
-                        st.rejected += 1;
+                        st.rejected += 1; if !self.is_dev { self.rej += 1; }
                         let e = m.get("error").map(|v| v.to_string()).unwrap_or_default();
                         let who = if self.is_dev { "donation " } else { "" };
                         st.logline(format!("✗ {}rejected ({})  nonce {}", who, e, nonce));
@@ -868,259 +935,344 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
       let names_str = st.gpu_names.join(", ");
       st.logline(format!("{} worker(s) ready: {}", nworkers, names_str)); }
 
+    let nworkers = daemons.len() + usize::from(cpu_threads > 0);
     let mut donate_credit = 0.0f64;
-    let mut dev_retry = Instant::now();
-    let mut conn_fails = 0u32;   // consecutive connect failures / instant drops → exponential backoff 3s…60s
-    // adaptive sweep length: track the observed block cadence (from the user's prevhash changes) so sweeps
-    // stay short on fast chains (switch to new work sooner → far fewer stale shares + less wasted hashrate)
-    // but keep the efficient default on normal-speed chains.
-    let mut last_prevhash = String::new();
-    let mut last_block_at = Instant::now();
-    let mut block_interval_ema = 30.0f64;   // conservative start → sweep capped at MAX until real cadence is seen
+    let mut dev: Option<Conn> = None;
+    let mut dev_retry = Instant::now() - Duration::from_secs(60);
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut sig = String::new();          // signature of the target the sessions were built for
+    let mut addr_warned = false;
+    // hashrate splits: per worker, per session, accumulated share credit — each sweep the worker mines the session with
+    // the most credit and pays 1 back (weighted round-robin → exact proportions over time, no wasted sweeps)
+    let mut credits: Vec<HashMap<usize, f64>> = vec![HashMap::new(); nworkers];
 
     loop {
-        // read current live target (pool/addr/donate change when the user switches stratum)
-        let (pool, addr, worker, donate, network) = { let t = tgt.lock().unwrap(); (t.pool.clone(), t.addr.clone(), t.worker.clone(), t.donate, t.network.clone()) };
+        stats.lock().unwrap().last_tick = Some(Instant::now());   // heartbeat: every path through this loop ticks
+        let (pool, pname, addr, worker, donate, network, assign) = { let t = tgt.lock().unwrap();
+            (t.pool.clone(), t.name.clone(), t.addr.clone(), t.worker.clone(), t.donate, t.network.clone(), t.assign.clone()) };
         if addr.is_empty() {
             { let mut st = stats.lock().unwrap(); st.connected = false;
-              st.logline("no address set — go to SETUP [5] to set/generate one".into()); }
+              if !addr_warned { addr_warned = true; st.logline("no address set — go to SETUP [6] to set/generate one".into()); } }
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
-        stats.lock().unwrap().last_tick = Some(Instant::now());
-        if pool.starts_with(WAVICLES_PLACEHOLDER.split(':').next().unwrap_or("your-gateway")) {
-            { let mut st = stats.lock().unwrap(); st.connected = false;
-              st.logline("WAVICLES: set the address of YOUR DATUM gateway's stratum — STRATUMS [3] → e (host:port) — the pool port is not for miners".into()); }
-            sleep_unless_switched(&tgt, &pool, &addr, 10);
+        addr_warned = false;
+
+        // ── GPU groups: the selected stratum takes every worker not assigned elsewhere; each other pool named in
+        //    `assign` becomes its own session. A worker split across pools belongs to several sessions with a share %
+        //    and is time-sliced between them sweep by sweep. Rebuilt (all connections dropped) when anything changes. ──
+        let mut a: Vec<(&usize, &Vec<(String, String, f64)>)> = assign.iter().collect(); a.sort_by_key(|(i, _)| **i);
+        let new_sig = format!("{}|{}|{}|{}|{}|{:?}", pool, addr, worker, network, donate, a);
+        if new_sig != sig {
+            if !sig.is_empty() { stats.lock().unwrap().logline(format!("switching stratum → {}{}", pool, if assign.is_empty() { String::new() } else { format!(" + {} assigned worker(s)", assign.len()) })); }
+            sig = new_sig;
+            let mut groups: Vec<(String, String, Vec<usize>, Vec<f64>)> = vec![(pool.clone(), pname.clone(), vec![], vec![])];
+            for i in 0..nworkers {
+                let list: Vec<(String, String, f64)> = assign.get(&i).cloned().unwrap_or_else(|| vec![(pool.clone(), pname.clone(), 100.0)]);
+                for (u, n, pct) in list {
+                    match groups.iter_mut().find(|g| g.0 == u) { Some(g) => { g.2.push(i); g.3.push(pct); } None => groups.push((u, n, vec![i], vec![pct])) }
+                }
+            }
+            sessions = groups.into_iter().filter(|g| !g.2.is_empty()).map(|(u, n, w, p)| Session::new(&u, &n, w, p)).collect();
+            credits = vec![HashMap::new(); nworkers];
+            { let mut st = stats.lock().unwrap();
+              st.view = st.view.min(sessions.len().saturating_sub(1)); st.view_all = sessions.len() > 1; st.wrong_algo = false;
+              let mut modes: Vec<PoolMode> = sessions.iter().map(|s| s.mode).collect(); modes.dedup(); st.modes = modes;
+              st.sessions = sessions.iter().map(|s| SessionView { name: s.name.clone(), pool: s.pool.clone(), mode: s.mode, workers: s.workers.clone(), pcts: s.pcts.clone(), ..Default::default() }).collect();
+              if sessions.len() > 1 { for s in &sessions { st.logline(format!("group {} → workers {}", s.name,
+                  s.workers.iter().zip(&s.pcts).map(|(w, p)| if (*p - 100.0).abs() < 1e-9 { w.to_string() } else { format!("{} ({:.0}%)", w, p) }).collect::<Vec<_>>().join(", "))); } }
+              if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
+            dev = None; dev_retry = Instant::now() - Duration::from_secs(60);
+        }
+
+        // dead grinders: respawn once their backoff has elapsed (keeps index/name so the WORKERS rows stay put)
+        let mut respawn_tried = false;
+        for d in daemons.iter_mut() {
+            if d.dead && d.died_at.elapsed() >= d.retry_in() {
+                respawn_tried = true;
+                match spawn_daemon(d.dev, d.name.clone()) {
+                    Some(mut nd) => { nd.fails = d.fails; nd.timeouts = d.timeouts; *d = nd; let mut st = stats.lock().unwrap();
+                                      if d.fails <= 1 && d.timeouts <= 1 { alert(&mut st, "GPU back online", &format!("{} is hashing again", d.name)); }
+                                      else { st.logline(format!("✓ {} back online", d.name)); } }
+                    None => { d.died_at = Instant::now(); d.fails += 1; d.retry_secs = crash_backoff(d.fails);
+                              stats.lock().unwrap().logline(format!("✗ {} still not starting — next try in {}s", d.name, d.retry_in().as_secs())); }
+                }
+            }
+        }
+        if respawn_tried {
+            let mut st = stats.lock().unwrap();
+            st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
+        }
+
+        // ── every session: connect when due, pump, watchdogs ──
+        let login_name = login(&addr, &worker);
+        let multi = sessions.len() > 1;
+        for s in sessions.iter_mut() {
+            if s.conn.is_none() {
+                if s.pool == WAVICLES_PLACEHOLDER {
+                    if !s.placeholder_warned { s.placeholder_warned = true;
+                        let mut st = stats.lock().unwrap();
+                        st.logline("WAVICLES: no gateway address yet — STRATUMS [3] → Enter on the WAVICLES entry and type your DATUM gateway's host:port".into());
+                        if let Some(v) = st.sessions.iter_mut().find(|v| v.pool == s.pool) { v.note = "no gateway address — STRATUMS → Enter on WAVICLES".into(); } }
+                    continue;
+                }
+                if Instant::now() < s.next_try {
+                    let mut st = stats.lock().unwrap(); let secs = s.wait_secs();
+                    if let Some(v) = st.sessions.iter_mut().find(|v| v.pool == s.pool) { v.note = format!("unreachable · retry in {}s", secs); }
+                    continue;
+                }
+                match Conn::connect(&s.pool, &login_name, false) {
+                    Some(mut c) => {
+                        c.label = if multi { s.name.clone() } else { String::new() };
+                        s.conn = Some(c); s.since = Instant::now(); s.wrong_algo = false; s.warned_dead = false; s.grind_secs = 0.0; s.grind_tick = Instant::now();
+                        let mut st = stats.lock().unwrap(); st.started.get_or_insert(Instant::now());
+                        if let Some(v) = st.sessions.iter_mut().find(|v| v.pool == s.pool) { v.note.clear(); }
+                        st.logline(format!("connected to {} as {}{}", s.pool, login_name, if multi { format!(" · workers {:?}", s.workers) } else { String::new() }));
+                        if s.fails >= 3 { alert(&mut st, "pool reachable again", &format!("connected to {} after {} attempts · mining", s.pool, s.fails)); }
+                    }
+                    None => {
+                        s.fails += 1;
+                        let wait = (3u64 << (s.fails - 1).min(4)).min(60);   // 3 · 6 · 12 · 24 · 48 · 60s
+                        s.next_try = Instant::now() + Duration::from_secs(wait);
+                        let mut st = stats.lock().unwrap();
+                        st.logline(format!("connection failed to {} — retry in {}s (attempt {})", s.pool, wait, s.fails));
+                        if s.fails == 3 { alert(&mut st, "pool unreachable", &format!("{} — 3 failed attempts, retrying with backoff · not mining", s.pool)); }
+                    }
+                }
+                continue;
+            }
+            // pump + the connection watchdogs: dropped · no bytes for 90s · no NEW job for 6× the block cadence (90s…600s).
+            // `idle` only tracks ANY bytes (set_difficulty pings keep it alive), so a connection that stays open but stops
+            // delivering jobs — exactly what happens at a chain transition or a pool re-point — is resubscribed on its own.
+            let (dropped, idle, stalled, stall_s) = { let c = s.conn.as_mut().unwrap();
+                let ok = c.pump(&stats);
+                let stall = (s.ema * 6.0).clamp(90.0, 600.0);
+                (!ok, c.idle.elapsed() > Duration::from_secs(90), c.last_notify.elapsed() > Duration::from_secs_f64(stall), stall as u64) };
+            if dropped || idle || stalled {
+                // a session that died within 10s of connecting (pool accepts TCP then drops us) counts as a failure → back off
+                let early = dropped && s.since.elapsed() < Duration::from_secs(10);
+                let why = if dropped { "disconnected — reconnecting…".to_string() } else if idle { "no data for 90s — reconnecting…".into() } else { format!("no new job in {}s — resubscribing…", stall_s) };
+                s.drop_conn(early);
+                stats.lock().unwrap().logline(format!("{}: {}{}", s.pool, why, if early { format!(" (dropped early — backing off {}s)", s.wait_secs()) } else { String::new() }));
+                continue;
+            }
+            // Dead-work watchdog: two silent failure modes look EXACTLY like healthy mining in the readout (LIVE, full
+            // hashrate, 0 accepted): (a) the pool answers mining.set_difficulty but never sends a single mining.notify,
+            // and (b) work arrives in a stratum layout this miner does not speak, so every sweep returns nothing usable.
+            // (b) fires only after 5× the expected time-to-share at this group's hashrate and difficulty (never under
+            // 60s), counting only time spent actually grinding — CAROUSEL sets diff 4096, so a 7 GH/s card expects a
+            // share every ~42 min and must not be called broken at 45s.
+            if !s.warned_dead {
+                let c = s.conn.as_ref().unwrap();
+                if s.since.elapsed() > Duration::from_secs(45) && c.job.is_none() {
+                    s.warned_dead = true;
+                    let mut st = stats.lock().unwrap();
+                    alert(&mut st, "no work from pool", &format!("{} sent no work in 45s — check pool/algorithm", s.pool));
+                } else {
+                    let (hr, grinding) = { let st = stats.lock().unwrap();
+                        let hr: f64 = s.workers.iter().map(|&i| st.gpu_ghs.get(i).copied().unwrap_or(0.0)).sum();
+                        (hr, !st.paused && st.blake2b_active != Some(false) && hr > 0.0) };
+                    if grinding { s.grind_secs += s.grind_tick.elapsed().as_secs_f64(); }
+                    s.grind_tick = Instant::now();
+                    let expected = 4_294_967_296.0 * norm_diff(c.diff) / (hr.max(1e-6) * 1e9);
+                    if c.job.is_some() && c.acc == 0 && s.grind_secs > (5.0 * expected).max(60.0) {
+                        s.warned_dead = true;
+                        let (diff, pool) = (c.diff, s.pool.clone());
+                        let mut st = stats.lock().unwrap();
+                        alert(&mut st, "work is not usable", &format!("{} sent work but not one accepted share in {:.0}s of grinding (one was expected every ~{:.0}s at {:.2} GH/s, diff {:.0}) — the stratum format may be incompatible",
+                            pool, s.grind_secs, expected, hr, diff));
+                    }
+                }
+            }
+        }
+        // donation session: `donate`% of every sweep, all workers, always the PyBLØCK pool
+        if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
+        if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
+            dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true); dev_retry = Instant::now();
+        }
+        // what the header / tiles / panel show: the viewed group (`g` cycles it)
+        { let mut st = stats.lock().unwrap();
+          let v = st.view.min(sessions.len().saturating_sub(1));
+          match sessions.get(v) {
+              Some(s) => { st.connected = s.conn.is_some(); st.wrong_algo = s.wrong_algo;
+                           if st.endpoint != s.pool { st.endpoint = s.pool.clone(); } if st.mode != s.mode { st.mode = s.mode; } }
+              None => st.connected = false,
+          } }
+
+        // PAUSE: user hit `p`. Stop feeding the grinders (GPU/CPU go idle → no work sent, no shares submitted) but keep
+        // every pool connection alive (pumped above), so resume is instant with no reconnect.
+        if paused.load(Ordering::Relaxed) {
+            { let mut st = stats.lock().unwrap();
+              if !st.paused { st.paused = true; st.logline("⏸ mining paused".into()); }
+              st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
+            std::thread::sleep(Duration::from_millis(120));
+            continue;
+        } else {
+            let mut st = stats.lock().unwrap();
+            if st.paused { st.paused = false; st.logline("▶ mining resumed".into()); }
+        }
+        // ALGO GATE: pyblockMiner only hashes BLAKE2b. While the chain is still SHA-256d (pre-activation), grinding is
+        // pure wasted electricity + guaranteed rejects — idle the grinders and wait; mining resumes ON ITS OWN the
+        // moment BLAKE2b activates. (None/unknown → grind — safe default.)
+        if stats.lock().unwrap().blake2b_active == Some(false) {
+            { let mut st = stats.lock().unwrap(); st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
+            std::thread::sleep(Duration::from_millis(200));
             continue;
         }
-        let mut user = match Conn::connect(&pool, &login(&addr, &worker), false) {
-            Some(c) => c,
-            None => {
-                conn_fails += 1;
-                let wait = (3u64 << (conn_fails - 1).min(4)).min(60);   // 3 · 6 · 12 · 24 · 48 · 60s
-                { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("connection failed to {} — retry in {}s (attempt {})", pool, wait, conn_fails));
-                  if conn_fails == 3 { alert(&mut st, "pool unreachable", &format!("{} — 3 failed attempts, retrying with backoff · not mining", pool)); } }
-                sleep_unless_switched(&tgt, &pool, &addr, wait);
-                continue;
-            }
-        };
-        let mut dev: Option<Conn> = if donate > 0.0 { Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true) } else { None };
-        { let mut st = stats.lock().unwrap(); st.connected = true; st.wrong_algo = false; st.started.get_or_insert(Instant::now());
-          st.logline(format!("connected to {} as {}", pool, login(&addr, &worker)));
-          if conn_fails >= 3 { alert(&mut st, "pool reachable again", &format!("connected to {} after {} attempts · mining", pool, conn_fails)); }
-          if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
-        let session_start = Instant::now();
-        let mut switched = false;
-        let mut warned_dead_work = false;
-        let mut grind_secs = 0.0f64;            // seconds this session spent actually grinding (not paused / gated / workerless)
-        let mut grind_tick = Instant::now();
 
-        loop {
-            stats.lock().unwrap().last_tick = Some(Instant::now());   // heartbeat: every path through this loop ticks
-            // live switch: if the shared target's pool/addr changed, drop + reconnect
-            { let t = tgt.lock().unwrap();
-              if t.pool != pool || t.addr != addr || t.worker != worker || t.network != network || t.donate != donate {
-                stats.lock().unwrap().logline(format!("switching stratum → {}", t.pool)); switched = true; break;
-              } }
-            // dead grinders: respawn once their backoff has elapsed (keeps index/name so the WORKERS rows stay put)
-            let mut respawn_tried = false;
-            for d in daemons.iter_mut() {
-                if d.dead && d.died_at.elapsed() >= d.retry_in() {
-                    respawn_tried = true;
-                    match spawn_daemon(d.dev, d.name.clone()) {
-                        Some(mut nd) => { nd.fails = d.fails; nd.timeouts = d.timeouts; *d = nd; let mut st = stats.lock().unwrap();
-                                          if d.fails <= 1 && d.timeouts <= 1 { alert(&mut st, "GPU back online", &format!("{} is hashing again", d.name)); }
-                                          else { st.logline(format!("✓ {} back online", d.name)); } }
-                        None => { d.died_at = Instant::now(); d.fails += 1; d.retry_secs = crash_backoff(d.fails);
-                                  stats.lock().unwrap().logline(format!("✗ {} still not starting — next try in {}s", d.name, d.retry_in().as_secs())); }
-                    }
-                }
-            }
-            if respawn_tried {
-                let mut st = stats.lock().unwrap();
-                st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
-            }
-            if !user.pump(&stats) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("disconnected — reconnecting…".into()); } break; }
-            if let Some(d) = dev.as_mut() { if !d.pump(&stats) { dev = None; dev_retry = Instant::now(); } }
-            if dev.is_none() && donate > 0.0 && dev_retry.elapsed() > Duration::from_secs(20) {
-                dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true); dev_retry = Instant::now();
-            }
-            if user.idle.elapsed() > Duration::from_secs(90) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); } break; }
-            // Dead-work watchdog: two silent failure modes look EXACTLY like healthy mining in the readout
-            // (LIVE, full hashrate, 0 accepted): (a) the pool answers mining.set_difficulty but never sends a
-            // single mining.notify, and (b) work arrives in a stratum layout this miner does not speak, so
-            // build_work produces garbage and every sweep returns zero nonces. Both leave the operator watching
-            // a perfectly normal-looking miner that is producing nothing, while the stall watchdog below stays
-            // quiet for up to 10 minutes. Say it once, as soon as it is unambiguous.
-            if !warned_dead_work {
-                if session_start.elapsed() > Duration::from_secs(45) && user.job.is_none() {
-                    // (a) is unambiguous: every stratum sends a notify right after subscribe
-                    warned_dead_work = true;
-                    let mut st = stats.lock().unwrap();
-                    alert(&mut st, "no work from pool", &format!("{} sent no work in 45s — check pool/algorithm", pool));
-                } else {
-                    // (b): "best_diff == 0" only means "no share YET", and that is the normal state for as long as the
-                    // expected time-to-share at this hashrate and difficulty — CAROUSEL sets diff 4096, so a 7 GH/s
-                    // card expects one every ~42 min and a CPU miner on diff 1 every ~40s. Fire only after 5× that
-                    // (never under 60s), counting only time spent actually grinding: not paused, not gated, workers up.
-                    let (hr, bd, acc, grinding) = { let st = stats.lock().unwrap();
-                        (st.hr_total, st.best_diff, st.accepted, !st.paused && st.blake2b_active != Some(false) && st.hr_total > 0.0) };
-                    if grinding { grind_secs += grind_tick.elapsed().as_secs_f64(); }
-                    grind_tick = Instant::now();
-                    let expected = 4_294_967_296.0 * norm_diff(user.diff) / (hr.max(1e-6) * 1e9);
-                    if user.job.is_some() && bd == 0.0 && acc == 0 && grind_secs > (5.0 * expected).max(60.0) {
-                        warned_dead_work = true;
-                        let mut st = stats.lock().unwrap();
-                        alert(&mut st, "work is not usable", &format!("{} sent work but not one valid result in {:.0}s of grinding (a share was expected every ~{:.0}s at {:.2} GH/s, diff {:.0}) — the stratum format may be incompatible",
-                            pool, grind_secs, expected, hr, user.diff));
-                    }
-                }
-            }
-            // Job-freshness watchdog: force a clean resubscribe if no NEW work (mining.notify) has arrived for a
-            // while, scaled to the observed block cadence. `idle` only tracks ANY bytes (set_difficulty pings keep
-            // it alive), so a connection that stays open but stops delivering jobs — exactly what happens at a
-            // chain transition (BLAKE2b activation / pool re-point / node reorg) — would otherwise leave the miner
-            // grinding dead work until a manual restart. This makes it pick up the new template ON ITS OWN.
-            let stall = Duration::from_secs_f64((block_interval_ema * 6.0).clamp(90.0, 600.0));
-            if user.last_notify.elapsed() > stall { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline(format!("no new job in {}s — resubscribing…", stall.as_secs())); } break; }
-
-            // PAUSE: user hit `p`. Stop feeding the grinders (GPU/CPU go idle → no work sent, no shares submitted)
-            // but keep the pool connection alive by pumping it, so resume is instant with no reconnect.
-            if paused.load(Ordering::Relaxed) {
-                { let mut st = stats.lock().unwrap();
-                  if !st.paused { st.paused = true; st.logline("⏸ mining paused".into()); }
-                  st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
-                user.pump(&stats);
-                if let Some(d) = dev.as_mut() { d.pump(&stats); }
-                std::thread::sleep(Duration::from_millis(120));
-                continue;
-            } else {
-                let mut st = stats.lock().unwrap();
-                if st.paused { st.paused = false; st.logline("▶ mining resumed".into()); }
-            }
-
-            // ALGO GATE: pyblockMiner only hashes BLAKE2b. While the chain is still SHA-256d (pre-activation),
-            // grinding is pure wasted electricity + guaranteed rejects — so idle the grinders and wait. The pool
-            // reports blake2b_active=false until the flag-day height; we keep the connection pumped so mining
-            // resumes ON ITS OWN the moment BLAKE2b activates. (None/unknown → grind — safe default.)
-            if stats.lock().unwrap().blake2b_active == Some(false) {
-                { let mut st = stats.lock().unwrap(); st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; } }
-                user.pump(&stats);
-                if let Some(d) = dev.as_mut() { d.pump(&stats); }
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-
-            donate_credit += donate / 100.0;
-            let dev_ready = dev.as_ref().and_then(|d| d.ready()).is_some();
-            let do_donate = donate_credit >= 1.0 && dev_ready;
-            let (en1v, jobv, is_dev) = if do_donate {
-                let d = dev.as_ref().unwrap(); let (a, b) = d.ready().unwrap(); (a, b, true)
-            } else {
-                match user.ready() { Some((a, b)) => (a, b, false), None => { std::thread::sleep(Duration::from_millis(60)); continue; } }
-            };
-            if is_dev { donate_credit -= 1.0; }
-
-            // ALGO CHECK: SHA-256 work (full coinbase + merkle branches) means this stratum is not a BLAKE2b pool —
-            // e.g. a SHA-256 DATUM gateway on the same box. Refuse it: idle the grinders, badge the header, alert once.
-            if !is_dev && is_sha256_job(&jobv) {
-                { let mut st = stats.lock().unwrap();
-                  if !st.wrong_algo { st.wrong_algo = true; st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; }
-                      alert(&mut st, "⛔ SHA-256 work — not mining", &format!("{} sends SHA-256 jobs (coinbase + merkle branches); pyblockMiner mines BLAKE2b. Wrong port or a SHA-256 gateway — pick a BLAKE2b stratum", pool)); } }
-                user.pump(&stats);
-                if let Some(d) = dev.as_mut() { d.pump(&stats); }
-                std::thread::sleep(Duration::from_millis(300));
-                continue;
-            } else if !is_dev { let mut st = stats.lock().unwrap(); if st.wrong_algo { st.wrong_algo = false; st.logline("BLAKE2b work again — mining".into()); } }
-            let diff = norm_diff(if is_dev { dev.as_ref().unwrap().diff } else { user.diff });
-            let bits = floor_pot(diff);
-            let (prevhash, ntime, version, job_id, en2hex, work_root) = {
-                let c = if is_dev { dev.as_mut().unwrap() } else { &mut user };
-                build_work(c, &en1v, &jobv)
-            };
-            // update the observed block interval from the user's prevhash changes, then size the sweep to a
-            // small fraction of it (clamped): fast chain → short sweep → quick switch; slow chain → 0.35s cap.
-            if !is_dev && prevhash != last_prevhash {
-                if !last_prevhash.is_empty() {
-                    let dt = last_block_at.elapsed().as_secs_f64();
-                    if dt > 0.02 && dt < 600.0 { block_interval_ema = block_interval_ema * 0.7 + dt * 0.3; }
-                }
-                last_prevhash = prevhash.clone();
-                last_block_at = Instant::now();
-            }
-            let mut sweep_secs = (block_interval_ema * 0.15).clamp(0.06, 0.35);
-            if sweep_ms > 0 { sweep_secs = sweep_secs.min((sweep_ms as f64 / 1000.0).max(0.02)); }
-            let work = Work { prevhash: &prevhash, ntime: &ntime, work_root: &work_root, bits };
-            let (nonces, gpu_ghs, cpu_ghs, events) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &work, sweep_secs);
-            {
-                let mut st = stats.lock().unwrap();
-                for (e, al) in events { if al { alert(&mut st, "GPU down", &e); } else { st.logline(e); } }
-                st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
-                let mut all = gpu_ghs.clone();
-                if cpu_threads > 0 { all.push(cpu_ghs); }
-                st.gpu_ghs = all;
-                st.hr_total = st.gpu_ghs.iter().sum();
-                let hv = (st.hr_total * 100.0) as u64;
-                st.hr_hist.push_back(hv);
-                while st.hr_hist.len() > 512 { st.hr_hist.pop_front(); }   // keep enough samples so the Sparkline fills wide terminals (it shows the last <width> points)
-            }
-            user.pump(&stats);
-            if let Some(d) = dev.as_mut() { d.pump(&stats); }
-            // Only submit winners if this sweep's job is still the tip. If a block landed DURING the grind,
-            // its winners are for the old prevhash → worthless (the pool rejects them as stale-prevblk), so we
-            // skip them, exactly like a normal miner does. Safe now because the adaptive sweep keeps each grind
-            // well under the block interval → stale sweeps are a minority (this is NOT the old v0.2.1 bug that
-            // dropped everything with fixed 0.35s sweeps ≈ the block time on a fast chain).
+        // ── one job per group with work (or the donation job for everyone on a donation sweep) ──
+        donate_credit += donate / 100.0;
+        let do_donate = donate_credit >= 1.0 && dev.as_ref().and_then(|d| d.ready()).is_some();
+        let mut jobs: Vec<Job> = vec![];
+        let mut worker_job: Vec<Option<usize>> = vec![None; nworkers];
+        let mut groups: Vec<Vec<usize>> = vec![];
+        if do_donate {
+            donate_credit -= 1.0;
+            let d = dev.as_mut().unwrap(); let (en1v, jobv) = d.ready().unwrap();
+            let diff = norm_diff(d.diff);
+            let (prevhash, ntime, version, job_id, en2hex, work_root) = build_work(d, &en1v, &jobv);
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
-            // Which target is "the network"? PyBLØCK's datum puts the real network nbits in the job. CONVOY/OCEAN DATUM
-            // gateways put the SHARE target there (1d00ffff for diff 1) — using it would call every share a block and
-            // put the time-to-block at seconds. The WAVICLES poller supplies node.difficulty; when it's known, it wins.
-            let net_difficulty = { let mut st = stats.lock().unwrap();
-                if !is_dev && nbits != 0 && st.net_difficulty == 0.0 { st.net_nbits = nbits; }
-                st.net_difficulty };
-            let net_target = if net_difficulty > 0.0 { target_from_difficulty(net_difficulty) } else { nbits_to_target(nbits) };
-            // found-block height. The BLAKE2b stratum notify carries NO coinbase (coinb2 empty, merkle []),
-            // so coinb1 has no BIP34 height — the pool's reported mining height is the only source. blake_stats
-            // returns the *template* height (tip+1) = exactly the block being mined. Captured per-sweep and
-            // carried in `pending` so BLOCK FOUND logs it even if the tip moves before the pool replies.
-            let job_height = stats.lock().unwrap().net_height;
-            // did the tip move during this grind? compare the ground prevhash to the latest job's prevhash
-            let still_current = {
-                let latest = if is_dev { dev.as_ref().and_then(|d| d.job.as_ref()) } else { user.job.as_ref() };
-                match latest.and_then(|j| j.get(1)).and_then(|v| v.as_str()) {
-                    Some(cur) => cur == prevhash,
-                    None => true,   // unknown → submit rather than silently drop
+            jobs.push(Job { sess: None, prevhash, ntime, version, job_id, en2hex, work_root, bits: floor_pot(diff), diff, nbits });
+            let all: Vec<usize> = (0..nworkers).collect();
+            for &i in &all { worker_job[i] = Some(0); }
+            groups.push(all);
+        } else {
+            let mut sess_job: Vec<Option<usize>> = vec![None; sessions.len()];   // session → its job this sweep
+            for (si, s) in sessions.iter_mut().enumerate() {
+                let Some(c) = s.conn.as_mut() else { continue };
+                let Some((en1v, jobv)) = c.ready() else { continue };
+                // ALGO CHECK: SHA-256 work (full coinbase + merkle branches) means this stratum is not a BLAKE2b pool —
+                // e.g. a SHA-256 DATUM gateway on the same box. Refuse it: this group idles, header badge, alert once.
+                if is_sha256_job(&jobv) {
+                    if !s.wrong_algo { s.wrong_algo = true; let mut st = stats.lock().unwrap();
+                        alert(&mut st, "⛔ SHA-256 work — not mining", &format!("{} sends SHA-256 jobs (coinbase + merkle branches); pyblockMiner mines BLAKE2b. Wrong port or a SHA-256 gateway — pick a BLAKE2b stratum", s.pool)); }
+                    continue;
+                } else if s.wrong_algo { s.wrong_algo = false; stats.lock().unwrap().logline(format!("{}: BLAKE2b work again — mining", s.pool)); }
+                let diff = norm_diff(c.diff);
+                let (prevhash, ntime, version, job_id, en2hex, work_root) = build_work(c, &en1v, &jobv);
+                let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
+                // block cadence per group: sizes its sweeps and its job-freshness stall
+                if prevhash != s.last_prevhash {
+                    if !s.last_prevhash.is_empty() { let dt = s.last_block_at.elapsed().as_secs_f64(); if dt > 0.02 && dt < 600.0 { s.ema = s.ema * 0.7 + dt * 0.3; } }
+                    s.last_prevhash = prevhash.clone(); s.last_block_at = Instant::now();
                 }
+                // PyBLØCK's datum puts the real network nbits in the job; a DATUM gateway puts the SHARE target there
+                // (WAVICLES) — that one is never taken as the network's (the WAVICLES poller supplies node.difficulty)
+                if nbits != 0 && s.mode != PoolMode::Wavicles { let mut st = stats.lock().unwrap(); if st.net_difficulty == 0.0 { st.net_nbits = nbits; } }
+                sess_job[si] = Some(jobs.len());
+                jobs.push(Job { sess: Some(si), prevhash, ntime, version, job_id, en2hex, work_root, bits: floor_pot(diff), diff, nbits });
+            }
+            // each worker picks its session for this sweep: the one it's assigned to, or — for a split worker — the one
+            // it owes the most sweeps to (weighted round-robin on its share %). A session without work this sweep is
+            // skipped for another of the worker's sessions rather than idling the GPU.
+            let mut chosen: Vec<Option<usize>> = vec![None; nworkers];
+            for i in 0..nworkers {
+                let mine: Vec<(usize, f64)> = sessions.iter().enumerate().filter_map(|(si, s)| s.workers.iter().position(|&w| w == i).map(|k| (si, s.pcts[k]))).collect();
+                if mine.is_empty() { continue; }
+                let ready: Vec<&(usize, f64)> = mine.iter().filter(|(si, _)| sess_job[*si].is_some()).collect();
+                if ready.is_empty() { continue; }
+                let pick = if mine.len() == 1 { mine[0].0 } else {
+                    for (si, pct) in &mine { *credits[i].entry(*si).or_insert(0.0) += pct / 100.0; }
+                    let best = ready.iter().max_by(|a, b| credits[i][&a.0].partial_cmp(&credits[i][&b.0]).unwrap_or(std::cmp::Ordering::Equal)).unwrap().0;
+                    *credits[i].get_mut(&best).unwrap() -= 1.0;
+                    best
+                };
+                chosen[i] = Some(pick);
+                worker_job[i] = sess_job[pick];
+            }
+            for (si, _) in sessions.iter().enumerate() {
+                let g: Vec<usize> = (0..nworkers).filter(|&i| chosen[i] == Some(si)).collect();
+                if !g.is_empty() { groups.push(g); }
+            }
+        }
+        if jobs.is_empty() { std::thread::sleep(Duration::from_millis(60)); continue; }
+        // sweep length: a small fraction of the block interval (clamped) — the fastest chain among the groups with work
+        // decides, so new work is picked up quickly everywhere; --sweep-ms caps it further.
+        let mut sweep_secs = jobs.iter().map(|j| match j.sess { Some(si) => sessions[si].ema, None => sessions.first().map(|s| s.ema).unwrap_or(30.0) })
+            .map(|ema| (ema * 0.15).clamp(0.06, 0.35)).fold(0.35, f64::min);
+        if sweep_ms > 0 { sweep_secs = sweep_secs.min((sweep_ms as f64 / 1000.0).max(0.02)); }
+        let works: Vec<Option<Work>> = worker_job.iter().map(|wj| wj.map(|ji| { let j = &jobs[ji]; Work { prevhash: &j.prevhash, ntime: &j.ntime, work_root: &j.work_root, bits: j.bits } })).collect();
+        let (nonces, gpu_ghs, cpu_ghs, events) = grind_all(&mut daemons, cpu_threads, &mut cpu_rate, &works, &groups, sweep_secs);
+        {
+            let mut st = stats.lock().unwrap();
+            for (e, al) in events { if al { alert(&mut st, "GPU down", &e); } else { st.logline(e); } }
+            st.gpu_dead = daemons.iter().map(|d| d.dead).chain(std::iter::once(false).take(usize::from(cpu_threads > 0))).collect();
+            let mut all = gpu_ghs.clone();
+            if cpu_threads > 0 { all.push(cpu_ghs); }
+            st.gpu_ghs = all;
+            st.hr_total = st.gpu_ghs.iter().sum();
+            let hv = (st.hr_total * 100.0) as u64;
+            st.hr_hist.push_back(hv);
+            while st.hr_hist.len() > 512 { st.hr_hist.pop_front(); }   // keep enough samples so the Sparkline fills wide terminals (it shows the last <width> points)
+            // per-group hashrate: what actually mined it THIS sweep, smoothed (a split worker alternates sweep by sweep)
+            let ghs = st.gpu_ghs.clone();
+            for (si, s) in sessions.iter_mut().enumerate() {
+                let now_hr: f64 = if do_donate { s.workers.iter().zip(&s.pcts).map(|(&i, p)| ghs.get(i).copied().unwrap_or(0.0) * p / 100.0).sum() }
+                    else { (0..nworkers).filter(|&i| worker_job[i].map(|ji| jobs[ji].sess == Some(si)).unwrap_or(false)).map(|i| ghs.get(i).copied().unwrap_or(0.0)).sum() };
+                s.hr_ema = if s.conn.is_none() { 0.0 } else if s.hr_ema == 0.0 { now_hr } else { s.hr_ema * 0.9 + now_hr * 0.1 };
+                if let Some(v) = st.sessions.get_mut(si) {
+                    v.connected = s.conn.is_some(); v.wrong_algo = s.wrong_algo; v.hr = s.hr_ema;
+                    if let Some(c) = s.conn.as_ref() { v.acc = c.acc; v.rej = c.rej; v.diff = norm_diff(c.diff); }
+                }
+            }
+        }
+        for s in sessions.iter_mut() { if let Some(c) = s.conn.as_mut() { c.pump(&stats); } }
+        if let Some(d) = dev.as_mut() { d.pump(&stats); }
+
+        // ── submit, per job. Only winners whose job is still the tip (a block landing mid-grind makes them worthless),
+        //    only those that meet the exact share difficulty (the kernel filters at a power of two), each to its own pool. ──
+        let (net_difficulty, job_height) = { let st = stats.lock().unwrap(); (st.net_difficulty, st.net_height) };
+        let mut sweep_best = 0.0f64;
+        for (ji, j) in jobs.iter().enumerate() {
+            let (conn, wavicles) = match j.sess {
+                Some(si) => { let s = &mut sessions[si]; match s.conn.as_mut() { Some(c) => (c, s.mode == PoolMode::Wavicles), None => continue } }
+                None => match dev.as_mut() { Some(d) => (d, false), None => continue },
             };
-            let mut sweep_best = 0.0f64;
-            let conn = if is_dev { dev.as_mut().unwrap() } else { &mut user };
-            for nh in nonces {
-                // The grinders filter at floor_pot(diff) — a power of two. On a pool diff that ISN'T a power of two
-                // (vardiff 3000 → kernel bits 11 = 2048) some winners are below the real share target and the pool
-                // would reject them → check the exact difficulty here and only send what can be accepted.
-                let (is_block, meets_diff) = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
-                    Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; }
-                                 ((nbits != 0 || net_difficulty > 0.0) && hash_le_target(&h, &net_target), d >= diff * 0.999) }
+            // the network target: node.difficulty from the WAVICLES API for a gateway session (its job nbits is the share
+            // target), the job's nbits everywhere else
+            let net_target = if wavicles && net_difficulty > 0.0 { target_from_difficulty(net_difficulty) } else { nbits_to_target(j.nbits) };
+            let block_known = if wavicles { net_difficulty > 0.0 } else { j.nbits != 0 };
+            let still_current = conn.job.as_ref().and_then(|jb| jb.get(1)).and_then(|v| v.as_str()).map(|cur| cur == j.prevhash).unwrap_or(true);
+            for (_, nh) in nonces.iter().filter(|(wi, _)| worker_job[*wi] == Some(ji)) {
+                let (is_block, meets_diff) = match nonce_hash(&j.prevhash, &j.ntime, &j.work_root, nh) {
+                    Some(h) => { let d = hash_diff(&h); if j.sess.is_some() && d > sweep_best { sweep_best = d; }
+                                 (block_known && hash_le_target(&h, &net_target), d >= j.diff * 0.999) }
                     None => (false, true),
                 };
-                if !still_current || !meets_diff { continue; }   // stale sweep (a block landed mid-grind) or sub-target → don't submit
+                if !still_current || !meets_diff { continue; }
                 conn.subid += 1; let sid = conn.subid;
                 conn.pending.insert(sid, (nh.clone(), is_block, job_height, Instant::now()));
-                send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, job_id, en2hex, ntime, nh, version]}));
+                send(&mut conn.stream, &json!({"id":sid,"method":"mining.submit","params":[conn.addr, j.job_id, j.en2hex, j.ntime, nh, j.version]}));
             }
-            if sweep_best > 0.0 && !is_dev { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
         }
-        // a session that died within 10s of connecting (pool accepts TCP then drops us) counts as a failure → back off,
-        // instead of hammering the pool in a tight reconnect loop. A user-driven switch never waits.
-        if !switched && session_start.elapsed() < Duration::from_secs(10) {
-            conn_fails += 1;
-            let wait = (3u64 << (conn_fails - 1).min(4)).min(60);
-            stats.lock().unwrap().logline(format!("session dropped early — reconnecting in {}s", wait));
-            sleep_unless_switched(&tgt, &pool, &addr, wait);
-        } else { conn_fails = 0; }
+        if sweep_best > 0.0 { let mut st = stats.lock().unwrap(); if sweep_best > st.best_diff { st.best_diff = sweep_best; } }
     }
 }
+
+// ── one stratum session per GPU group: its connection, backoff, block cadence, watchdog state and algo state ──
+struct Session {
+    pool: String, name: String, mode: PoolMode, workers: Vec<usize>, pcts: Vec<f64>,
+    conn: Option<Conn>, fails: u32, next_try: Instant, since: Instant,
+    last_prevhash: String, last_block_at: Instant, ema: f64, hr_ema: f64,
+    warned_dead: bool, grind_secs: f64, grind_tick: Instant, wrong_algo: bool, placeholder_warned: bool,
+}
+impl Session {
+    fn new(pool: &str, name: &str, workers: Vec<usize>, pcts: Vec<f64>) -> Session {
+        Session { pool: pool.into(), name: name.into(), mode: pool_mode(pool, name), workers, pcts, conn: None, fails: 0, next_try: Instant::now(),
+                  since: Instant::now(), last_prevhash: String::new(), last_block_at: Instant::now(), ema: 30.0, hr_ema: 0.0,   // conservative start → sweep capped until real cadence is seen
+                  warned_dead: false, grind_secs: 0.0, grind_tick: Instant::now(), wrong_algo: false, placeholder_warned: false }
+    }
+    // drop the connection; a failure (refused, or a session that died within 10s of connecting) escalates the backoff 3s…60s
+    fn drop_conn(&mut self, failure: bool) {
+        self.conn = None;
+        if failure { self.fails += 1; } else { self.fails = 0; }
+        let wait = if self.fails == 0 { 0 } else { (3u64 << (self.fails - 1).min(4)).min(60) };
+        self.next_try = Instant::now() + Duration::from_secs(wait);
+    }
+    fn wait_secs(&self) -> u64 { self.next_try.saturating_duration_since(Instant::now()).as_secs() }
+}
+// a job built for one sweep — owned, so one per group can coexist
+struct Job { sess: Option<usize>, prevhash: String, ntime: String, version: String, job_id: String, en2hex: String, work_root: String, bits: u32, diff: f64, nbits: u32 }
 
 struct NetStats { miners: u64, ghs: f64, height: u64, blake2b_active: Option<bool>, activation_height: u64, blocks_until: u64, latest: String }
 // true if `latest` is a strictly newer semver than `cur` (both "x.y.z", optional leading 'v')
@@ -1352,7 +1504,10 @@ fn relaunch() -> ! {
 // ── local stats API: GET / → JSON · GET /metrics → Prometheus text. 127.0.0.1 only, one tiny HTTP/1.0 server. ──
 fn stats_json(st: &Stats) -> Value {
     let workers: Vec<Value> = st.gpu_names.iter().enumerate().map(|(i, n)| json!({
-        "name": n, "ghs": st.gpu_ghs.get(i).copied().unwrap_or(0.0), "offline": st.gpu_dead.get(i).copied().unwrap_or(false) })).collect();
+        "name": n, "ghs": st.gpu_ghs.get(i).copied().unwrap_or(0.0), "offline": st.gpu_dead.get(i).copied().unwrap_or(false),
+        "pool": st.session_of(i).map(|s| s.name.clone()), "mode": st.session_of(i).map(|s| s.mode.label()) })).collect();
+    let sessions: Vec<Value> = st.sessions.iter().map(|s| json!({ "name": s.name, "pool": s.pool, "mode": s.mode.label(), "workers": s.workers,
+        "connected": s.connected, "wrong_algo": s.wrong_algo, "hashrate_ghs": s.hr, "shares_accepted": s.acc, "shares_rejected": s.rej, "difficulty": s.diff })).collect();
     let chirp = st.chirp.as_ref().map(|c| json!({
         "listed": c.me(&st.addr).is_some(), "eligible": c.me(&st.addr).map(|m| m.eligible).unwrap_or(false),
         "slice_pct": c.my_pct(&st.addr), "tenure_days": c.me(&st.addr).map(|m| m.days),
@@ -1363,7 +1518,7 @@ fn stats_json(st: &Stats) -> Value {
         "version": VERSION, "ts": now_unix(), "uptime_s": st.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
         "pool": st.endpoint, "mode": st.mode.label(), "network": st.network, "address": st.addr, "worker": st.worker,
         "connected": st.connected, "paused": st.paused, "blake2b_active": st.blake2b_active,
-        "hashrate_ghs": st.hr_total, "workers": workers,
+        "hashrate_ghs": st.hr_total, "workers": workers, "groups": sessions,
         "blocks": st.blocks, "shares_accepted": st.accepted, "shares_rejected": st.rejected, "donation_blocks": st.donated,
         "difficulty": st.diff, "best_share_diff": st.best_diff,
         "balance_btc": if st.balance_ok { Some(st.balance_btc) } else { None },
@@ -1402,7 +1557,8 @@ fn metrics_text(st: &Stats) -> String {
     }
     o.push_str("# HELP pyblock_worker_hashrate_ghs per-worker hashrate in GH/s\n# TYPE pyblock_worker_hashrate_ghs gauge\n");
     for (i, n) in st.gpu_names.iter().enumerate() {
-        o.push_str(&format!("pyblock_worker_hashrate_ghs{{worker=\"{}\",index=\"{}\"}} {}\n", n.replace('"', "'"), i, st.gpu_ghs.get(i).copied().unwrap_or(0.0)));
+        o.push_str(&format!("pyblock_worker_hashrate_ghs{{worker=\"{}\",index=\"{}\",pool=\"{}\"}} {}\n", n.replace('"', "'"), i,
+            st.session_of(i).map(|s| s.name.replace('"', "'")).unwrap_or_default(), st.gpu_ghs.get(i).copied().unwrap_or(0.0)));
     }
     o
 }
@@ -1427,11 +1583,52 @@ fn api_server(port: u16, stats: Arc<Mutex<Stats>>) {
 
 // ═══════════════════════ TABS / UI ═══════════════════════
 #[derive(Clone, Copy, PartialEq)]
-enum Tab { Mine, Data, Stratums, Learn, Network, Setup, Help }
-const TABS: [(Tab, &str); 7] = [
+enum Tab { Mine, Data, Stratums, Learn, Network, Setup, Help, Rig }
+const TABS: [(Tab, &str); 8] = [
     (Tab::Mine, "MINE"), (Tab::Data, "DATA"), (Tab::Stratums, "STRATUMS"), (Tab::Learn, "LEARN"),
-    (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"),
+    (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"), (Tab::Rig, "RIG"),
 ];
+
+// ── RIG tab helpers: who mines where, as a workers × pools grid ──
+// the pools a worker can be sent to: every stratum of the selected network (your address is per network)
+fn rig_pools(cfg: &Config) -> Vec<usize> {
+    let net = cfg.stratums.get(cfg.selected).map(|s| s.network.clone()).unwrap_or_default();
+    (0..cfg.stratums.len()).filter(|&i| cfg.stratums[i].network == net).collect()
+}
+// a worker's effective split as (stratum index, %) — the selected stratum at 100% when it has no assignment
+fn split_of(cfg: &Config, w: usize) -> Vec<(usize, f64)> {
+    let list: Vec<(usize, f64)> = cfg.gpu_pools.get(&w).map(|spec| parse_split(spec).into_iter()
+        .filter_map(|(n, p)| find_stratum(&cfg.stratums, &n).and_then(|s| cfg.stratums.iter().position(|x| x.name == s.name)).map(|i| (i, p))).collect()).unwrap_or_default();
+    if list.is_empty() { vec![(cfg.selected, 100.0)] } else { list }
+}
+// write a split back as a gpu_pools spec; "only the selected stratum" means no assignment at all
+fn set_split(cfg: &mut Config, w: usize, list: Vec<(usize, f64)>) {
+    let list: Vec<(usize, f64)> = list.into_iter().filter(|(_, p)| *p > 0.5).collect();
+    let total: f64 = list.iter().map(|(_, p)| p).sum();
+    if list.is_empty() || (list.len() == 1 && list[0].0 == cfg.selected) { cfg.gpu_pools.remove(&w); return; }
+    let spec = list.iter().map(|(i, p)| format!("{}:{:.0}", cfg.stratums[*i].name, p * 100.0 / total)).collect::<Vec<_>>().join("+");
+    cfg.gpu_pools.insert(w, spec);
+}
+// move `step`% of worker w onto pool p — taken from its biggest other share (a negative step gives that much away,
+// to its biggest other share, or back to the selected stratum when p was the only one)
+fn rig_nudge(cfg: &mut Config, w: usize, p: usize, step: f64) {
+    let mut list = split_of(cfg, w);
+    if !list.iter().any(|(i, _)| *i == p) { list.push((p, 0.0)); }
+    let k = list.iter().position(|(i, _)| *i == p).unwrap();
+    let biggest_other = |list: &Vec<(usize, f64)>| (0..list.len()).filter(|&j| j != k && list[j].1 > 0.0)
+        .max_by(|&a, &b| list[a].1.partial_cmp(&list[b].1).unwrap_or(std::cmp::Ordering::Equal));
+    if step > 0.0 {
+        if let Some(j) = biggest_other(&list) { let t = step.min(100.0 - list[k].1).min(list[j].1); list[j].1 -= t; list[k].1 += t; }
+    } else {
+        let give = (-step).min(list[k].1);
+        list[k].1 -= give;
+        match biggest_other(&list) {
+            Some(j) => list[j].1 += give,
+            None => { let sel = cfg.selected; if p != sel { list.push((sel, give)); } else { list[k].1 += give; } }
+        }
+    }
+    set_split(cfg, w, list);
+}
 
 enum Input { AddStratum, EditAddr, EditWorker, EditTelegram, EditUrl }
 struct App {
@@ -1445,6 +1642,9 @@ struct App {
     paused: Arc<AtomicBool>,   // shared with the engine: `p` toggles pause/resume of mining
     list_scroll: usize,   // ↑↓ offset into the CHIRP coinbase list (MINE + NETWORK tabs)
     update_armed: bool,   // first `u` arms, second `u` confirms the in-app update (any other key disarms)
+    select_after_edit: bool,   // Enter on the WAVICLES placeholder opened the URL editor → select + connect on confirm
+    rig_w: usize, rig_p: usize,       // RIG grid cursor: worker row, pool column
+    rig_dirty: Option<Instant>,       // RIG edits apply ~1.5s after the last keypress (one reconnect, not one per key)
     do_update: bool,      // set by the confirmed `u` → main leaves the TUI and runs the update
 }
 impl App {
@@ -1518,6 +1718,7 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
         Tab::Network => render_network(f, body, st, app),
         Tab::Setup => render_setup(f, body, app),
         Tab::Help => render_help(f, body),
+        Tab::Rig => render_rig(f, body, app, st),
     }
     // footer
     let foot = if let Some(k) = &app.input {
@@ -1536,6 +1737,8 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
         if matches!(st.mode, PoolMode::Chirp | PoolMode::Wavicles) && matches!(app.tab, Tab::Mine | Tab::Network) {
             sp.push(Span::styled("↑↓", Style::new().fg(GRN))); sp.push(Span::styled(if st.mode == PoolMode::Chirp { " coinbase list · " } else { " window list · " }, Style::new().fg(MUT)));
         }
+        if st.sessions.len() > 1 { sp.push(Span::styled("g", Style::new().fg(GRN)));
+            sp.push(dim(&if st.view_all { format!(" groups ({}) · ", st.sessions.len()) } else { format!(" group {}/{} · ", st.view.min(st.sessions.len() - 1) + 1, st.sessions.len()) })); }
         if st.update_available { sp.push(bold("u".into(), PNK)); sp.push(Span::styled(format!(" update to v{} · ", st.latest_version), Style::new().fg(PNK))); }
         sp.extend([Span::styled("p", Style::new().fg(GRN)),
                         Span::styled(if st.paused { " resume · " } else { " pause · " }, Style::new().fg(MUT)),
@@ -1553,15 +1756,22 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     // The mode panel (CHIRP coinbase list · CAROUSEL rotation · LOTTO odds) takes what its content needs,
     // within what the screen can spare after header + tiles + workers + sparkline + a small log.
     let head_h = header_rows(area.width);
-    let fixed = head_h + 5 + 5 + gpu_h + 4 + 6;
-    let want = mode_panel_rows(st, area.width) as u16 + 2;
+    let overview = st.sessions.len() > 1 && st.view_all;
+    let fixed = head_h + 5 + if overview { 0 } else { 5 } + gpu_h + 4 + 6;
+    let want = if overview { groups_panel_rows(st, area.width) as u16 + 2 } else { mode_panel_rows(st, area.width) as u16 + 2 };
     let panel_h = want.min(area.height.saturating_sub(fixed)).max(5);
-    let c = Layout::vertical([Constraint::Length(head_h), Constraint::Length(5), Constraint::Length(5),
-        Constraint::Length(panel_h), Constraint::Length(gpu_h), Constraint::Length(4), Constraint::Min(3)]).split(area);
+    let c = if overview {
+        // multi-pool rig: the whole rig at a glance — every group, its pool, hashrate, shares and what it pays (g drills in)
+        Layout::vertical([Constraint::Length(head_h), Constraint::Length(5), Constraint::Length(0),
+            Constraint::Length(panel_h), Constraint::Length(gpu_h), Constraint::Length(4), Constraint::Min(3)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Length(head_h), Constraint::Length(5), Constraint::Length(5),
+            Constraint::Length(panel_h), Constraint::Length(gpu_h), Constraint::Length(4), Constraint::Min(3)]).split(area)
+    };
     render_header(f, c[0], st);
     render_your_tiles(f, c[1], st);
-    render_net_tiles(f, c[2], st);
-    render_mode_panel(f, c[3], st, app);
+    if overview { render_groups_panel(f, c[3], st); }
+    else { render_net_tiles(f, c[2], st); render_mode_panel(f, c[3], st, app); }
     // workers
     let mut glines: Vec<Line> = vec![];
     for (i, g) in st.gpu_ghs.iter().enumerate() {
@@ -1570,6 +1780,18 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
         let mut sp = vec![dim(&format!("  {:>2}  ", i)), Span::styled(format!("{:<28}", name), Style::new().fg(if down { MUT } else { WHT }))];
         if down { sp.push(Span::styled("○ offline · auto-respawning", Style::new().fg(Color::Red))); }
         else { sp.push(bold(format!("{:>7.2}", g), GRN)); sp.push(dim(" GH/s")); }
+        // multi-pool rigs: which pool(s) this worker mines, with its share for split workers (the viewed group is lit)
+        if st.sessions.len() > 1 {
+            sp.push(dim("   "));
+            for (k, (s, pct)) in st.sessions_of(i).into_iter().enumerate() {
+                let viewed = !st.view_all && st.sessions.get(st.view).map(|v| v.pool == s.pool).unwrap_or(false);
+                if k > 0 { sp.push(dim(" + ")); }
+                sp.push(Span::styled(format!("{} {}", s.mode.icon(), s.name), Style::new().fg(if viewed || st.view_all { s.mode.accent() } else { MUT })));
+                if (pct - 100.0).abs() > 1e-9 { sp.push(dim(&format!(" {:.0}%", pct))); }
+                if s.wrong_algo { sp.push(Span::styled(" ⛔", Style::new().fg(Color::Red))); }
+                else if !s.connected { sp.push(Span::styled(if s.note.is_empty() { " ○ offline".to_string() } else { format!(" ○ {}", s.note) }, Style::new().fg(AMB))); }
+            }
+        }
         glines.push(Line::from(sp));
     }
     if glines.is_empty() { glines.push(Line::from(dim("  warming up…"))); }
@@ -1589,7 +1811,83 @@ fn render_mine(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
 // ── header: which pool MODE you're on, chain, connection, and — the thing a miner cares about — who gets paid ──
 // 2 content rows on wide terminals; on narrow ones the address/balance and the payout get a row each (nothing truncates)
 fn header_rows(width: u16) -> u16 { if width < 132 { 5 } else { 4 } }
+// one line of "what this group pays you right now", per mode — the overview's rightmost column
+fn group_payline(st: &Stats, s: &SessionView) -> String {
+    match s.mode {
+        PoolMode::Chirp => match st.chirp.as_ref() {
+            Some(c) => match c.me(&st.addr) {
+                Some(m) if m.eligible => format!("your slice {:.2}% ≈ {} / block", c.my_pct(&st.addr).unwrap_or(0.0), fmt_btc(c.reward_sats as f64 / 1e8 * c.my_pct(&st.addr).unwrap_or(0.0) / 100.0 * c.keep())),
+                Some(m) => format!("joining the draw · {:.1} of {:.0} days", m.days, c.min_days),
+                None => "not in the coinbase draw yet".into() },
+            None => "coinbase draw loading…".into() },
+        PoolMode::Wavicles => match st.wavicles.as_ref() {
+            Some(w) => match w.me(&st.addr) {
+                Some(m) => format!("window {:.2}% ≈ {} if a block hits{}", m.share_pct, fmt_btc(m.payout_sats as f64 / 1e8), if m.payable { "" } else { " · ⚠ not payable" }),
+                None => "not in the TIDES window yet".into() },
+            None => "TIDES window loading…".into() },
+        PoolMode::Carousel => st.carousel.as_ref().map(|k| format!("now mining {}'s template · keep 96%", k.current)).unwrap_or_else(|| "rotation loading…".into()),
+        PoolMode::Lotto => { let eta = net_eta(st, s.hr); format!("solo · ~{} per block · keep 99.1%", fmt_dur(eta)) }
+        PoolMode::Custom => "operator's rules".into(),
+    }
+}
+// ── multi-pool overview: one row per GPU group — pool · link · hashrate · workers (with splits) · diff · shares · payline ──
+fn groups_panel_rows(st: &Stats, width: u16) -> usize { st.sessions.len() * if width < 152 { 2 } else { 1 } + 2 }
+fn render_groups_panel(f: &mut Frame, area: Rect, st: &Stats) {
+    let wide = area.width >= 152;   // one row per group; narrower terminals put "pays you" on a second, indented row
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        format!("  {:<30} {:<9} {:>10}   {:<22} {:>8}  {:>14}{}", "GROUP", "LINK", "HASHRATE", "WORKERS", "DIFF", "ACC · REJ", if wide { "   PAYS YOU" } else { "" }), Style::new().fg(DIM)))];
+    for (gi, s) in st.sessions.iter().enumerate() {
+        let (link, lcol) = if s.wrong_algo { ("⛔ SHA-256", Color::Red) } else if s.connected { ("● LIVE", GRN) } else { ("○ offline", AMB) };
+        let workers = s.workers.iter().zip(&s.pcts).map(|(w, p)| if (*p - 100.0).abs() < 1e-9 { w.to_string() } else { format!("{} ({:.0}%)", w, p) }).collect::<Vec<_>>().join(", ");
+        // an offline group says WHY in the pays-you column — the fix is usually one keypress away
+        let payline = if !s.connected && !s.note.is_empty() { format!("⚠ {}", s.note) } else { group_payline(st, s) };
+        let paycol = if !s.connected && !s.note.is_empty() { AMB } else { s.mode.accent() };
+        let name: String = format!("{} {}", s.mode.icon(), s.name).chars().take(30).collect();
+        let mut sp = vec![
+            dim(&format!("{:>2}", gi + 1)), Span::raw(" "),
+            Span::styled(format!("{:<30}", name), Style::new().fg(s.mode.accent()).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {:<9}", link), Style::new().fg(lcol)),
+            bold(format!("{:>7.2}", s.hr), GRN), dim(" GH/s   "),
+            Span::styled(format!("{:<22}", workers), Style::new().fg(WHT)),
+            dim(&format!(" {:>8}", if s.diff > 0.0 { format!("{:.0}", s.diff) } else { "—".into() })),
+            dim(&format!("  {:>7} · {:<4}", s.acc, s.rej)),
+        ];
+        if wide { sp.push(Span::styled(payline, Style::new().fg(paycol))); lines.push(Line::from(sp)); }
+        else { lines.push(Line::from(sp)); lines.push(Line::from(vec![dim("       ↳ "), Span::styled(payline, Style::new().fg(paycol))])); }
+    }
+    let live = st.sessions.iter().filter(|s| s.connected && !s.wrong_algo).count();
+    let total: f64 = st.sessions.iter().map(|s| s.hr).sum();   // smoothed per-group rates, so the sum matches the rows
+    let title = format!("⚙ GROUPS · {} pools · {} of {} live · {:.1} GH/s total · g drills into a group", st.sessions.len(), live, st.sessions.len(), total);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&title, WHT)), area);
+}
 fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
+    // multi-pool rig, overview: no single mode to announce — the groups are the story
+    if st.sessions.len() > 1 && st.view_all {
+        let narrow = header_rows(area.width) == 5;
+        let live = st.sessions.iter().filter(|s| s.connected && !s.wrong_algo).count();
+        let dot = if st.paused { bold("⏸ PAUSED".into(), YLW) }
+                  else if live == st.sessions.len() { Span::styled(format!("● LIVE · {} pools", live), Style::new().fg(GRN)) }
+                  else if live > 0 { bold(format!("● {} of {} pools live", live, st.sessions.len()), AMB) }
+                  else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
+        let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
+        let mut l1 = vec![bold("⚙ MULTI-POOL BLAKE2b".into(), WHT), Span::raw("  "),
+            Span::styled(nt, Style::new().fg(Color::Black).bg(nco).add_modifier(Modifier::BOLD)), Span::raw("  "), dot,
+            dim(&format!("   {} workers across {} groups", st.gpu_names.len(), st.sessions.len()))];
+        if st.update_available { l1.push(bold(format!("   ⬆ v{} available — press u to update", st.latest_version), PNK)); }
+        let bal = if st.balance_ok { format!("balance {:.8} BTC", st.balance_btc) } else { "balance —".to_string() };
+        let mut chips: Vec<Span<'static>> = vec![dim(if narrow { "groups        " } else { "   " })];
+        for (i, s) in st.sessions.iter().enumerate() {
+            if i > 0 { chips.push(dim(" · ")); }
+            chips.push(Span::styled(format!("{} {}", s.mode.icon(), s.mode.label()), Style::new().fg(s.mode.accent())));
+            chips.push(dim(&format!(" {:.1} GH/s", s.hr)));
+        }
+        let mut l2 = vec![dim("your address  "), Span::styled(st.addr.clone(), Style::new().fg(CYN)),
+            dim(&if st.worker.is_empty() { String::new() } else { format!(".{}", st.worker) }), Span::styled(format!("   {}", bal), Style::new().fg(GRN))];
+        if st.donate > 0.0 { chips.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
+        let lines = if narrow { vec![Line::from(l1), Line::from(l2), Line::from(chips)] } else { l2.extend(chips); vec![Line::from(l1), Line::from(l2)] };
+        f.render_widget(Paragraph::new(Text::from(lines)).block(card(&format!("⛏ Bitcoin BLAKE2b · multi-pool rig · {} groups · g drills into a group", st.sessions.len()), WHT)), area);
+        return;
+    }
     let m = st.mode; let ac = m.accent();
     // engine heartbeat: connected + unpaused + not gated, yet no loop iteration for 20s → something blocked the engine
     let stalled = st.connected && !st.paused && st.blake2b_active != Some(false)
@@ -1598,6 +1896,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
               else if st.blake2b_active == Some(false) { bold("⏳ WAITING · SHA-256d".into(), AMB) }
               else if st.wrong_algo { bold("⛔ SHA-256 WORK · not mining".into(), Color::Red) }
               else if stalled { bold("⚠ ENGINE STALLED".into(), Color::Red) }
+              else if st.endpoint == WAVICLES_PLACEHOLDER { bold("⚙ SET YOUR GATEWAY · STRATUMS → Enter".into(), AMB) }
               else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
               else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
     let (nt, nco) = match st.network.as_str() { "mainnet" => (" MAINNET ", GRN), "testnet4" => (" TESTNET4 ", YLW), _ => (" REGTEST ", AMB) };
@@ -1644,7 +1943,10 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
     }
     if st.donate > 0.0 { l2.push(Span::styled(format!(" · donation {:.1}% → PyBLØCK", st.donate), Style::new().fg(AMB))); }
     let lines = if narrow { vec![Line::from(l1), Line::from(l3), Line::from(l2)] } else { vec![Line::from(l1), Line::from(l2)] };
-    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&format!("⛏ Bitcoin BLAKE2b · {}", m.tagline()), ac)), area);
+    let title = if st.sessions.len() > 1 { let v = st.view.min(st.sessions.len() - 1);
+        format!("⛏ Bitcoin BLAKE2b · {} · group {}/{} · {} · workers {:?} · g next", m.tagline(), v + 1, st.sessions.len(), st.sessions[v].name, st.sessions[v].workers) }
+        else { format!("⛏ Bitcoin BLAKE2b · {}", m.tagline()) };
+    f.render_widget(Paragraph::new(Text::from(lines)).block(card(&title, ac)), area);
 }
 
 fn render_your_tiles(f: &mut Frame, area: Rect, st: &Stats) {
@@ -1748,7 +2050,7 @@ fn render_wavicles_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
         f.render_widget(Paragraph::new(Text::from(vec![
             Line::from(dim("  loading the TIDES window from the pool…")),
             Line::from(dim("  this stratum must be YOUR DATUM gateway's stratum (STRATUMS [3] → e to set host:port) — the pool port :28915 is for the gateway, not for miners")),
-        ])).wrap(Wrap { trim: false }).block(card("ᛞ WAVICLES · the TIDES window", BLU)), area);
+        ])).wrap(Wrap { trim: false }).block(card(&format!("{} WAVICLES · the TIDES window", rune()), BLU)), area);
         return;
     };
     let show_hr = inner_w >= 100;
@@ -1790,7 +2092,7 @@ fn render_wavicles_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
     let off = scroll.min(rows.len().saturating_sub(vis));
     let shown: Vec<Line<'static>> = rows.iter().skip(off).take(vis).cloned().collect();
     let scroll_hint = if rows.len() > vis && vis > 0 { format!(" · ↑↓ {}–{} of {}", off + 1, (off + vis).min(rows.len()), rows.len()) } else { String::new() };
-    let title = format!("ᛞ WAVICLES · the TIDES window · {} identities{} · updated {} ago", w.miners.len(), scroll_hint, fmt_ago(now.saturating_sub(w.fetched)));
+    let title = format!("{} WAVICLES · the TIDES window · {} identities{} · updated {} ago", rune(), w.miners.len(), scroll_hint, fmt_ago(now.saturating_sub(w.fetched)));
     let block = card(&title, BLU);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2054,7 +2356,7 @@ fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
         let mut l1 = Line::from(vec![
             Span::styled(if active { " ● " } else if cur { " › " } else { "   " }, Style::new().fg(if active { GRN } else { ac })),
             Span::raw(format!("{} ", m.icon())),
-            Span::styled(format!("{:<24}", s.name), name_st),
+            Span::styled(format!("{:<34}", s.name), name_st),
             dim(&format!("{:<26}", s.url)),
             Span::styled(format!("{:<10}", s.network), Style::new().fg(AMB)),
             Span::styled(if s.custom { "custom  " } else { "        " }, Style::new().fg(DIM)),
@@ -2132,6 +2434,13 @@ fn render_network(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     render_mode_panel(f, c[2], st, app);
 }
 
+fn gpu_pools_summary(cfg: &Config) -> String {
+    let mut v: Vec<(usize, String)> = cfg.gpu_pools.iter().map(|(w, spec)| (*w, parse_split(spec).iter()
+        .map(|(n, p)| { let name = find_stratum(&cfg.stratums, n).map(|s| s.name.clone()).unwrap_or_else(|| format!("{}?", n));
+                        if (p - 100.0).abs() < 1e-9 { name } else { format!("{} {:.0}%", name, p) } }).collect::<Vec<_>>().join(" + "))).collect();
+    v.sort();
+    v.iter().map(|(w, n)| format!("worker {} → {}", w, n)).collect::<Vec<_>>().join(" · ")
+}
 fn render_setup(f: &mut Frame, area: Rect, app: &App) {
     let net = app.network();
     let addr = app.addr();
@@ -2158,15 +2467,85 @@ fn render_setup(f: &mut Frame, area: Rect, app: &App) {
                            dim("   (blocks · GPU down/up · pool outage · CHIRP eligibility)")]),
         row("log file", vec![dim(&logp)]),
         row("local api", vec![dim(&api)]),
+        row("gpu pools", vec![if app.cfg.gpu_pools.is_empty() { dim("every worker mines the selected stratum  (r → RIG tab to send GPUs to other pools or split their power)") }
+                               else { Span::styled(gpu_pools_summary(&app.cfg), Style::new().fg(GRN)) }, dim("   (r → RIG)")]),
         row("updates", vec![dim(&format!("the pool announces new versions → alert + ⬆ in the header · press u to update in-app · headless auto-update {}", onoff(app.cfg.auto_update)))]),
         Line::from(""),
         Line::from([key("g", "generate address   "), key("e", "edit/paste address   "), key("w", "worker name   "), key("c", "toggle CPU   "), key("+/-", "donation")].concat()),
-        Line::from([key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "send a test alert")].concat()),
+        Line::from([key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "send a test alert   "), key("r", "GPU → pool assignments")].concat()),
         Line::from(dim("  changes auto-save + apply live · devices, log file and api port apply on restart")),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("SETUP · address, worker, alerts, config (saved)", GRN)), area);
 }
 
+// ── RIG: who mines where — a workers × pools grid you steer with the arrows ──
+fn render_rig(f: &mut Frame, area: Rect, app: &App, st: &Stats) {
+    let cfg = &app.cfg;
+    let pools = rig_pools(cfg);
+    let nw = st.gpu_names.len();
+    // column titles on two rows: the pool MODE (🎰 LOTTO · 🌌 CHIRP · 🎠 CAROUSEL · ᛞ WAVICLES) and, under it, what tells
+    // same-mode entries apart ("your node", "PyBLØCK's node", a custom name) plus "selected" / "set URL first"
+    let colw = 16usize;
+    let tail = |s: &Stratum| -> String { let m = pool_mode(&s.url, &s.name);
+        let n = s.name.replace("PyBLØCK · ", "").replace("WAVICLES · ", ""); let n = n.split(" (").next().unwrap_or(&n).trim().to_string();
+        if n.eq_ignore_ascii_case(m.label()) { String::new() } else { n.chars().take(14).collect() } };
+    let mut lines: Vec<Line<'static>> = vec![];
+    let cur_col = app.rig_p.min(pools.len().saturating_sub(1));
+    let mut head = vec![dim(&format!("  {:<30} {:>9}  ", "WORKER", "NOW"))];
+    let mut sub = vec![dim(&format!("  {:<30} {:>9}  ", "", ""))];
+    for (k, &pi) in pools.iter().enumerate() {
+        let s = &cfg.stratums[pi]; let m = pool_mode(&s.url, &s.name);
+        let st_col = Style::new().fg(if k == cur_col { m.accent() } else { MUT }).add_modifier(if k == cur_col { Modifier::BOLD } else { Modifier::empty() });
+        head.push(Span::styled(format!("{:^w$}", format!("{} {}", m.icon(), m.label()), w = colw), st_col));
+        let t = tail(s);
+        let mark = if pi == cfg.selected { "selected" } else if s.url == WAVICLES_PLACEHOLDER { "set URL first" } else { "" };
+        let line2 = if t.is_empty() { mark.to_string() } else if mark.is_empty() { t } else { format!("{} · {}", t, mark) };
+        sub.push(Span::styled(format!("{:^w$}", line2.chars().take(colw).collect::<String>(), w = colw), Style::new().fg(if k == cur_col { m.accent() } else { DIM })));
+    }
+    lines.push(Line::from(head));
+    lines.push(Line::from(sub));
+    // rows: workers
+    for w in 0..nw {
+        let cur_row = w == app.rig_w.min(nw.saturating_sub(1));
+        let split = split_of(cfg, w);
+        let assigned = cfg.gpu_pools.contains_key(&w);
+        let name: String = st.gpu_names[w].chars().take(28).collect();
+        let hr = st.gpu_ghs.get(w).copied().unwrap_or(0.0);
+        let mut sp = vec![Span::styled(if cur_row { "▶ " } else { "  " }.to_string(), Style::new().fg(GRN)),
+            Span::styled(format!("{:<30}", format!("{} {}", w, name)), Style::new().fg(if cur_row { WHT } else { MUT }).add_modifier(if cur_row { Modifier::BOLD } else { Modifier::empty() })),
+            dim(&format!("{:>5.2} GH/s  ", hr))];
+        for (k, &pi) in pools.iter().enumerate() {
+            let pct = split.iter().find(|(i, _)| *i == pi).map(|(_, p)| *p).unwrap_or(0.0);
+            let m = pool_mode(&cfg.stratums[pi].url, &cfg.stratums[pi].name);
+            let cell = if pct > 0.5 { format!("{:.0}%", pct) } else { "·".to_string() };
+            let cell = if pct > 0.5 && !assigned { format!("{}·", cell) } else { cell };   // trailing dot = implicit default
+            let mut style = if pct > 0.5 { Style::new().fg(if assigned { m.accent() } else { MUT }).add_modifier(if assigned { Modifier::BOLD } else { Modifier::empty() }) } else { Style::new().fg(DIM) };
+            if cur_row && k == app.rig_p.min(pools.len().saturating_sub(1)) { style = style.add_modifier(Modifier::REVERSED); }
+            sp.push(Span::styled(format!("{:^w$}", cell, w = colw), style));
+        }
+        lines.push(Line::from(sp));
+    }
+    if nw == 0 { lines.push(Line::from(dim("  no workers yet — the grinders are starting…"))); }
+    lines.push(Line::from(""));
+    // per-pool result, live
+    let mut tot = vec![dim("  per pool now   ")];
+    if st.sessions.is_empty() { tot.push(dim("—")); }
+    for (i, s) in st.sessions.iter().enumerate() {
+        if i > 0 { tot.push(dim("  ·  ")); }
+        tot.push(Span::styled(format!("{} {}", s.mode.icon(), s.name.replace("PyBLØCK · ", "")), Style::new().fg(s.mode.accent())));
+        tot.push(dim(&format!(" {:.1} GH/s · {} acc", s.hr, s.acc)));
+        if !s.connected { tot.push(Span::styled(if s.note.is_empty() { " ○ offline".to_string() } else { format!(" ○ {}", s.note) }, Style::new().fg(AMB))); }
+    }
+    lines.push(Line::from(tot));
+    lines.push(Line::from(""));
+    let k = |key: &str, what: &str| vec![Span::styled(format!("  {}", key), Style::new().fg(GRN)), dim(&format!(" {}", what))];
+    lines.push(Line::from([k("↑↓", "worker   "), k("←→", "pool   "), k("Enter", "whole worker here   "), k("+ / −", "move 10% of its power   "), k("0", "back to the selected stratum")].concat()));
+    lines.push(Line::from([k("a", "everyone here   "), k("c", "clear all   "), vec![Span::raw("    "),
+        dim("a worker with no assignment mines the selected stratum (shown as 100%·) · one pool session per column in use · a split worker alternates its sweeps in that proportion")]].concat()));
+    lines.push(Line::from(dim(if app.rig_dirty.is_some() { "  ⟳ applying…" } else { "  changes save instantly and apply a moment after your last key" })));
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false })
+        .block(card(&format!("RIG · who mines where · {} workers × {} pools on {}", nw, pools.len(), cfg.stratums.get(cfg.selected).map(|s| s.network.as_str()).unwrap_or("?")), GRN)), area);
+}
 fn render_help(f: &mut Frame, area: Rect) {
     let l = |a: &str, b: &str| Line::from(vec![Span::styled(format!("  {:<17} ", a), Style::new().fg(GRN)), Span::styled(b.to_string(), Style::new().fg(MUT))]);
     let lines = vec![
@@ -2177,7 +2556,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("q / Esc", "quit (Esc also cancels an input)"),
         l("STRATUMS", "↑↓ move · Enter switch live · a add · d delete custom"),
         l("SETUP", "g generate · e edit address · w worker name · c CPU · +/- donation · b bell · n desktop · t telegram · x test alert"),
-        l("MINE / NETWORK", "on CHIRP: ↑↓ PgUp PgDn Home scroll the coinbase list (everyone in the draw)"),
+        l("MINE / NETWORK", "on CHIRP / WAVICLES: ↑↓ PgUp PgDn Home scroll the list · g next GPU group (multi-pool rigs)"),
+        l("RIG [8]", "who mines where: ↑↓ worker · ←→ pool · Enter = whole worker there · + / − = move 10% of its power · 0 = back to the selected stratum · a = everyone there · c = clear all"),
+        l("  how it works", "one stratum session per pool; a split worker alternates sweeps in proportion · MINE becomes a rig overview, g drills into a group · CLI: --gpu-pool 0=CHIRP,1=WAVICLES:70+LOTTO:30"),
         Line::from(""),
         Line::from(Span::styled(" Alerts · log · API", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
         l("alerts", "block found · GPU down / back · pool unreachable / back · CHIRP: on the list, in the draw, falling out, dropped"),
@@ -2191,7 +2572,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("🎰 LOTTO :4445", &PoolMode::Lotto.payout()),
         l("🌌 CHIRP :5574", &PoolMode::Chirp.payout()),
         l("🎠 CAROUSEL :30110", &PoolMode::Carousel.payout()),
-        l("ᛞ WAVICLES", &PoolMode::Wavicles.payout()),
+        l(&format!("{} WAVICLES", rune()), &PoolMode::Wavicles.payout()),
+        l("  the rune", "WAVICLES' mark is the Dagaz rune ᛞ; most terminal fonts lack it, so the miner shows the look-alike ⋈ · --rune unicode (or config \"rune\": \"unicode\") for the real ᛞ"),
         l("  how", "run a Knots BLAKE2b node + a DATUM gateway (pool b.pyblock.xyz:28915) · STRATUMS → WAVICLES → e → your gateway's host:port · MINE shows the TIDES window"),
         l("  SHA-256 work", "if a stratum sends SHA-256 jobs (a regular pool, a SHA-256 gateway) the miner refuses them: ⛔ badge + alert, no wasted power"),
         l("coinbase panel", "MINE shows who the next block pays: CHIRP lists every eligible miner + share; CAROUSEL the live template"),
@@ -2217,12 +2599,21 @@ fn render_help(f: &mut Frame, area: Rect) {
 }
 
 // apply the current selected stratum + address to the live engine target + stats display
+// worker → [(pool url, stratum name, %)] for every gpu_pools spec whose names resolve to stratums (unknown names are dropped)
+fn build_assign(cfg: &Config) -> HashMap<usize, Vec<(String, String, f64)>> {
+    cfg.gpu_pools.iter().filter_map(|(i, spec)| {
+        let v: Vec<(String, String, f64)> = parse_split(spec).into_iter()
+            .filter_map(|(n, pct)| find_stratum(&cfg.stratums, &n).map(|s| (s.url.clone(), s.name.clone(), pct))).collect();
+        if v.is_empty() { None } else { Some((*i, v)) }
+    }).collect()
+}
 fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) {
     let s = match app.cfg.stratums.get(app.cfg.selected) { Some(s) => s.clone(), None => return };
     let addr = app.addr();
     let donate = if net_cfg(&s.network).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
     let worker = clean_worker(&app.cfg.worker);
-    { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.addr = addr.clone(); t.worker = worker.clone(); t.network = s.network.clone(); t.donate = donate; }
+    { let mut t = tgt.lock().unwrap(); t.pool = s.url.clone(); t.name = s.name.clone(); t.addr = addr.clone(); t.worker = worker.clone(); t.network = s.network.clone(); t.donate = donate;
+      t.assign = build_assign(&app.cfg); }
     { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.worker = worker; st.alerts = app.cfg.alerts.clone();
       st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false;
       // pool mode drives the MINE/NETWORK panels; drop the old mode's data so the new one starts clean (poller refills within ~1s)
@@ -2263,7 +2654,7 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
     // input mode: type into the buffer
     if let Some(kind) = &app.input {
         match code {
-            KeyCode::Esc => { app.input = None; app.buf.clear(); }
+            KeyCode::Esc => { app.input = None; app.buf.clear(); app.select_after_edit = false; }
             KeyCode::Backspace => { app.buf.pop(); }
             KeyCode::Enter => {
                 let buf = app.buf.clone();
@@ -2296,7 +2687,11 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                                 app.msg = format!("{} → {}", s.name, s.url);
                             }
                             save_config(&app.cfg);
-                            if app.strat_cur == app.cfg.selected { apply_target(app, tgt, stats); }
+                            if app.select_after_edit || app.strat_cur == app.cfg.selected {
+                                app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats); app.list_scroll = 0;
+                                if app.select_after_edit { app.msg = format!("WAVICLES · connecting to your gateway at {}", app.cfg.stratums[app.strat_cur].url); }
+                            }
+                            app.select_after_edit = false;
                         } else { app.msg = "format: host:port".into(); }
                     }
                     Input::EditTelegram => {
@@ -2321,13 +2716,29 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
     // normal mode
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Char(c @ '1'..='7') => { app.tab = TABS[c as usize - '1' as usize].0; }
+        KeyCode::Char(c @ '1'..='8') => { app.tab = TABS[c as usize - '1' as usize].0; }
         KeyCode::Tab => { let i = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0); app.tab = TABS[(i + 1) % TABS.len()].0; }
         // pause/resume mining — works from any tab (the engine picks it up within ~120ms; connection stays alive)
         KeyCode::Char('p') => {
             let v = !app.paused.load(Ordering::Relaxed);
             app.paused.store(v, Ordering::Relaxed);
             app.msg = if v { "⏸ mining paused — press p to resume".into() } else { "▶ mining resumed".into() };
+        }
+        // multi-pool rigs: `g` cycles which GPU group the header / tiles / panel show
+        KeyCode::Char('g') => {
+            let mut st = stats.lock().unwrap();
+            let n = st.sessions.len();
+            // overview → group 1 → group 2 → … → overview
+            if n > 1 {
+                app.list_scroll = 0;
+                if st.view_all { st.view_all = false; st.view = 0; }
+                else if st.view + 1 < n { st.view += 1; }
+                else { st.view_all = true; st.view = 0; }
+                let s = st.sessions[st.view].clone();
+                // switch the header / tiles / panel right now (the engine would catch up a sweep later)
+                st.mode = s.mode; st.endpoint = s.pool.clone(); st.connected = s.connected; st.wrong_algo = s.wrong_algo;
+                app.msg = if st.view_all { format!("overview · {} groups · g drills into a group", n) } else { format!("group {}/{} · {} · workers {:?} · g next", st.view + 1, n, s.name, s.workers) }; }
+            else { app.msg = "one group — send GPUs to other pools in SETUP → r  (0=CHIRP,1=WAVICLES)".into(); }
         }
         // in-app update: u arms, u again pulls + builds + relaunches (mining stops for the build, ~1–2 min)
         KeyCode::Char('u') => {
@@ -2343,9 +2754,17 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
             Tab::Stratums => match code {
                 KeyCode::Up => { if app.strat_cur > 0 { app.strat_cur -= 1; } }
                 KeyCode::Down => { if app.strat_cur + 1 < app.cfg.stratums.len() { app.strat_cur += 1; } }
-                KeyCode::Enter => { app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats); app.list_scroll = 0;
-                    let s = &app.cfg.stratums[app.strat_cur];
-                    app.msg = format!("switched to {} · {}", s.name, pool_mode(&s.url, &s.name).payout()); }
+                KeyCode::Enter => {
+                    // the WAVICLES placeholder has no address yet: Enter opens the editor right away and the entry
+                    // is selected + connected the moment a host:port is confirmed (no dead "OFFLINE" state to explain)
+                    if app.cfg.stratums.get(app.strat_cur).map(|s| s.url == WAVICLES_PLACEHOLDER).unwrap_or(false) {
+                        app.input = Some(Input::EditUrl); app.buf.clear(); app.select_after_edit = true;
+                        app.msg = "WAVICLES · your node: type your DATUM gateway's stratum host:port (CONVOY default 127.0.0.1:23334) · Enter connects".into();
+                    } else {
+                        app.cfg.selected = app.strat_cur; save_config(&app.cfg); apply_target(app, tgt, stats); app.list_scroll = 0;
+                        let s = &app.cfg.stratums[app.strat_cur];
+                        app.msg = format!("switched to {} · {}", s.name, pool_mode(&s.url, &s.name).payout());
+                    } }
                 KeyCode::Char('a') => { app.input = Some(Input::AddStratum); app.buf.clear(); }
                 KeyCode::Char('e') => { app.input = Some(Input::EditUrl);
                     app.buf = app.cfg.stratums.get(app.strat_cur).map(|s| if s.url == WAVICLES_PLACEHOLDER { String::new() } else { s.url.clone() }).unwrap_or_default(); }
@@ -2380,6 +2799,39 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                 KeyCode::Right => { if app.learn_page + 1 < 4 { app.learn_page += 1; } }   // 4 LEARN pages
                 _ => {}
             },
+            // RIG: the workers × pools grid. Every edit saves at once and applies ~1.5s after the last key.
+            Tab::Rig => {
+                let pools = rig_pools(&app.cfg);
+                let nw = stats.lock().unwrap().gpu_names.len();
+                if pools.is_empty() || nw == 0 { return false; }
+                app.rig_w = app.rig_w.min(nw - 1); app.rig_p = app.rig_p.min(pools.len() - 1);
+                let (w, p) = (app.rig_w, pools[app.rig_p]);
+                let mut changed = true;
+                match code {
+                    KeyCode::Up => { app.rig_w = app.rig_w.saturating_sub(1); changed = false; }
+                    KeyCode::Down => { if app.rig_w + 1 < nw { app.rig_w += 1; } changed = false; }
+                    KeyCode::Left => { app.rig_p = app.rig_p.saturating_sub(1); changed = false; }
+                    KeyCode::Right => { if app.rig_p + 1 < pools.len() { app.rig_p += 1; } changed = false; }
+                    // a WAVICLES column without a gateway address can't be mined: Enter / + / a open the address editor
+                    // for that entry instead (type host:port, then assign) — no silent "offline" group
+                    KeyCode::Enter | KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('a') if app.cfg.stratums[p].url == WAVICLES_PLACEHOLDER => {
+                        app.strat_cur = p; app.input = Some(Input::EditUrl); app.buf.clear(); changed = false;
+                        app.msg = "this WAVICLES entry has no gateway yet — type your DATUM gateway's host:port, then assign the worker".into();
+                    }
+                    KeyCode::Enter => { set_split(&mut app.cfg, w, vec![(p, 100.0)]); }
+                    KeyCode::Char('+') | KeyCode::Char('=') => { rig_nudge(&mut app.cfg, w, p, 10.0); }
+                    KeyCode::Char('-') | KeyCode::Char('_') => { rig_nudge(&mut app.cfg, w, p, -10.0); }
+                    KeyCode::Char('0') | KeyCode::Delete | KeyCode::Backspace => { app.cfg.gpu_pools.remove(&w); }
+                    KeyCode::Char('a') => { for i in 0..nw { set_split(&mut app.cfg, i, vec![(p, 100.0)]); } }
+                    KeyCode::Char('c') => { app.cfg.gpu_pools.clear(); }
+                    _ => { changed = false; }
+                }
+                if changed {
+                    save_config(&app.cfg); app.rig_dirty = Some(Instant::now());
+                    let s = split_of(&app.cfg, w).iter().map(|(i, pct)| format!("{} {:.0}%", app.cfg.stratums[*i].name, pct)).collect::<Vec<_>>().join(" + ");
+                    app.msg = format!("worker {} → {}   (applies in a moment)", w, s);
+                }
+            }
             Tab::Setup => match code {
                 KeyCode::Char('g') => {
                     let net = app.network();
@@ -2402,6 +2854,7 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                 KeyCode::Char('n') => { app.cfg.alerts.desktop = !app.cfg.alerts.desktop; save_config(&app.cfg); apply_target(app, tgt, stats);
                                         app.msg = format!("desktop notifications {}", if app.cfg.alerts.desktop { "on" } else { "off" }); }
                 KeyCode::Char('x') => { let mut st = stats.lock().unwrap(); alert(&mut st, "test alert", "if you can read this, alerts work"); app.msg = "test alert sent — check bell / desktop / telegram".into(); }
+                KeyCode::Char('r') => { app.tab = Tab::Rig; app.msg = "RIG: ↑↓ worker · ←→ pool · Enter all here · + / − 10% · 0 default · a everyone here".into(); }
                 KeyCode::Char('+') => { app.cfg.donate += 1.0; save_config(&app.cfg); apply_target(app, tgt, stats); }
                 KeyCode::Char('-') => { app.cfg.donate = (app.cfg.donate - 1.0).max(DONATE_MIN); save_config(&app.cfg); apply_target(app, tgt, stats); }
                 _ => {}
@@ -2447,9 +2900,13 @@ fn main() {
             "--no-log-file" => { cfg.log_file = false; }
             "--no-bell" => { cfg.alerts.bell = false; }
             "--no-desktop" => { cfg.alerts.desktop = false; }
+            "--rune" => { i += 1; if i < args.len() { cfg.rune = args[i].to_lowercase(); } }   // unicode | bowtie
             "--auto-update" => { cfg.auto_update = true; }
             "--sweep-ms" => { i += 1; if i < args.len() { cfg.sweep_ms = args[i].parse().unwrap_or(0); } }
             "--gpu-iter" => { i += 1; if i < args.len() { cfg.gpu_iter = args[i].parse().unwrap_or(0); } }
+            // per-GPU pools: --gpu-pool 0=CHIRP,1=WAVICLES,2=my-pool  (an empty name clears that GPU → selected stratum)
+            "--gpu-pool" | "--gpu-pools" => { i += 1; if i < args.len() {
+                for (w, n) in parse_gpu_pools(&args[i]) { if n.is_empty() { cfg.gpu_pools.remove(&w); } else { cfg.gpu_pools.insert(w, n); } } } }
             "--update" => { update_now = true; }
             "--update-to" => { i += 1; if i < args.len() { update_now = true; update_to = args[i].trim_start_matches('v').to_string(); } }   // pin a release (support / rollback / testing)
             "--donate" => { i += 1; if i < args.len() { cfg.donate = args[i].parse().unwrap_or(DONATE_MIN); } }
@@ -2497,16 +2954,16 @@ fn main() {
     if cfg.selected >= cfg.stratums.len() { cfg.selected = 0; }
 
     let paused = Arc::new(AtomicBool::new(false));   // shared pause flag: `p` toggles, engine idles the grinders
-    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone(), list_scroll: 0, update_armed: false, do_update: false };
+    let mut app = App { tab: Tab::Mine, cfg, strat_cur: 0, learn_page: 0, input: None, buf: String::new(), msg: String::new(), paused: paused.clone(), list_scroll: 0, update_armed: false, do_update: false, select_after_edit: false, rig_w: 0, rig_p: 0, rig_dirty: None };
     app.strat_cur = app.cfg.selected;
 
     // devices — attempt the GPU grinder even if no GPU is name-detected (it enumerates OpenCL/Metal and
     // signals READY; if there's no device or it isn't built, spawn_daemon drops it and the engine falls
     // back to CPU). `--cpu` forces CPU-only.
     let detected = gpu_names().len() as u32;
-    let ngpu = if app.cfg.cpu { 0 } else { app.cfg.gpus.unwrap_or(if detected > 0 { detected } else { 1 }) };
-    let mut use_cpu = app.cfg.cpu;
-    if ngpu == 0 { use_cpu = true; }
+    // --gpus 0 = CPU only · --cpu = the CPU joins the GPUs as one more worker (what the README always said)
+    let ngpu = app.cfg.gpus.unwrap_or(if detected > 0 { detected } else { 1 });
+    let use_cpu = app.cfg.cpu || ngpu == 0;
     let cpu_threads = if use_cpu { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) } else { 0 };
 
     // shared state
@@ -2515,7 +2972,9 @@ fn main() {
     let donate0 = if net_cfg(&net0).donate { app.cfg.donate.max(DONATE_MIN) } else { 0.0 };
     let tgt = Arc::new(Mutex::new(Target {
         pool: app.cfg.stratums.get(app.cfg.selected).map(|s| s.url.clone()).unwrap_or_default(),
+        name: app.cfg.stratums.get(app.cfg.selected).map(|s| s.name.clone()).unwrap_or_default(),
         addr: app.addr(), worker: clean_worker(&app.cfg.worker), network: net0.clone(), donate: donate0,
+        assign: build_assign(&app.cfg),
     }));
     { let mut st = stats.lock().unwrap(); st.endpoint = tgt.lock().unwrap().pool.clone(); st.addr = app.addr(); st.network = net0; st.donate = donate0;
       st.mode = app.cfg.stratums.get(app.cfg.selected).map(|s| pool_mode(&s.url, &s.name)).unwrap_or_default();
@@ -2526,6 +2985,7 @@ fn main() {
 
     // work-size knobs (mixed-speed rigs / flaky power / TDR): --gpu-iter reaches the grinders through their environment
     if app.cfg.gpu_iter > 0 { std::env::set_var("PYBLOCK_GPU_ITER", app.cfg.gpu_iter.to_string()); }
+    REAL_RUNE.store(matches!(app.cfg.rune.as_str(), "unicode" | "ᛞ" | "runic" | "real"), Ordering::Relaxed);
     if app.cfg.gpu_iter > 0 || app.cfg.sweep_ms > 0 {
         stats.lock().unwrap().logline(format!("work size: sweep cap {} · nonces per work-item {}",
             if app.cfg.sweep_ms > 0 { format!("{} ms", app.cfg.sweep_ms) } else { "adaptive".into() },
@@ -2537,22 +2997,23 @@ fn main() {
     // mode poller: CHIRP coinbase draw / CAROUSEL rotation for the ACTIVE stratum. Refreshes every 15s (the pool's
     // own pages do the same) and immediately on a stratum switch. A failed poll keeps the last good data on screen.
     { let stats = stats.clone(); std::thread::spawn(move || {
-        let mut last_mode: Option<PoolMode> = None; let mut last_poll = Instant::now();
+        let mut last_modes: Vec<PoolMode> = vec![]; let mut last_poll = Instant::now();
         // your CHIRP state at the previous poll: (listed, eligible, stale>1h) — transitions become alerts
         let mut chirp_prev: Option<(bool, bool, bool)> = None;
         let mut wav_prev: Option<bool> = None;   // WAVICLES: were you in the window at the previous poll?
         loop {
-            let mode = stats.lock().unwrap().mode;
-            if last_mode != Some(mode) || last_poll.elapsed() >= Duration::from_secs(15) {
-                if last_mode != Some(mode) { chirp_prev = None; wav_prev = None; }
-                last_mode = Some(mode); last_poll = Instant::now();
-                match mode {
+            // every mode with a live GPU group gets polled (a rig can be on CHIRP and WAVICLES at once)
+            let modes = stats.lock().unwrap().modes.clone();
+            if modes != last_modes || last_poll.elapsed() >= Duration::from_secs(15) {
+                if modes != last_modes { chirp_prev = None; wav_prev = None; }
+                last_modes = modes.clone(); last_poll = Instant::now();
+                for mode in modes { match mode {
                     PoolMode::Chirp => {
                         let r = poll_chirp();
                         let k = poll_carousel();   // CHIRP mines the suppliers' templates too → show the live rotation
                         let mut st = stats.lock().unwrap();
-                        if st.mode == PoolMode::Chirp && k.is_some() { st.carousel = k; }
-                        if st.mode == PoolMode::Chirp { if let Some(c) = r {
+                        if st.modes.contains(&PoolMode::Chirp) && k.is_some() { st.carousel = k; }
+                        if st.modes.contains(&PoolMode::Chirp) { if let Some(c) = r {
                             let now = now_unix();
                             let me = c.me(&st.addr).map(|m| (m.eligible, now.saturating_sub(m.last_seen) > 3600, m.days));
                             let cur = me.map(|(e, s, _)| (true, e, s)).unwrap_or((false, false, false));
@@ -2572,11 +3033,11 @@ fn main() {
                             st.chirp = Some(c);
                         } }
                     }
-                    PoolMode::Carousel => { let r = poll_carousel(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Carousel && r.is_some() { st.carousel = r; } }
+                    PoolMode::Carousel => { let r = poll_carousel(); let mut st = stats.lock().unwrap(); if st.modes.contains(&PoolMode::Carousel) && r.is_some() { st.carousel = r; } }
                     PoolMode::Wavicles => {
                         let r = poll_wavicles();
                         let mut st = stats.lock().unwrap();
-                        if st.mode == PoolMode::Wavicles { if let Some(w) = r {
+                        if st.modes.contains(&PoolMode::Wavicles) { if let Some(w) = r {
                             // in/out of the TIDES window → alert on the transition (never on the first poll)
                             let cur = w.me(&st.addr).is_some();
                             if let Some(prev) = wav_prev { if prev != cur {
@@ -2589,7 +3050,7 @@ fn main() {
                         } }
                     }
                     _ => {}
-                }
+                } }
             }
             std::thread::sleep(Duration::from_millis(400));
         }
@@ -2661,6 +3122,8 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| { ratatui::restore(); default_hook(info); }));
     let mut terminal = ratatui::init();
     loop {
+        // RIG edits: apply once the user stops pressing keys (each apply rebuilds every pool session)
+        if let Some(t) = app.rig_dirty { if t.elapsed() > Duration::from_millis(1500) { app.rig_dirty = None; apply_target(&app, &tgt, &stats); } }
         let ring = { let mut st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); std::mem::take(&mut st.ring_bell) };
         if ring { let mut o = std::io::stdout(); let _ = o.write_all(b"\x07"); let _ = o.flush(); }   // alert → terminal bell
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
@@ -2737,6 +3200,19 @@ mod tests {
         let sha = json!(["j", "00".repeat(32), "00".repeat(163), "00".repeat(559), ["ab"], "20000000", "1702355e", "00000000", true]);
         assert!(!is_sha256_job(b2b.as_array().unwrap())); assert!(is_sha256_job(sha.as_array().unwrap()));
         assert_eq!(pool_mode("192.168.1.9:5574", "my datum box"), PoolMode::Wavicles);   // name beats the port table
+        // per-GPU pool specs + stratum lookup by name
+        assert_eq!(parse_gpu_pools("0=CHIRP, 2 = my pool,1="), vec![(0, "CHIRP".to_string()), (2, "my pool".to_string()), (1, String::new())]);
+        let list = default_stratums();
+        assert_eq!(find_stratum(&list, "chirp").map(|s| s.url.as_str()), Some("pool.pyblock.xyz:5574"));
+        assert_eq!(find_stratum(&list, "WAVICLES").map(|s| s.name.as_str()), Some("WAVICLES · your node (DATUM)"));   // first match
+        assert!(find_stratum(&list, "nope").is_none());
+        // hashrate splits: explicit, implicit remainder, equal shares, normalization
+        assert_eq!(parse_split("CHIRP:70+WAVICLES:30"), vec![("CHIRP".to_string(), 70.0), ("WAVICLES".to_string(), 30.0)]);
+        assert_eq!(parse_split("CHIRP"), vec![("CHIRP".to_string(), 100.0)]);
+        assert_eq!(parse_split("A+B"), vec![("A".to_string(), 50.0), ("B".to_string(), 50.0)]);
+        assert_eq!(parse_split("A:60+B"), vec![("A".to_string(), 60.0), ("B".to_string(), 40.0)]);
+        assert_eq!(parse_split("A:1+B:3"), vec![("A".to_string(), 25.0), ("B".to_string(), 75.0)]);
+        assert!(parse_split("").is_empty());
     }
     #[test]
     fn wavicles_identity_matching() {

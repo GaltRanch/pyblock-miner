@@ -110,16 +110,24 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | `--network <net>` | *(from selected stratum)* | selects the stratum for that chain: `mainnet` (bc1…/1…/3…), `testnet4` (tb1…/m…/n…/2…), or `regtest` (bcrt1…/m…/n…/2…). The dev donation applies **only on mainnet** (testnet/regtest coins have no value). |
 | `--pool <host:port>` | *(selected stratum's URL)* | override the selected stratum's URL |
 | `--gpus <N>` | auto (all detected) | how many GPUs to use (`0` = CPU only) |
-| `--cpu` | off | also mine on the CPU (added as an extra worker) |
+| `--cpu` | off | also mine on the CPU (added as an extra worker next to the GPUs; `--gpus 0` = CPU only) |
 | `--donate <pct>` | `2.0` | PyBLØCK hashrate donation percent (mainnet only, minimum 2.0, see below) |
 | `--worker <name>` | *(none)* | log in as `addr.name` so the pool tells your rigs apart (also SETUP → `w`) |
 | `--api-port <N>` | off | local stats API: `http://127.0.0.1:N/` (JSON) and `/metrics` (Prometheus) — localhost only |
 | `--telegram <token>,<chat_id>` | off | alerts to a Telegram chat (also SETUP → `t`) |
 | `--webhook <url>` | off | alerts as a JSON `POST {source,title,body,ts}` |
 | `--no-log-file` · `--no-bell` · `--no-desktop` | on | turn off the timestamped `miner.log`, the terminal bell, or desktop notifications |
+| `--rune unicode` | `bowtie` | WAVICLES' mark is the Dagaz rune ᛞ; most terminal fonts lack the Runic block, so the miner shows the look-alike `⋈` by default. Pick `unicode` if your font has ᛞ. |
+| `--gpu-pool 0=CHIRP,1=WAVICLES,2=my-pool` | *(all on the selected stratum)* | **multi-pool rig**: each GPU (and the CPU, as the last worker index) mines its own pool — one stratum session per group, its own vardiff, watchdogs and share count; unassigned workers mine the selected stratum. Also SETUP → `r`. `g` in the app cycles which group the header/tiles/panel show. |
 | `--sweep-ms <ms>` · `--gpu-iter <n>` | adaptive · 512 | work-size knobs for mixed-speed rigs, flaky power or Windows TDR: cap each sweep's length (smaller nonce range per device) and/or the nonces per GPU work-item (smaller kernel launches: 512 = 2^31 nonces per launch, 128 = 2^29). Costs a little hashrate; try `--gpu-iter 128` first. Persist in config. |
 | `--update` | | `git pull` + build in this checkout, then exit (same as pressing `u` twice in the app) |
 | `--auto-update` | off | headless services: when the pool announces a newer version, pull + build + relaunch on their own |
+
+### Multi-pool rigs — one GPU on CHIRP, another on WAVICLES, another wherever
+
+Every worker can mine a different pool at the same time. Open the **RIG** tab (`8`, or `r` from SETUP): a grid of your workers × the pools of the current network. Move with the arrows, press **Enter** to send the whole worker to that pool, **`+` / `−`** to move 10% of its power onto or off that pool (so a GPU can mine CHIRP 70% / WAVICLES 30%), **`0`** to put it back on the selected stratum, **`a`** to send every worker to the pool under the cursor. Changes save at once and apply a moment after your last key; the grid shows each pool's live hashrate and accepted shares. From the shell the same thing is `--gpu-pool 0=CHIRP,1=WAVICLES:70+LOTTO:30`. Anything unassigned stays on the selected stratum, so with no assignments the miner behaves exactly as before. Each group is its own stratum session — connection, vardiff, backoff, job-freshness and dead-work watchdogs, SHA-256 refusal, share counts — a split worker alternates its sweeps between its pools in proportion, and the nonce space is split inside each group, never across pools.
+
+With more than one group **MINE becomes a rig overview**: a GROUPS card with every pool, link state, hashrate, workers (and their split), difficulty, shares and what that pool pays you right now; `g` drills into a group (its own header, network tiles and panel — CHIRP's coinbase draw, WAVICLES' TIDES window, …) and back to the overview. The WORKERS card names every worker's pool(s), and the local API lists `groups` with per-pool hashrate and shares. Names match STRATUMS entries case-insensitively (`CHIRP` → `PyBLØCK · CHIRP`; the CPU is the last worker index).
 
 ### Updates
 
@@ -135,13 +143,15 @@ Every log line is also appended, timestamped, to `~/.config/pyblockminer/miner.l
 
 | key | action |
 |-----|--------|
-| `1`–`7` / `Tab` | switch tabs (MINE · DATA · STRATUMS · LEARN · NETWORK · SETUP · HELP) |
+| `1`–`8` / `Tab` | switch tabs (MINE · DATA · STRATUMS · LEARN · NETWORK · SETUP · HELP · RIG) |
+| RIG: `↑↓` `←→` `Enter` `+`/`−` `0` `a` `c` | worker · pool · whole worker here · move 10% of its power · back to the selected stratum · everyone here · clear all |
 | `p` | pause / resume mining from any tab |
 | MINE / NETWORK: `↑↓` `PgUp` `PgDn` `Home` `End` | scroll the CHIRP coinbase list (everyone in the draw) |
 | `q` / `Esc` | quit (`Esc` also cancels a text input) |
 | STRATUMS: `↑↓` `Enter` `e` `a` `d` | move · **switch live** · edit address (WAVICLES: your gateway) · add custom · delete custom |
 | SETUP: `g` `e` `w` `c` `+/-` | generate address · edit/paste address · worker name · toggle CPU · donation |
-| SETUP: `b` `n` `t` `x` | bell · desktop notifications · Telegram `token,chat_id` · send a test alert |
+| SETUP: `b` `n` `t` `x` `r` | bell · desktop notifications · Telegram `token,chat_id` · send a test alert · open the RIG tab |
+| `g` | multi-pool rigs: next GPU group (header, tiles and panel follow it) |
 | LEARN: `←` `→` | previous / next info page |
 
 The **MINE** tab shows the pool mode (LOTTO / CHIRP / CAROUSEL), a network badge (MAINNET / TESTNET4 / REGTEST), your address's live **balance** (from the PyBLØCK BLAKE2b node), your hashrate/blocks, mode-aware network cards, and the coinbase panel described above. Run it in a real terminal (it's a full-screen TUI); it lays out for any width — addresses show in full on wide terminals and masked (`bc1qjd…5pw2`) on narrow ones.
