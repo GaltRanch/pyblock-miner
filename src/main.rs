@@ -844,6 +844,8 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
         let session_start = Instant::now();
         let mut switched = false;
         let mut warned_dead_work = false;
+        let mut grind_secs = 0.0f64;            // seconds this session spent actually grinding (not paused / gated / workerless)
+        let mut grind_tick = Instant::now();
 
         loop {
             stats.lock().unwrap().last_tick = Some(Instant::now());   // heartbeat: every path through this loop ticks
@@ -881,16 +883,29 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             // single mining.notify, and (b) work arrives in a stratum layout this miner does not speak, so
             // build_work produces garbage and every sweep returns zero nonces. Both leave the operator watching
             // a perfectly normal-looking miner that is producing nothing, while the stall watchdog below stays
-            // quiet for up to 10 minutes. best_diff is the tell: any live setup posts a low-difficulty result
-            // within seconds of the first sweep. Say it once, as soon as it is unambiguous.
-            if !warned_dead_work && session_start.elapsed() > Duration::from_secs(45) {
-                let no_work = user.job.is_none();
-                let no_results = { let st = stats.lock().unwrap(); st.best_diff == 0.0 && st.accepted == 0 };
-                if no_work || no_results {
+            // quiet for up to 10 minutes. Say it once, as soon as it is unambiguous.
+            if !warned_dead_work {
+                if session_start.elapsed() > Duration::from_secs(45) && user.job.is_none() {
+                    // (a) is unambiguous: every stratum sends a notify right after subscribe
                     warned_dead_work = true;
                     let mut st = stats.lock().unwrap();
-                    if no_work { alert(&mut st, "no work from pool", &format!("{} sent no work in 45s \u{2014} check pool/algorithm", pool)); }
-                    else { alert(&mut st, "work is not usable", &format!("{} sent work but no valid result in 45s \u{2014} stratum format may be incompatible", pool)); }
+                    alert(&mut st, "no work from pool", &format!("{} sent no work in 45s — check pool/algorithm", pool));
+                } else {
+                    // (b): "best_diff == 0" only means "no share YET", and that is the normal state for as long as the
+                    // expected time-to-share at this hashrate and difficulty — CAROUSEL sets diff 4096, so a 7 GH/s
+                    // card expects one every ~42 min and a CPU miner on diff 1 every ~40s. Fire only after 5× that
+                    // (never under 60s), counting only time spent actually grinding: not paused, not gated, workers up.
+                    let (hr, bd, acc, grinding) = { let st = stats.lock().unwrap();
+                        (st.hr_total, st.best_diff, st.accepted, !st.paused && st.blake2b_active != Some(false) && st.hr_total > 0.0) };
+                    if grinding { grind_secs += grind_tick.elapsed().as_secs_f64(); }
+                    grind_tick = Instant::now();
+                    let expected = 4_294_967_296.0 * user.diff.max(1.0) / (hr.max(1e-6) * 1e9);
+                    if user.job.is_some() && bd == 0.0 && acc == 0 && grind_secs > (5.0 * expected).max(60.0) {
+                        warned_dead_work = true;
+                        let mut st = stats.lock().unwrap();
+                        alert(&mut st, "work is not usable", &format!("{} sent work but not one valid result in {:.0}s of grinding (a share was expected every ~{:.0}s at {:.2} GH/s, diff {:.0}) — the stratum format may be incompatible",
+                            pool, grind_secs, expected, hr, user.diff));
+                    }
                 }
             }
             // Job-freshness watchdog: force a clean resubscribe if no NEW work (mining.notify) has arrived for a

@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "pyblock-miner"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "bitcoin",
  "blake2b_simd",
