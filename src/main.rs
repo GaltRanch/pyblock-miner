@@ -188,6 +188,7 @@ struct WaviclesInfo {
     miners: Vec<WavMiner>,        // sorted by share desc (the API's order)
     pool_ghs: f64, gateways: u64, fill_pct: f64, identities: u64, window_multiple: u64, fee_bps: u64,
     height: u64, tip_age_s: u64, owed_sats: u64, blocks: u64, difficulty: f64, fetched: u64,
+    top_block: u64,   // highest height in the blocks list — the list may be capped, its length alone can plateau
 }
 impl WaviclesInfo {
     // the API masks identities like mask_addr (6…4) — match either form
@@ -240,8 +241,11 @@ struct AlertCfg {
     #[serde(default)] telegram_token: String,          // Bot API token · with telegram_chat → sendMessage
     #[serde(default)] telegram_chat: String,
     #[serde(default)] webhook_url: String,             // POST {source,title,body,ts} as JSON
+    // block sound: "" / "auto" = a chime through whatever audio player this box has · "off" = bells only ·
+    // anything else = your own command (a "{}" in it is replaced by the chime's path, e.g. "mpg123 -q /my/horn.mp3")
+    #[serde(default)] sound: String,
 }
-impl Default for AlertCfg { fn default() -> Self { AlertCfg { bell: true, desktop: true, telegram_token: String::new(), telegram_chat: String::new(), webhook_url: String::new() } } }
+impl Default for AlertCfg { fn default() -> Self { AlertCfg { bell: true, desktop: true, telegram_token: String::new(), telegram_chat: String::new(), webhook_url: String::new(), sound: String::new() } } }
 fn d_donate() -> f64 { DONATE_MIN }
 fn d_true() -> bool { true }
 impl Default for Config {
@@ -434,7 +438,7 @@ struct Stats {
     wavicles: Option<WaviclesInfo>,    // WAVICLES: the TIDES window (who gets paid if a block hits now)
     worker: String,                    // worker suffix in use (header shows addr.worker)
     alerts: AlertCfg,                  // live alert settings (SETUP edits them; alert() reads them)
-    ring_bell: bool,                   // set by alert(), consumed by the UI loop → \x07
+    ring_bell: u8,                     // bells the UI loop still owes the terminal (\x07) — a block rings three times
     alerts_sent: u64,
     log_file: Option<std::fs::File>,   // miner.log (timestamped copy of every log line)
     api_port: u16,
@@ -463,14 +467,77 @@ fn open_log_file() -> Option<std::fs::File> {
     if std::fs::metadata(&p).map(|m| m.len() > 5_000_000).unwrap_or(false) { let _ = std::fs::rename(&p, p.with_extension("log.1")); }
     std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
 }
-// Fire an alert: log line (🔔) + bell flag for the UI + desktop / Telegram / webhook on a throwaway thread so the
+// ── the block chime ──────────────────────────────────────────────────────────────────────────────────────────────
+// A found block is the one event worth hearing from the other room, so it gets a real sound and not just the
+// terminal's beep — which many terminals mute or turn into a silent visual flash. The miner has no audio
+// dependencies, so it writes a small WAV once and hands it to whatever player the box already has.
+#[derive(Clone, Copy, PartialEq)]
+enum Sfx { Ping, Block }
+// two-note chime (B5 → E6) with a soft attack and an exponential tail, 16-bit mono PCM
+fn write_chime(path: &Path) -> std::io::Result<()> {
+    const SR: u32 = 44_100;
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut note = |freq: f64, dur: f64, gain: f64| {
+        let n = (SR as f64 * dur) as usize;
+        for i in 0..n {
+            let t = i as f64 / SR as f64;
+            let env = (-4.0 * t / dur).exp() * (1.0 - (-t * 500.0).exp());   // click-free attack, decaying tail
+            let tau = 2.0 * std::f64::consts::PI * t;
+            let s = (tau * freq).sin() * 0.75 + (tau * freq * 2.0).sin() * 0.25;   // + one octave for sparkle
+            pcm.extend_from_slice(&(((s * env * gain).clamp(-1.0, 1.0) * 30_000.0) as i16).to_le_bytes());
+        }
+    };
+    note(987.77, 0.15, 0.9);    // B5
+    note(1318.51, 0.55, 1.0);   // E6
+    let mut f = std::fs::File::create(path)?;
+    let (len, byte_rate) = (pcm.len() as u32, SR * 2);
+    f.write_all(b"RIFF")?; f.write_all(&(36 + len).to_le_bytes())?; f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; f.write_all(&1u16.to_le_bytes())?; f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&SR.to_le_bytes())?; f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?; f.write_all(&16u16.to_le_bytes())?;
+    f.write_all(b"data")?; f.write_all(&len.to_le_bytes())?; f.write_all(&pcm)?;
+    Ok(())
+}
+fn chime_path() -> Option<PathBuf> {
+    let p = config_path().parent()?.join("block.wav");
+    if !p.exists() { if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); } write_chime(&p).ok()?; }
+    Some(p)
+}
+// Play the chime with the first player that exists. `cfg` is the user's `alerts.sound`: "off" silences it, a custom
+// command runs as given (with "{}" → the chime path). Runs on the alert thread, so nothing blocks the engine.
+fn play_chime(cfg: &str) {
+    if cfg.eq_ignore_ascii_case("off") || cfg == "-" { return; }
+    let Some(wav) = chime_path() else { return };
+    let w = wav.to_string_lossy().into_owned();
+    if !cfg.is_empty() && !cfg.eq_ignore_ascii_case("auto") {
+        let cmd = cfg.replace("{}", &w);
+        #[cfg(windows)] let _ = Command::new("cmd").args(["/C", &cmd]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        #[cfg(not(windows))] let _ = Command::new("sh").args(["-c", &cmd]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        return;
+    }
+    #[cfg(windows)]
+    { let ps = format!("(New-Object Media.SoundPlayer '{}').PlaySync()", w.replace('\'', "''"));
+      let _ = Command::new("powershell").args(["-NoProfile", "-Command", &ps]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
+    #[cfg(not(windows))]
+    for (bin, args) in [("afplay", vec![]), ("paplay", vec![]), ("pw-play", vec![]), ("aplay", vec!["-q"]),
+                        ("ffplay", vec!["-nodisp", "-autoexit", "-loglevel", "quiet"]), ("mpv", vec!["--really-quiet", "--no-video"]), ("play", vec!["-q"])] {
+        let mut c = Command::new(bin); c.args(&args).arg(&w).stdout(Stdio::null()).stderr(Stdio::null());
+        if let Ok(s) = c.status() { if s.success() { return; } }
+    }
+}
+
+// Fire an alert: log line (🔔) + bells for the UI + desktop / Telegram / webhook / sound on a throwaway thread so the
 // engine never waits on the network. Takes the already-locked Stats so callers holding the lock can't deadlock.
-fn alert(st: &mut Stats, title: &str, body: &str) {
+fn alert(st: &mut Stats, title: &str, body: &str) { alert_sfx(st, title, body, Sfx::Ping) }
+// a block — yours or your pool's — is worth a chime and three bells; everything else keeps the single quiet beep
+fn alert_block(st: &mut Stats, title: &str, body: &str) { alert_sfx(st, title, body, Sfx::Block) }
+fn alert_sfx(st: &mut Stats, title: &str, body: &str, sfx: Sfx) {
     st.logline(format!("🔔 {} — {}", title, body));
     st.alerts_sent += 1;
-    if st.alerts.bell { st.ring_bell = true; }
+    if st.alerts.bell { st.ring_bell = st.ring_bell.saturating_add(if sfx == Sfx::Block { 3 } else { 1 }); }
     let (cfg, title, body) = (st.alerts.clone(), title.to_string(), body.to_string());
     std::thread::spawn(move || {
+        if sfx == Sfx::Block { play_chime(&cfg.sound); }
         if cfg.desktop {
             #[cfg(target_os = "linux")]
             { let _ = Command::new("notify-send").args(["-a", "pyblockMiner", &format!("⛏ {}", title), &body]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
@@ -864,7 +931,7 @@ impl Conn {
                                 st.blocks += 1; let n = st.blocks;
                                 st.logline(format!("🎉 BLOCK FOUND {}(#{}){}  paid to your address · nonce {}", hs, n, on, nonce));
                                 let body = format!("{}block #{} this session{} · paid to {}", hs, n, on, st.addr);
-                                alert(&mut st, "🎉 BLOCK FOUND", &body);
+                                alert_block(&mut st, "🎉 BLOCK FOUND", &body);
                             } else {
                                 let a = st.accepted;
                                 st.logline(format!("✓ share accepted (#{}){} · nonce {}", a, on, nonce));
@@ -1381,6 +1448,8 @@ fn poll_wavicles() -> Option<WaviclesInfo> {
         window_multiple: u(&pool, "window_multiple").max(1), fee_bps: pool.get("fee_bps").and_then(|x| x.as_u64()).unwrap_or(WAVICLES_FEE_BPS),
         height: u(&node, "height"), tip_age_s: u(&node, "tip_age_s"), owed_sats: u(&v, "owed"), difficulty: f(&node, "difficulty"),
         blocks: v.get("blocks").and_then(|x| x.as_array()).map(|a| a.len() as u64).unwrap_or(0),
+        top_block: v.get("blocks").and_then(|x| x.as_array()).map(|a| a.iter()
+            .filter_map(|b| ["height", "block_height", "h"].iter().find_map(|k| b.get(*k).and_then(|x| x.as_u64()))).max().unwrap_or(0)).unwrap_or(0),
         fetched: now_unix(),
     })
 }
@@ -2463,8 +2532,10 @@ fn render_setup(f: &mut Frame, area: Rect, app: &App) {
         row("worker name", worker_v),
         row("donation", vec![Span::styled(donate_disp, Style::new().fg(AMB))]),
         row("gpus", vec![Span::styled(gpus_disp, Style::new().fg(GRN)), Span::styled(format!("   cpu: {}", onoff(app.cfg.cpu)), Style::new().fg(GRN))]),
-        row("alerts", vec![Span::styled(format!("bell {} · desktop {} · telegram {} · webhook {}", onoff(a.bell), onoff(a.desktop), tg, wh), Style::new().fg(AMB)),
-                           dim("   (blocks · GPU down/up · pool outage · CHIRP eligibility)")]),
+        row("alerts", vec![Span::styled(format!("sound {} · bell {} · desktop {} · telegram {} · webhook {}",
+                               if a.sound.eq_ignore_ascii_case("off") { "off".into() } else if a.sound.is_empty() || a.sound.eq_ignore_ascii_case("auto") { "on".to_string() } else { format!("on ({})", a.sound) },
+                               onoff(a.bell), onoff(a.desktop), tg, wh), Style::new().fg(AMB)),
+                           dim("   (a block — yours or your pool's — chimes · GPU down/up · pool outage · CHIRP / WAVICLES eligibility)")]),
         row("log file", vec![dim(&logp)]),
         row("local api", vec![dim(&api)]),
         row("gpu pools", vec![if app.cfg.gpu_pools.is_empty() { dim("every worker mines the selected stratum  (r → RIG tab to send GPUs to other pools or split their power)") }
@@ -2472,7 +2543,7 @@ fn render_setup(f: &mut Frame, area: Rect, app: &App) {
         row("updates", vec![dim(&format!("the pool announces new versions → alert + ⬆ in the header · press u to update in-app · headless auto-update {}", onoff(app.cfg.auto_update)))]),
         Line::from(""),
         Line::from([key("g", "generate address   "), key("e", "edit/paste address   "), key("w", "worker name   "), key("c", "toggle CPU   "), key("+/-", "donation")].concat()),
-        Line::from([key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "send a test alert   "), key("r", "GPU → pool assignments")].concat()),
+        Line::from([key("s", "block sound   "), key("b", "bell   "), key("n", "desktop notifications   "), key("t", "telegram token,chat   "), key("x", "test alert + sound   "), key("r", "GPU → pool assignments")].concat()),
         Line::from(dim("  changes auto-save + apply live · devices, log file and api port apply on restart")),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }).block(card("SETUP · address, worker, alerts, config (saved)", GRN)), area);
@@ -2561,7 +2632,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("  how it works", "one stratum session per pool; a split worker alternates sweeps in proportion · MINE becomes a rig overview, g drills into a group · CLI: --gpu-pool 0=CHIRP,1=WAVICLES:70+LOTTO:30"),
         Line::from(""),
         Line::from(Span::styled(" Alerts · log · API", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
-        l("alerts", "block found · GPU down / back · pool unreachable / back · CHIRP: on the list, in the draw, falling out, dropped"),
+        l("alerts", "YOUR block · your POOL's block (CHIRP syndicate / WAVICLES window — they pay everyone in it) · GPU down / back · pool unreachable / back · CHIRP & WAVICLES eligibility"),
+        l("block sound", "a block chimes out loud (3 bells + a WAV through afplay/paplay/aplay/ffplay/mpv, PowerShell on Windows) · SETUP s toggles · x plays it · --sound off | --sound 'mpg123 -q /my/horn.mp3'"),
         l("channels", "terminal bell · desktop (notify-send / macOS) · Telegram (SETUP t, or --telegram token,chat) · --webhook <url> (POST JSON)"),
         l("log file", "every log line, timestamped → <config dir>/miner.log (rotates at 5 MB) · --no-log-file"),
         l("--api-port N", "http://127.0.0.1:N/ live stats as JSON · /metrics for Prometheus/Grafana · localhost only"),
@@ -2853,7 +2925,11 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                                         app.msg = format!("bell {}", if app.cfg.alerts.bell { "on" } else { "off" }); }
                 KeyCode::Char('n') => { app.cfg.alerts.desktop = !app.cfg.alerts.desktop; save_config(&app.cfg); apply_target(app, tgt, stats);
                                         app.msg = format!("desktop notifications {}", if app.cfg.alerts.desktop { "on" } else { "off" }); }
-                KeyCode::Char('x') => { let mut st = stats.lock().unwrap(); alert(&mut st, "test alert", "if you can read this, alerts work"); app.msg = "test alert sent — check bell / desktop / telegram".into(); }
+                KeyCode::Char('x') => { let mut st = stats.lock().unwrap(); alert_block(&mut st, "test alert", "this is exactly what a found block sounds like");
+                                        app.msg = "test alert sent — you should hear the block chime (SETUP s toggles it)".into(); }
+                KeyCode::Char('s') => { app.cfg.alerts.sound = if app.cfg.alerts.sound.eq_ignore_ascii_case("off") { String::new() } else { "off".into() };
+                                        save_config(&app.cfg); apply_target(app, tgt, stats);
+                                        app.msg = format!("block sound {} (x plays it)", if app.cfg.alerts.sound.eq_ignore_ascii_case("off") { "off" } else { "on" }); }
                 KeyCode::Char('r') => { app.tab = Tab::Rig; app.msg = "RIG: ↑↓ worker · ←→ pool · Enter all here · + / − 10% · 0 default · a everyone here".into(); }
                 KeyCode::Char('+') => { app.cfg.donate += 1.0; save_config(&app.cfg); apply_target(app, tgt, stats); }
                 KeyCode::Char('-') => { app.cfg.donate = (app.cfg.donate - 1.0).max(DONATE_MIN); save_config(&app.cfg); apply_target(app, tgt, stats); }
@@ -2901,6 +2977,8 @@ fn main() {
             "--no-bell" => { cfg.alerts.bell = false; }
             "--no-desktop" => { cfg.alerts.desktop = false; }
             "--rune" => { i += 1; if i < args.len() { cfg.rune = args[i].to_lowercase(); } }   // unicode | bowtie
+            "--sound" => { i += 1; if i < args.len() { cfg.alerts.sound = args[i].clone(); } }   // auto | off | your own command ({} = the chime)
+            "--no-sound" => { cfg.alerts.sound = "off".into(); }
             "--auto-update" => { cfg.auto_update = true; }
             "--sweep-ms" => { i += 1; if i < args.len() { cfg.sweep_ms = args[i].parse().unwrap_or(0); } }
             "--gpu-iter" => { i += 1; if i < args.len() { cfg.gpu_iter = args[i].parse().unwrap_or(0); } }
@@ -3001,11 +3079,15 @@ fn main() {
         // your CHIRP state at the previous poll: (listed, eligible, stale>1h) — transitions become alerts
         let mut chirp_prev: Option<(bool, bool, bool)> = None;
         let mut wav_prev: Option<bool> = None;   // WAVICLES: were you in the window at the previous poll?
+        // blocks the pool had at the previous poll — on CHIRP and WAVICLES a block found by ANYONE pays everyone in
+        // the draw/window, so the pool finding one is your event too. None = first poll (never alert on startup).
+        let mut chirp_blocks: Option<u64> = None;              // CHIRP publishes a cumulative counter
+        let mut wav_blocks: Option<(u64, u64)> = None;         // WAVICLES: (list length, highest height seen)
         loop {
             // every mode with a live GPU group gets polled (a rig can be on CHIRP and WAVICLES at once)
             let modes = stats.lock().unwrap().modes.clone();
             if modes != last_modes || last_poll.elapsed() >= Duration::from_secs(15) {
-                if modes != last_modes { chirp_prev = None; wav_prev = None; }
+                if modes != last_modes { chirp_prev = None; wav_prev = None; chirp_blocks = None; wav_blocks = None; }
                 last_modes = modes.clone(); last_poll = Instant::now();
                 for mode in modes { match mode {
                     PoolMode::Chirp => {
@@ -3030,6 +3112,14 @@ fn main() {
                                 }
                             } }
                             chirp_prev = Some(cur);
+                            // the syndicate found a block → it is split among everyone eligible, you included
+                            if let Some(prev) = chirp_blocks { if c.blocks > prev {
+                                let n = c.blocks - prev;
+                                let yours = c.my_pct(&st.addr).map(|p| format!("your {:.2}% ≈ {}", p, fmt_btc(c.reward_sats as f64 / 1e8 * p / 100.0 * c.keep())))
+                                    .unwrap_or_else(|| "you are not in the draw yet".into());
+                                alert_block(&mut st, "🎉 CHIRP found a block", &format!("the syndicate found {} block{} ({} total) · {}", n, if n > 1 { "s" } else { "" }, c.blocks, yours));
+                            } }
+                            chirp_blocks = Some(c.blocks);
                             st.chirp = Some(c);
                         } }
                     }
@@ -3045,6 +3135,15 @@ fn main() {
                                 else { alert(&mut st, "WAVICLES · out of the window", "no work from your identity in the TIDES window — check your gateway and miners"); }
                             } }
                             wav_prev = Some(cur);
+                            // a block found by any gateway pays the whole TIDES window, you included. The API's block
+                            // list may be capped, so a new block shows as MORE entries or as a HIGHER top height.
+                            if let Some((pn, ph)) = wav_blocks { if w.blocks > pn || w.top_block > ph {
+                                let yours = w.me(&st.addr).map(|m| format!("your {:.2}% ≈ {}", m.share_pct, fmt_btc(m.payout_sats as f64 / 1e8)))
+                                    .unwrap_or_else(|| "you were not in the window".into());
+                                let at = if w.top_block > 0 { format!("block {}", w.top_block) } else { "a block".to_string() };
+                                alert_block(&mut st, "🎉 WAVICLES found a block", &format!("the window found {} · {}", at, yours));
+                            } }
+                            wav_blocks = Some((w.blocks, w.top_block));
                             if w.difficulty > 0.0 { st.net_difficulty = w.difficulty; }   // the gateway's job nbits is the SHARE target, not the network's
                             st.wavicles = Some(w);
                         } }
@@ -3103,6 +3202,9 @@ fn main() {
                 (st.network.clone(), st.connected, st.hr_total, st.gpu_ghs.len(), st.blocks, st.accepted, st.rejected, st.net_height, st.best_diff, fresh)
             };
             for l in &newlogs { println!("  · {}", l); }
+            // headless: the bells still ring (journald/tmux forward them), the chime already played on the alert thread
+            let bells = std::mem::take(&mut stats.lock().unwrap().ring_bell);
+            for _ in 0..bells { print!("\x07"); }
             println!("{} · {} · {:.1} GH/s ({}w) · blocks {} · {} acc (rej {}) · net_h {} · best {}",
                 net, if conn { "LIVE" } else { "waiting" }, hr, nworkers, blk, acc, rej, neth, fmt_diff(bd));
             let _ = std::io::stdout().flush();
@@ -3125,7 +3227,9 @@ fn main() {
         // RIG edits: apply once the user stops pressing keys (each apply rebuilds every pool session)
         if let Some(t) = app.rig_dirty { if t.elapsed() > Duration::from_millis(1500) { app.rig_dirty = None; apply_target(&app, &tgt, &stats); } }
         let ring = { let mut st = stats.lock().unwrap(); let _ = terminal.draw(|f| ui(f, &app, &st)); std::mem::take(&mut st.ring_bell) };
-        if ring { let mut o = std::io::stdout(); let _ = o.write_all(b"\x07"); let _ = o.flush(); }   // alert → terminal bell
+        // alert → terminal bell (three for a block; one per frame so they're heard as a pattern, not one blip)
+        if ring > 0 { let mut o = std::io::stdout(); let _ = o.write_all(b"\x07"); let _ = o.flush();
+                      stats.lock().unwrap().ring_bell = ring - 1; }
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
                 // Windows consoles emit Press AND Release (and Repeat) for one physical keypress; Unix emits

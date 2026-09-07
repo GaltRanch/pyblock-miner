@@ -116,7 +116,8 @@ Flags are **optional overrides** (the saved config is otherwise the source of tr
 | `--api-port <N>` | off | local stats API: `http://127.0.0.1:N/` (JSON) and `/metrics` (Prometheus) — localhost only |
 | `--telegram <token>,<chat_id>` | off | alerts to a Telegram chat (also SETUP → `t`) |
 | `--webhook <url>` | off | alerts as a JSON `POST {source,title,body,ts}` |
-| `--no-log-file` · `--no-bell` · `--no-desktop` | on | turn off the timestamped `miner.log`, the terminal bell, or desktop notifications |
+| `--sound <auto\|off\|cmd>` | `auto` | the chime a found block plays. `off` = bells only; a command runs as given (`{}` → the chime's path) |
+| `--no-log-file` · `--no-bell` · `--no-desktop` · `--no-sound` | on | turn off the timestamped `miner.log`, the terminal bell, desktop notifications, or the block chime |
 | `--rune unicode` | `bowtie` | WAVICLES' mark is the Dagaz rune ᛞ; most terminal fonts lack the Runic block, so the miner shows the look-alike `⋈` by default. Pick `unicode` if your font has ᛞ. |
 | `--gpu-pool 0=CHIRP,1=WAVICLES,2=my-pool` | *(all on the selected stratum)* | **multi-pool rig**: each GPU (and the CPU, as the last worker index) mines its own pool — one stratum session per group, its own vardiff, watchdogs and share count; unassigned workers mine the selected stratum. Also SETUP → `r`. `g` in the app cycles which group the header/tiles/panel show. |
 | `--sweep-ms <ms>` · `--gpu-iter <n>` | adaptive · 512 | work-size knobs for mixed-speed rigs, flaky power or Windows TDR: cap each sweep's length (smaller nonce range per device) and/or the nonces per GPU work-item (smaller kernel launches: 512 = 2^31 nonces per launch, 128 = 2^29). Costs a little hashrate; try `--gpu-iter 128` first. Persist in config. |
@@ -135,7 +136,11 @@ The pool announces the latest miner version. When yours is older you get an **al
 
 ### Alerts, log file, local API
 
-The miner tells you what matters even when you're not looking: **block found**, **GPU down / back online**, **pool unreachable / back**, and on CHIRP **you're on the list · you're in the coinbase draw · you're falling out (no shares for 1 h) · you dropped off**. Channels: terminal bell, desktop notification (`notify-send` on Linux, Notification Center on macOS), Telegram, webhook. Toggle them in **SETUP** (`b` bell · `n` desktop · `t` telegram · `x` send a test alert).
+The miner tells you what matters even when you're not looking: **a block found — yours, or your pool's**, **GPU down / back online**, **pool unreachable / back**, and on CHIRP/WAVICLES **you're on the list · you're in the coinbase draw / TIDES window · you're falling out (no shares for 1 h) · you dropped off**. On CHIRP and WAVICLES a block found by *anyone* in the syndicate or the window pays everyone in it, so those count as your blocks too and the alert says what your slice is worth.
+
+**A block makes a sound.** Three bells plus a real chime, so you hear it from the next room even if your terminal mutes its beep: the miner writes a small `block.wav` next to its config on first use and plays it with whatever the box already has (`afplay` · `paplay` · `pw-play` · `aplay` · `ffplay` · `mpv` · `play`; PowerShell on Windows). No audio dependencies, nothing to install. **SETUP → `s`** toggles it and **`x`** plays it so you know what to listen for. `--sound off` silences it; `--sound "mpg123 -q /my/airhorn.mp3"` uses your own (a `{}` in the command is replaced by the chime's path).
+
+Other channels: terminal bell, desktop notification (`notify-send` on Linux, Notification Center on macOS), Telegram, webhook. Toggle them in **SETUP** (`s` sound · `b` bell · `n` desktop · `t` telegram · `x` test).
 
 Every log line is also appended, timestamped, to `~/.config/pyblockminer/miner.log` (rotated at 5 MB) so a bad night can be reconstructed. With `--api-port 18080`, `curl 127.0.0.1:18080/` returns live JSON (hashrate, workers, shares, your CHIRP slice and expected BTC/day, balance…) and `/metrics` feeds Prometheus/Grafana.
 
@@ -150,7 +155,7 @@ Every log line is also appended, timestamped, to `~/.config/pyblockminer/miner.l
 | `q` / `Esc` | quit (`Esc` also cancels a text input) |
 | STRATUMS: `↑↓` `Enter` `e` `a` `d` | move · **switch live** · edit address (WAVICLES: your gateway) · add custom · delete custom |
 | SETUP: `g` `e` `w` `c` `+/-` | generate address · edit/paste address · worker name · toggle CPU · donation |
-| SETUP: `b` `n` `t` `x` `r` | bell · desktop notifications · Telegram `token,chat_id` · send a test alert · open the RIG tab |
+| SETUP: `s` `b` `n` `t` `x` `r` | block sound · bell · desktop notifications · Telegram `token,chat_id` · test alert + sound · open the RIG tab |
 | `g` | multi-pool rigs: next GPU group (header, tiles and panel follow it) |
 | LEARN: `←` `→` | previous / next info page |
 
