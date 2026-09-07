@@ -843,6 +843,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
           if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
         let session_start = Instant::now();
         let mut switched = false;
+        let mut warned_dead_work = false;
 
         loop {
             stats.lock().unwrap().last_tick = Some(Instant::now());   // heartbeat: every path through this loop ticks
@@ -875,6 +876,23 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 dev = Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true); dev_retry = Instant::now();
             }
             if user.idle.elapsed() > Duration::from_secs(90) { { let mut st = stats.lock().unwrap(); st.connected = false; st.logline("no data for 90s — reconnecting…".into()); } break; }
+            // Dead-work watchdog: two silent failure modes look EXACTLY like healthy mining in the readout
+            // (LIVE, full hashrate, 0 accepted): (a) the pool answers mining.set_difficulty but never sends a
+            // single mining.notify, and (b) work arrives in a stratum layout this miner does not speak, so
+            // build_work produces garbage and every sweep returns zero nonces. Both leave the operator watching
+            // a perfectly normal-looking miner that is producing nothing, while the stall watchdog below stays
+            // quiet for up to 10 minutes. best_diff is the tell: any live setup posts a low-difficulty result
+            // within seconds of the first sweep. Say it once, as soon as it is unambiguous.
+            if !warned_dead_work && session_start.elapsed() > Duration::from_secs(45) {
+                let no_work = user.job.is_none();
+                let no_results = { let st = stats.lock().unwrap(); st.best_diff == 0.0 && st.accepted == 0 };
+                if no_work || no_results {
+                    warned_dead_work = true;
+                    let mut st = stats.lock().unwrap();
+                    if no_work { alert(&mut st, "no work from pool", &format!("{} sent no work in 45s \u{2014} check pool/algorithm", pool)); }
+                    else { alert(&mut st, "work is not usable", &format!("{} sent work but no valid result in 45s \u{2014} stratum format may be incompatible", pool)); }
+                }
+            }
             // Job-freshness watchdog: force a clean resubscribe if no NEW work (mining.notify) has arrived for a
             // while, scaled to the observed block cadence. `idle` only tracks ANY bytes (set_difficulty pings keep
             // it alive), so a connection that stays open but stops delivering jobs — exactly what happens at a
