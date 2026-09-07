@@ -33,6 +33,17 @@ const DONATE_MIN: f64 = 2.0;
 const POOL_FEE_BPS: u64 = 90;          // LOTTO pool fee
 const CHIRP_FEE_BPS: u64 = 100;        // PyBLØCK on CHIRP blocks
 const CHIRP_SUPPLIER_BPS: u64 = 100;   // template supplier on CHIRP blocks
+const WAVICLES_FEE_BPS: u64 = 40;      // PyBLØCK on WAVICLES blocks (the API's pool.fee_bps overrides it when present)
+const WAVICLES_PLACEHOLDER: &str = "your-gateway:port";   // never connects — replaced by the user's DATUM gateway stratum
+// BLAKE2b stratum jobs carry a 40-byte coinb1, an EMPTY coinb2 and NO merkle branches (the pool builds the coinbase).
+// A SHA-256 stratum (a regular pool, a SHA-256 DATUM gateway) sends a full coinbase + merkle branches — grinding that
+// with BLAKE2b is pure wasted power, so the engine refuses it and says so.
+fn is_sha256_job(job: &[Value]) -> bool {
+    let coinb2 = job.get(3).and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    let merkle = job.get(4).and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let coinb1 = job.get(2).and_then(|v| v.as_str()).map(|s| s.len() / 2).unwrap_or(0);
+    coinb2 || merkle || coinb1 > 64
+}
 fn pct(bps: u64) -> String { let v = bps as f64 / 100.0; if v.fract().abs() < 1e-9 { format!("{:.0}%", v) } else { format!("{:.1}%", v) } }
 const VERSION: &str = env!("CARGO_PKG_VERSION");   // from Cargo.toml — shown in TUI footer, --version, and the stratum UA
 
@@ -47,6 +58,7 @@ const BRD: Color = Color::Rgb(35, 60, 35);
 const PUR: Color = Color::Rgb(185, 107, 255);   // CHIRP accent — the pool site's violet
 const WHT: Color = Color::Rgb(236, 236, 244);   // CAROUSEL accent + primary values (soft white)
 const DIM: Color = Color::Rgb(58, 70, 58);      // quiet card borders — the frame recedes, the numbers speak
+const BLU: Color = Color::Rgb(53, 199, 224);    // WAVICLES accent — brand cyan #35C7E0 (the Dagaz rune ᛞ; never water, never a wave)
 
 // ── network config: mainnet | testnet4 | regtest ──
 struct NetCfg { name: &'static str, donate: bool }
@@ -84,17 +96,27 @@ fn default_stratums() -> Vec<Stratum> {
         Stratum { name: "PyBLØCK · CAROUSEL".into(), url: "pool.pyblock.xyz:30110".into(), network: "mainnet".into(),  custom: false },
         Stratum { name: "PyBLØCK · testnet4".into(), url: "pool.pyblock.xyz:23111".into(), network: "testnet4".into(), custom: false },
         Stratum { name: "PyBLØCK · regtest".into(),  url: "pool.pyblock.xyz:23110".into(), network: "regtest".into(),  custom: false },
+        // WAVICLES = your own Knots BLAKE2b node + a DATUM gateway. The miner points at YOUR GATEWAY's stratum, never at
+        // the pool (b.pyblock.xyz:28915 is where the gateway connects; it only dictates the coinbase split). There is no
+        // universal gateway port — and a SHA-256 gateway on the same box would happily hand out SHA-256 work — so the
+        // default is a placeholder: select it, press `e` in STRATUMS and type your gateway's host:port.
+        Stratum { name: "WAVICLES · your node (DATUM)".into(), url: WAVICLES_PLACEHOLDER.into(), network: "mainnet".into(), custom: false },
+        // the house gateway: PyBLØCK's node builds the block, you still get paid by the TIDES window. vardiff_min 4096 →
+        // ASICs only today (a GPU would not submit a share for hours); a diff-1 twin for GPUs is the pool's call.
+        Stratum { name: "WAVICLES · via PyBLØCK's node (ASIC)".into(), url: "b.pyblock.xyz:23114".into(), network: "mainnet".into(), custom: false },
     ]
 }
 
 // ── pool MODE: what the coinbase does on this stratum. Same BLAKE2b chain, different payout rules.
 //    Detected from the port (PyBLØCK convention: 4445 LOTTO · 5574 CHIRP · 30110 CAROUSEL) or the name. ──
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
-enum PoolMode { #[default] Lotto, Chirp, Carousel, Custom }
+enum PoolMode { #[default] Lotto, Chirp, Carousel, Wavicles, Custom }
 fn pool_mode(url: &str, name: &str) -> PoolMode {
     let port = url.rsplit(':').next().unwrap_or("");
     let n = name.to_ascii_uppercase();
     match port {
+        // WAVICLES is your own gateway on any host/port → only the name can tell (checked before the pool ports)
+        _ if n.contains("WAVICLE") || n.contains("DATUM") || n.contains("GATEWAY") => PoolMode::Wavicles,
         "5574" | "5554"            => PoolMode::Chirp,
         "30110" | "30000"          => PoolMode::Carousel,
         "4445" | "23111" | "23110" => PoolMode::Lotto,
@@ -105,11 +127,12 @@ fn pool_mode(url: &str, name: &str) -> PoolMode {
     }
 }
 impl PoolMode {
-    fn label(self) -> &'static str { match self { PoolMode::Lotto => "LOTTO", PoolMode::Chirp => "CHIRP", PoolMode::Carousel => "CAROUSEL", PoolMode::Custom => "CUSTOM" } }
-    fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Custom => "⛏" } }
-    fn accent(self) -> Color { match self { PoolMode::Lotto => YLW, PoolMode::Chirp => PUR, PoolMode::Carousel => WHT, PoolMode::Custom => CYN } }
+    fn label(self) -> &'static str { match self { PoolMode::Lotto => "LOTTO", PoolMode::Chirp => "CHIRP", PoolMode::Carousel => "CAROUSEL", PoolMode::Wavicles => "WAVICLES", PoolMode::Custom => "CUSTOM" } }
+    fn icon(self) -> &'static str { match self { PoolMode::Lotto => "🎰", PoolMode::Chirp => "🌌", PoolMode::Carousel => "🎠", PoolMode::Wavicles => "ᛞ", PoolMode::Custom => "⛏" } }
+    fn accent(self) -> Color { match self { PoolMode::Lotto => YLW, PoolMode::Chirp => PUR, PoolMode::Carousel => WHT, PoolMode::Wavicles => BLU, PoolMode::Custom => CYN } }
     fn tagline(self) -> &'static str {
-        match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · supplier templates", PoolMode::Carousel => "rotating clean templates", PoolMode::Custom => "custom stratum" }
+        match self { PoolMode::Lotto => "solo lottery", PoolMode::Chirp => "syndicate · supplier templates", PoolMode::Carousel => "rotating clean templates",
+                     PoolMode::Wavicles => "your node · TIDES window", PoolMode::Custom => "custom stratum" }
     }
     // who gets paid — one honest line, shown in STRATUMS and in the MINE header (numbers come from the constants above)
     fn payout(self) -> String {
@@ -117,6 +140,7 @@ impl PoolMode {
             PoolMode::Lotto    => format!("every block you find pays YOUR address · you keep {} · PyBLØCK fee {}", pct(10_000 - POOL_FEE_BPS), pct(POOL_FEE_BPS)),
             PoolMode::Chirp    => format!("{} of every block split among ALL eligible miners by weight · suppliers' templates · supplier {} · PyBLØCK {} · 7d loyalty", pct(10_000 - CHIRP_FEE_BPS - CHIRP_SUPPLIER_BPS), pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)),
             PoolMode::Carousel => "you mine independent suppliers' clean templates · finder keeps 96% · supplier 3% · PyBLØCK 1%".into(),
+            PoolMode::Wavicles => format!("your node builds the block · {} of every block to the TIDES work window, split by share of work · {} fee", pct(10_000 - WAVICLES_FEE_BPS), pct(WAVICLES_FEE_BPS)),
             PoolMode::Custom   => "payout rules are the pool operator's — check their site".into(),
         }
     }
@@ -125,6 +149,7 @@ impl PoolMode {
             PoolMode::Lotto => format!("keep {} · fee {}", pct(10_000 - POOL_FEE_BPS), pct(POOL_FEE_BPS)),
             PoolMode::Chirp => format!("syndicate keeps {} · supplier {} · fee {}", pct(10_000 - CHIRP_FEE_BPS - CHIRP_SUPPLIER_BPS), pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)),
             PoolMode::Carousel => "keep 96% · supplier 3% · fee 1%".into(), PoolMode::Custom => "operator's rules".into(),
+            PoolMode::Wavicles => format!("work window {} · fee {}", pct(10_000 - WAVICLES_FEE_BPS), pct(WAVICLES_FEE_BPS)),
         }
     }
 }
@@ -149,6 +174,24 @@ impl ChirpInfo {
         let m = self.me(addr)?; let s = self.sum_weight();
         if m.eligible && s > 0.0 { Some(m.weight / s * 100.0) } else { None }
     }
+}
+// ── WAVICLES: the TIDES work window — who gets paid if a block hits right now. Source: b.pyblock.xyz wavicles_api.php?mode=stats ──
+#[derive(Clone, Default)]
+struct WavMiner { identity: String, share_pct: f64, payout_sats: u64, last_share_s: u64, hashrate_ghs: f64, payable: bool }
+#[derive(Clone, Default)]
+struct WaviclesInfo {
+    miners: Vec<WavMiner>,        // sorted by share desc (the API's order)
+    pool_ghs: f64, gateways: u64, fill_pct: f64, identities: u64, window_multiple: u64, fee_bps: u64,
+    height: u64, tip_age_s: u64, owed_sats: u64, blocks: u64, difficulty: f64, fetched: u64,
+}
+impl WaviclesInfo {
+    // the API masks identities like mask_addr (6…4) — match either form
+    fn me(&self, addr: &str) -> Option<&WavMiner> {
+        if addr.is_empty() { return None; }
+        let masked = mask_addr(addr, false);
+        self.miners.iter().find(|m| m.identity == addr || m.identity == masked)
+    }
+    fn to_window_sats(&self) -> u64 { self.miners.iter().map(|m| m.payout_sats).sum() }
 }
 // ── CAROUSEL: independent suppliers' clean templates in rotation. Source: b.pyblock.xyz carousel.php?carrousel=1 ──
 #[derive(Clone, Default)]
@@ -227,7 +270,8 @@ fn reconcile_defaults(c: &mut Config) {
     }
     // Agrega los pools default que falten (por URL) → CHIRP/CAROUSEL llegan a configs ya guardados.
     for d in defs.iter() {
-        if !c.stratums.iter().any(|s| !s.custom && s.url == d.url) { c.stratums.push(d.clone()); changed = true; }
+        // …unless an entry with the same NAME is already there (the user edited a default's URL → it became theirs)
+        if !c.stratums.iter().any(|s| (!s.custom && s.url == d.url) || s.name == d.name) { c.stratums.push(d.clone()); changed = true; }
     }
     if changed { save_config(c); }
 }
@@ -319,6 +363,7 @@ struct Stats {
     net_ghs: f64,
     net_height: u64,
     net_nbits: u32,     // network block target (compact nbits) — for the solo-lottery ETA in the DATA tab
+    net_difficulty: f64, // network difficulty from the WAVICLES API (node.difficulty); 0 = unknown → use net_nbits
     network: String,
     balance_ok: bool,
     balance_btc: f64,
@@ -332,9 +377,11 @@ struct Stats {
     update_available: bool,
     gpu_dead: Vec<bool>,               // per worker: grinder down, auto-respawning (shown in WORKERS)
     last_tick: Option<Instant>,        // engine heartbeat — the UI flags ENGINE STALLED if it stops while connected
+    wrong_algo: bool,                  // the stratum hands out SHA-256 work → not grinding (header badge)
     mode: PoolMode,                    // what the coinbase does on the active stratum (LOTTO / CHIRP / CAROUSEL)
     chirp: Option<ChirpInfo>,          // CHIRP: everyone in the coinbase draw (kept while polling, cleared on switch)
     carousel: Option<CarouselInfo>,    // CAROUSEL: templates in rotation + the one being mined right now
+    wavicles: Option<WaviclesInfo>,    // WAVICLES: the TIDES window (who gets paid if a block hits now)
     worker: String,                    // worker suffix in use (header shows addr.worker)
     alerts: AlertCfg,                  // live alert settings (SETUP edits them; alert() reads them)
     ring_bell: bool,                   // set by alert(), consumed by the UI loop → \x07
@@ -393,6 +440,14 @@ fn alert(st: &mut Stats, title: &str, body: &str) {
     });
 }
 
+// Pool difficulties arrive as integers from PyBLØCK's datum (1, 4096) but as Sia-style "bdiff" from CONVOY/OCEAN DATUM
+// gateways (n × 65535/65536 → 0.99998, 4095.94). Truncating 4095.94 to 4095 gave bits 11 instead of 12: a target 2× too
+// easy → ~50% of shares rejected `high-hash` as soon as vardiff rose (every WAVICLES gateway, and :23114). Snap values
+// that sit within 1% of an integer after undoing the 65535/65536 scale; leave genuinely fractional diffs alone.
+fn norm_diff(diff: f64) -> f64 {
+    let x = diff * 65536.0 / 65535.0;
+    if (x - x.round()).abs() < 0.01 { x.round().max(1.0) } else { diff.max(1e-9) }
+}
 fn floor_pot(diff: f64) -> u32 {
     let d = if diff >= 1.0 { diff as u64 } else { 1 };
     63u32.saturating_sub(d.leading_zeros())
@@ -417,6 +472,14 @@ fn target_be(bits: u32) -> [u8; 32] {
         out[i] = acc as u8;
     }
     out
+}
+// a 256-bit big-endian target from a Bitcoin-style difficulty: diff-1 target = 0xFFFF·2^208 (nbits 1d00ffff), divided by d.
+// f64 keeps 53 bits — plenty: only the top bytes of a target ever matter for a compare or an ETA.
+fn target_from_difficulty(d: f64) -> [u8; 32] {
+    let mut v = 65535.0 * 2f64.powi(208) / d.max(1e-9);
+    let mut t = [0u8; 32];
+    for i in 0..32 { let p = 2f64.powi(8 * (31 - i as i32)); let b = (v / p).floor(); t[i] = b.clamp(0.0, 255.0) as u8; v -= b * p; }
+    t
 }
 // network block target from the job's compact nbits (Bitcoin standard mantissa·256^(exp-3))
 fn nbits_to_target(nbits: u32) -> [u8; 32] {
@@ -710,9 +773,9 @@ impl Conn {
             } else if meth == Some("mining.set_difficulty") {
                 self.diff = m.get("params").and_then(|p| p.get(0)).and_then(|v| v.as_f64()).unwrap_or(1.0);
                 if !self.is_dev {
-                    let bits = floor_pot(self.diff);
+                    let bits = floor_pot(norm_diff(self.diff));
                     let mut st = stats.lock().unwrap();
-                    st.diff = self.diff; st.bits = bits;
+                    st.diff = norm_diff(self.diff); st.bits = bits;
                     st.logline(format!("difficulty set · bits={}", bits));
                 }
             } else if meth == Some("mining.notify") {
@@ -825,6 +888,12 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             continue;
         }
         stats.lock().unwrap().last_tick = Some(Instant::now());
+        if pool.starts_with(WAVICLES_PLACEHOLDER.split(':').next().unwrap_or("your-gateway")) {
+            { let mut st = stats.lock().unwrap(); st.connected = false;
+              st.logline("WAVICLES: set the address of YOUR DATUM gateway's stratum — STRATUMS [3] → e (host:port) — the pool port is not for miners".into()); }
+            sleep_unless_switched(&tgt, &pool, &addr, 10);
+            continue;
+        }
         let mut user = match Conn::connect(&pool, &login(&addr, &worker), false) {
             Some(c) => c,
             None => {
@@ -837,7 +906,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             }
         };
         let mut dev: Option<Conn> = if donate > 0.0 { Conn::connect(DONATE_POOL, DEV_DONATION_ADDR, true) } else { None };
-        { let mut st = stats.lock().unwrap(); st.connected = true; st.started.get_or_insert(Instant::now());
+        { let mut st = stats.lock().unwrap(); st.connected = true; st.wrong_algo = false; st.started.get_or_insert(Instant::now());
           st.logline(format!("connected to {} as {}", pool, login(&addr, &worker)));
           if conn_fails >= 3 { alert(&mut st, "pool reachable again", &format!("connected to {} after {} attempts · mining", pool, conn_fails)); }
           if donate > 0.0 { st.logline(format!("hashrate donation {:.1}% → PyBLØCK", donate)); } }
@@ -899,7 +968,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                         (st.hr_total, st.best_diff, st.accepted, !st.paused && st.blake2b_active != Some(false) && st.hr_total > 0.0) };
                     if grinding { grind_secs += grind_tick.elapsed().as_secs_f64(); }
                     grind_tick = Instant::now();
-                    let expected = 4_294_967_296.0 * user.diff.max(1.0) / (hr.max(1e-6) * 1e9);
+                    let expected = 4_294_967_296.0 * norm_diff(user.diff) / (hr.max(1e-6) * 1e9);
                     if user.job.is_some() && bd == 0.0 && acc == 0 && grind_secs > (5.0 * expected).max(60.0) {
                         warned_dead_work = true;
                         let mut st = stats.lock().unwrap();
@@ -953,7 +1022,18 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             };
             if is_dev { donate_credit -= 1.0; }
 
-            let diff = if is_dev { dev.as_ref().unwrap().diff } else { user.diff };
+            // ALGO CHECK: SHA-256 work (full coinbase + merkle branches) means this stratum is not a BLAKE2b pool —
+            // e.g. a SHA-256 DATUM gateway on the same box. Refuse it: idle the grinders, badge the header, alert once.
+            if !is_dev && is_sha256_job(&jobv) {
+                { let mut st = stats.lock().unwrap();
+                  if !st.wrong_algo { st.wrong_algo = true; st.hr_total = 0.0; for g in st.gpu_ghs.iter_mut() { *g = 0.0; }
+                      alert(&mut st, "⛔ SHA-256 work — not mining", &format!("{} sends SHA-256 jobs (coinbase + merkle branches); pyblockMiner mines BLAKE2b. Wrong port or a SHA-256 gateway — pick a BLAKE2b stratum", pool)); } }
+                user.pump(&stats);
+                if let Some(d) = dev.as_mut() { d.pump(&stats); }
+                std::thread::sleep(Duration::from_millis(300));
+                continue;
+            } else if !is_dev { let mut st = stats.lock().unwrap(); if st.wrong_algo { st.wrong_algo = false; st.logline("BLAKE2b work again — mining".into()); } }
+            let diff = norm_diff(if is_dev { dev.as_ref().unwrap().diff } else { user.diff });
             let bits = floor_pot(diff);
             let (prevhash, ntime, version, job_id, en2hex, work_root) = {
                 let c = if is_dev { dev.as_mut().unwrap() } else { &mut user };
@@ -993,8 +1073,13 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
             // well under the block interval → stale sweeps are a minority (this is NOT the old v0.2.1 bug that
             // dropped everything with fixed 0.35s sweeps ≈ the block time on a fast chain).
             let nbits = jobv.get(6).and_then(|v| v.as_str()).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0);
-            if !is_dev && nbits != 0 { stats.lock().unwrap().net_nbits = nbits; }   // network target → DATA-tab solo-lottery ETA
-            let net_target = nbits_to_target(nbits);
+            // Which target is "the network"? PyBLØCK's datum puts the real network nbits in the job. CONVOY/OCEAN DATUM
+            // gateways put the SHARE target there (1d00ffff for diff 1) — using it would call every share a block and
+            // put the time-to-block at seconds. The WAVICLES poller supplies node.difficulty; when it's known, it wins.
+            let net_difficulty = { let mut st = stats.lock().unwrap();
+                if !is_dev && nbits != 0 && st.net_difficulty == 0.0 { st.net_nbits = nbits; }
+                st.net_difficulty };
+            let net_target = if net_difficulty > 0.0 { target_from_difficulty(net_difficulty) } else { nbits_to_target(nbits) };
             // found-block height. The BLAKE2b stratum notify carries NO coinbase (coinb2 empty, merkle []),
             // so coinb1 has no BIP34 height — the pool's reported mining height is the only source. blake_stats
             // returns the *template* height (tip+1) = exactly the block being mined. Captured per-sweep and
@@ -1016,7 +1101,7 @@ fn engine(stats: Arc<Mutex<Stats>>, tgt: Arc<Mutex<Target>>, ngpu: u32, cpu_thre
                 // would reject them → check the exact difficulty here and only send what can be accepted.
                 let (is_block, meets_diff) = match nonce_hash(&prevhash, &ntime, &work_root, &nh) {
                     Some(h) => { let d = hash_diff(&h); if d > sweep_best { sweep_best = d; }
-                                 (nbits != 0 && hash_le_target(&h, &net_target), d >= diff * 0.999) }
+                                 ((nbits != 0 || net_difficulty > 0.0) && hash_le_target(&h, &net_target), d >= diff * 0.999) }
                     None => (false, true),
                 };
                 if !still_current || !meets_diff { continue; }   // stale sweep (a block landed mid-grind) or sub-target → don't submit
@@ -1123,6 +1208,30 @@ fn poll_chirp() -> Option<ChirpInfo> {
 // Supplier names are typed by THIRD PARTIES on the pool → strip control chars / escape sequences and cap the length
 // before they reach the terminal. Printable Unicode (emoji, accents) stays.
 fn clean_label(s: &str) -> String { s.chars().filter(|c| !c.is_control()).take(40).collect::<String>().trim().to_string() }
+const WAVICLES_API: &str = "https://b.pyblock.xyz:8443/wavicles_api.php?mode=stats";
+fn poll_wavicles() -> Option<WaviclesInfo> {
+    let v = get_json(WAVICLES_API, 10)?;
+    if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
+    let f = |o: &Value, k: &str| o.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let u = |o: &Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let w = v.get("window").cloned().unwrap_or(Value::Null);
+    let miners: Vec<WavMiner> = w.get("miners").and_then(|x| x.as_array()).map(|a| a.iter().map(|m| WavMiner {
+        identity: m.get("identity").and_then(|x| x.as_str()).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '…').take(90).collect(),
+        share_pct: f(m, "share_percent"), payout_sats: u(m, "payout_sats"), last_share_s: u(m, "last_share_s"),
+        hashrate_ghs: f(m, "hashrate_ghs"), payable: m.get("payable").and_then(|x| x.as_bool()).unwrap_or(false),
+    }).collect()).unwrap_or_default();
+    let pool = v.get("pool").cloned().unwrap_or(Value::Null);
+    let node = v.get("node").cloned().unwrap_or(Value::Null);
+    Some(WaviclesInfo {
+        miners,
+        pool_ghs: v.get("hashrate").map(|h| f(h, "pool_ghs")).unwrap_or(0.0),
+        gateways: u(&v, "gateways"), fill_pct: f(&w, "fill_percent"), identities: u(&w, "identities"),
+        window_multiple: u(&pool, "window_multiple").max(1), fee_bps: pool.get("fee_bps").and_then(|x| x.as_u64()).unwrap_or(WAVICLES_FEE_BPS),
+        height: u(&node, "height"), tip_age_s: u(&node, "tip_age_s"), owed_sats: u(&v, "owed"), difficulty: f(&node, "difficulty"),
+        blocks: v.get("blocks").and_then(|x| x.as_array()).map(|a| a.len() as u64).unwrap_or(0),
+        fetched: now_unix(),
+    })
+}
 fn poll_carousel() -> Option<CarouselInfo> {
     let v = get_json(CAROUSEL_API, 10)?;
     let strs = |k: &str| -> Vec<String> { v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|e| {
@@ -1260,6 +1369,10 @@ fn stats_json(st: &Stats) -> Value {
         "balance_btc": if st.balance_ok { Some(st.balance_btc) } else { None },
         "net": { "ok": st.net_ok, "miners": st.net_miners, "hashrate_ghs": st.net_ghs, "height": st.net_height },
         "chirp": chirp, "carousel": carousel, "alerts_sent": st.alerts_sent,
+        "wavicles": st.wavicles.as_ref().map(|w| json!({
+            "in_window": w.me(&st.addr).is_some(), "share_pct": w.me(&st.addr).map(|m| m.share_pct), "payout_btc": w.me(&st.addr).map(|m| m.payout_sats as f64 / 1e8),
+            "expected_btc_day": wav_btc_per_day(st, w), "identities": w.identities, "gateways": w.gateways, "fill_pct": w.fill_pct,
+            "pool_ghs": w.pool_ghs, "to_window_btc": w.to_window_sats() as f64 / 1e8, "fee_bps": w.fee_bps, "node_height": w.height })),
     })
 }
 fn metrics_text(st: &Stats) -> String {
@@ -1277,6 +1390,11 @@ fn metrics_text(st: &Stats) -> String {
     g(&mut o, "pyblock_net_miners", "pyblockMiner miners online", st.net_miners as f64);
     g(&mut o, "pyblock_uptime_seconds", "seconds since first connect", st.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0));
     if st.balance_ok { g(&mut o, "pyblock_balance_btc", "address balance on the BLAKE2b chain", st.balance_btc); }
+    if let Some(w) = st.wavicles.as_ref() {
+        g(&mut o, "pyblock_wavicles_share_pct", "your share of the TIDES window (0 if not in it)", w.me(&st.addr).map(|m| m.share_pct).unwrap_or(0.0));
+        g(&mut o, "pyblock_wavicles_window_fill_pct", "TIDES window fill", w.fill_pct);
+        g(&mut o, "pyblock_wavicles_pool_ghs", "WAVICLES pool hashrate in GH/s", w.pool_ghs);
+    }
     if let Some(c) = st.chirp.as_ref() {
         g(&mut o, "pyblock_chirp_slice_pct", "your share of every CHIRP block (0 if not eligible)", c.my_pct(&st.addr).unwrap_or(0.0));
         g(&mut o, "pyblock_chirp_candidates", "eligible miners in the CHIRP coinbase", c.candidates as f64);
@@ -1315,7 +1433,7 @@ const TABS: [(Tab, &str); 7] = [
     (Tab::Network, "NETWORK"), (Tab::Setup, "SETUP"), (Tab::Help, "HELP"),
 ];
 
-enum Input { AddStratum, EditAddr, EditWorker, EditTelegram }
+enum Input { AddStratum, EditAddr, EditWorker, EditTelegram, EditUrl }
 struct App {
     tab: Tab,
     cfg: Config,
@@ -1404,7 +1522,8 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
     // footer
     let foot = if let Some(k) = &app.input {
         let label = match k { Input::AddStratum => "new stratum (name,host:port,network)", Input::EditAddr => "address",
-                              Input::EditWorker => "worker name (letters · digits · - _ · empty = none)", Input::EditTelegram => "telegram  bot_token,chat_id  (empty = off)" };
+                              Input::EditWorker => "worker name (letters · digits · - _ · empty = none)", Input::EditTelegram => "telegram  bot_token,chat_id  (empty = off)",
+                              Input::EditUrl => "stratum address  host:port  (WAVICLES: your DATUM gateway)" };
         Line::from(vec![Span::styled(format!(" {} > ", label), Style::new().fg(Color::Black).bg(YLW)),
                         Span::styled(format!("{}_", app.buf), Style::new().fg(YLW)),
                         Span::styled("   Enter=ok  Esc=cancel", Style::new().fg(MUT))])
@@ -1414,8 +1533,8 @@ fn ui(f: &mut Frame, app: &App, st: &Stats) {
         let mut sp = vec![Span::styled(" 1-7 ", Style::new().fg(Color::Black).bg(GRN)),
                         Span::styled(" tabs · ", Style::new().fg(MUT)),
                         Span::styled("Tab", Style::new().fg(GRN)), Span::styled(" next · ", Style::new().fg(MUT))];
-        if st.mode == PoolMode::Chirp && matches!(app.tab, Tab::Mine | Tab::Network) {
-            sp.push(Span::styled("↑↓", Style::new().fg(GRN))); sp.push(Span::styled(" coinbase list · ", Style::new().fg(MUT)));
+        if matches!(st.mode, PoolMode::Chirp | PoolMode::Wavicles) && matches!(app.tab, Tab::Mine | Tab::Network) {
+            sp.push(Span::styled("↑↓", Style::new().fg(GRN))); sp.push(Span::styled(if st.mode == PoolMode::Chirp { " coinbase list · " } else { " window list · " }, Style::new().fg(MUT)));
         }
         if st.update_available { sp.push(bold("u".into(), PNK)); sp.push(Span::styled(format!(" update to v{} · ", st.latest_version), Style::new().fg(PNK))); }
         sp.extend([Span::styled("p", Style::new().fg(GRN)),
@@ -1477,6 +1596,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
         && st.last_tick.map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(false);
     let dot = if st.paused { bold("⏸ PAUSED".into(), YLW) }
               else if st.blake2b_active == Some(false) { bold("⏳ WAITING · SHA-256d".into(), AMB) }
+              else if st.wrong_algo { bold("⛔ SHA-256 WORK · not mining".into(), Color::Red) }
               else if stalled { bold("⚠ ENGINE STALLED".into(), Color::Red) }
               else if st.connected { Span::styled("● LIVE", Style::new().fg(GRN)) }
               else { Span::styled("● OFFLINE", Style::new().fg(Color::Red)) };
@@ -1508,6 +1628,17 @@ fn render_header(f: &mut Frame, area: Rect, st: &Stats) {
             });
             l2.push(dim(&match st.chirp.as_ref() { Some(c) => format!(" · {}", c.fee_text()), None => format!(" · supplier {} · fee {}", pct(CHIRP_SUPPLIER_BPS), pct(CHIRP_FEE_BPS)) }));
         }
+        // WAVICLES: your share of the TIDES window and what that pays if a block hits right now
+        PoolMode::Wavicles => {
+            l2.push(match st.wavicles.as_ref() {
+                None => dim("TIDES window · loading…"),
+                Some(w) => match w.me(&st.addr) {
+                    Some(me) => bold(format!("your share of the window  {:.2}%  ≈ {} if a block hits now", me.share_pct, fmt_btc(me.payout_sats as f64 / 1e8)), BLU),
+                    None => Span::styled("not in the window yet · shares from your gateway enter it", Style::new().fg(AMB)),
+                },
+            });
+            l2.push(dim(&format!(" · fee {}", pct(st.wavicles.as_ref().map(|w| w.fee_bps).unwrap_or(WAVICLES_FEE_BPS)))));
+        }
         PoolMode::Custom => l2.push(dim(&m.payout_short())),
         _ => l2.push(Span::styled(m.payout_short(), Style::new().fg(PNK))),
     }
@@ -1538,6 +1669,14 @@ fn render_net_tiles(f: &mut Frame, area: Rect, st: &Stats) {
             f.render_widget(tile("◈ SYNDICATE HASHRATE", Line::from(bold(fmt_ths(c.hashrate_ths), PUR)), &format!("{} blocks found together", c.blocks), PUR), r[1]);
             f.render_widget(tile("◈ LAST BLOCK REWARD", Line::from(vec![bold(if reward > 0.0 { format!("{:.4}", reward) } else { "—".into() }, PUR), dim(" BTC")]), &cut, PUR), r[2]);
         }
+        (PoolMode::Wavicles, _, _) if st.wavicles.is_some() => {
+            let w = st.wavicles.as_ref().unwrap();
+            let mine = w.me(&st.addr).map(|m| format!("you ≈ {} · {:.2}%", fmt_btc(m.payout_sats as f64 / 1e8), m.share_pct))
+                .unwrap_or_else(|| format!("to the window {} · you're not in it", fmt_btc(w.to_window_sats() as f64 / 1e8)));
+            f.render_widget(tile("◈ IN THE WINDOW", Line::from(bold(format!("{}", w.identities), BLU)), &format!("identities · {} gateways · pool {}", w.gateways, fmt_ths(w.pool_ghs / 1e3)), BLU), r[0]);
+            f.render_widget(tile("◈ TIDES WINDOW", Line::from(vec![bold(format!("{:.1}", w.fill_pct), BLU), dim(" % full")]), &format!("{}× network difficulty in accepted work", w.window_multiple), BLU), r[1]);
+            f.render_widget(tile("◈ IF A BLOCK HITS NOW", Line::from(bold(fmt_btc(w.to_window_sats() as f64 / 1e8), BLU)), &mine, BLU), r[2]);
+        }
         (PoolMode::Carousel, _, Some(k)) => {
             let cur = if k.current.is_empty() { "—".to_string() } else { k.current.clone() };
             f.render_widget(tile("◈ SUPPLIERS", Line::from(bold(format!("{}", k.suppliers.len()), WHT)), "clean templates in rotation", WHT), r[0]);
@@ -1547,7 +1686,7 @@ fn render_net_tiles(f: &mut Frame, area: Rect, st: &Stats) {
         _ => {
             let (nm, ng, nh) = if st.net_ok { (format!("{}", st.net_miners), fmt_ths(st.net_ghs / 1e3), format!("{}", st.net_height)) }
                 else { ("—".into(), "—".into(), "—".into()) };
-            let sub = match st.mode { PoolMode::Chirp => "syndicate data loading…", PoolMode::Carousel => "rotation data loading…", _ => "PyBLØCK LOTTO network" };
+            let sub = match st.mode { PoolMode::Chirp => "syndicate data loading…", PoolMode::Carousel => "rotation data loading…", PoolMode::Wavicles => "TIDES window loading…", _ => "PyBLØCK LOTTO network" };
             f.render_widget(tile("◈ MINERS ONLINE", Line::from(bold(nm, CYN)), "using pyblockMiner", CYN), r[0]);
             f.render_widget(tile("◈ NETWORK HASHRATE", Line::from(bold(ng, CYN)), "all pyblockMiner users", CYN), r[1]);
             f.render_widget(tile("◈ POOL HEIGHT", Line::from(bold(nh, CYN)), sub, CYN), r[2]);
@@ -1571,12 +1710,15 @@ fn mode_panel_rows(st: &Stats, width: u16) -> usize {
             None => 1,
         },
         PoolMode::Lotto => 3,
+        // summary · you · column header · miners
+        PoolMode::Wavicles => st.wavicles.as_ref().map(|w| w.miners.len() + 1 + wrapped(130) + wrapped(120)).unwrap_or(1),
         PoolMode::Custom => 2,
     }
 }
 fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
     match st.mode {
         PoolMode::Chirp => render_chirp_panel(f, area, st, app.list_scroll),
+        PoolMode::Wavicles => render_wavicles_panel(f, area, st, app.list_scroll),
         PoolMode::Carousel => {
             let upd = st.carousel.as_ref().map(|k| format!(" · updated {} ago", fmt_ago(now_unix().saturating_sub(k.fetched)))).unwrap_or_default();
             f.render_widget(Paragraph::new(Text::from(carousel_lines(st))).wrap(Wrap { trim: false })
@@ -1590,8 +1732,75 @@ fn render_mode_panel(f: &mut Frame, area: Rect, st: &Stats, app: &App) {
         ])).block(card("⛏ CUSTOM STRATUM", CYN)), area),
     }
 }
+// expected BTC/day for a WAVICLES identity: pool blocks/day (mean, pool hashrate vs the network target) × what the
+// window would pay you right now. Every block anyone in the window finds pays the whole window.
+fn wav_btc_per_day(st: &Stats, w: &WaviclesInfo) -> f64 {
+    let Some(me) = w.me(&st.addr) else { return 0.0 };
+    let eta = net_eta(st, w.pool_ghs);
+    if !eta.is_finite() || eta <= 0.0 { return 0.0; }
+    (86_400.0 / eta) * me.payout_sats as f64 / 1e8
+}
+// ── WAVICLES: the TIDES window — every identity that gets paid if a block hits now, share of work, payout, freshness ──
+fn render_wavicles_panel(f: &mut Frame, area: Rect, st: &Stats, scroll: usize) {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let Some(w) = st.wavicles.as_ref() else {
+        f.render_widget(Paragraph::new(Text::from(vec![
+            Line::from(dim("  loading the TIDES window from the pool…")),
+            Line::from(dim("  this stratum must be YOUR DATUM gateway's stratum (STRATUMS [3] → e to set host:port) — the pool port :28915 is for the gateway, not for miners")),
+        ])).wrap(Wrap { trim: false }).block(card("ᛞ WAVICLES · the TIDES window", BLU)), area);
+        return;
+    };
+    let show_hr = inner_w >= 100;
+    let now = now_unix();
+    let mut head: Vec<Line<'static>> = vec![Line::from(vec![
+        bold(format!("  {} ", w.identities), BLU), dim("identities share every block · window "),
+        Span::styled(format!("{:.1}% full", w.fill_pct), Style::new().fg(WHT)),
+        dim(&format!(" · pool {} · {} gateways · {} blocks · to the window {} · fee {} · node tip {} ({} ago)",
+            fmt_ths(w.pool_ghs / 1e3), w.gateways, w.blocks, fmt_btc(w.to_window_sats() as f64 / 1e8), pct(w.fee_bps), w.height, fmt_ago(w.tip_age_s))),
+    ])];
+    head.push(match w.me(&st.addr) {
+        Some(m) => Line::from(vec![bold("  you  ".into(), BLU), bold(format!("{:.2}% of the window ≈ {} if a block hits now", m.share_pct, fmt_btc(m.payout_sats as f64 / 1e8)), WHT),
+            Span::styled(format!(" · ≈ {} / day expected", fmt_btc(wav_btc_per_day(st, w))), Style::new().fg(BLU)),
+            dim(&format!(" · {} · last share {} ago{}", fmt_ths(m.hashrate_ghs / 1e3), fmt_ago(m.last_share_s), if m.payable { "" } else { " · ⚠ NOT PAYABLE — log in to your gateway with an address" }))]),
+        None => Line::from(vec![dim("  you  "), dim("not in the window — your gateway's shares enter it once the pool sees them (miners log in to the GATEWAY with your address)")]),
+    });
+    if w.owed_sats > 0 { head.push(Line::from(vec![dim("  carry  "), dim(&format!("{} owed from trimmed coinbases, paid in the next blocks", fmt_btc(w.owed_sats as f64 / 1e8)))])); }
+    let head_h: usize = head.iter().map(|l| (l.width() + 8 + inner_w - 1) / inner_w.max(1)).sum();
+    let col_header = Line::from(Span::styled(format!("    {:>2}  {:<16}  {:<10} {:>7}   {:>14}  {}{:>10}   STATUS", "#", "IDENTITY", "SHARE", "", "WOULD GET", if show_hr { format!("{:>11}  ", "HASHRATE") } else { String::new() }, "LAST SHARE"), Style::new().fg(DIM)));
+    let top = w.miners.iter().map(|m| m.share_pct).fold(0.0f64, f64::max).max(1e-9);
+    let masked_me = mask_addr(&st.addr, false);
+    let rows: Vec<Line<'static>> = w.miners.iter().enumerate().map(|(i, m)| {
+        let is_me = !st.addr.is_empty() && (m.identity == st.addr || m.identity == masked_me);
+        let (status, scol) = if !m.payable { ("⚠ not payable".to_string(), AMB) }
+            else if m.last_share_s > 3600 { (format!("● quiet {}", fmt_ago(m.last_share_s)), AMB) } else { ("● in window".to_string(), GRN) };
+        let name_st = if is_me { Style::new().fg(BLU).add_modifier(Modifier::BOLD) } else { Style::new().fg(WHT) };
+        let mut sp = vec![bold(if is_me { "  ▶ " } else { "    " }.into(), BLU), dim(&format!("{:>2}  ", i + 1)),
+            Span::styled(format!("{:<16}  ", m.identity), name_st),
+            Span::styled(bar(m.share_pct / 100.0 / (top / 100.0), 10), Style::new().fg(if is_me { BLU } else { Color::Rgb(60, 100, 160) })),
+            if is_me { bold(format!(" {:>6.2}%   ", m.share_pct), WHT) } else { Span::styled(format!(" {:>6.2}%   ", m.share_pct), Style::new().fg(WHT)) },
+            Span::styled(format!("{:>14}  ", fmt_btc(m.payout_sats as f64 / 1e8)), Style::new().fg(if is_me { WHT } else { MUT }))];
+        if show_hr { sp.push(dim(&format!("{:>11}  ", fmt_ths(m.hashrate_ghs / 1e3)))); }
+        sp.push(dim(&format!("{:>10}   ", fmt_ago(m.last_share_s))));
+        sp.push(Span::styled(status, Style::new().fg(scol)));
+        if is_me { sp.push(bold("  you".into(), BLU)); }
+        Line::from(sp)
+    }).collect();
+    let vis = inner_h.saturating_sub(head_h + 1);
+    let off = scroll.min(rows.len().saturating_sub(vis));
+    let shown: Vec<Line<'static>> = rows.iter().skip(off).take(vis).cloned().collect();
+    let scroll_hint = if rows.len() > vis && vis > 0 { format!(" · ↑↓ {}–{} of {}", off + 1, (off + vis).min(rows.len()), rows.len()) } else { String::new() };
+    let title = format!("ᛞ WAVICLES · the TIDES window · {} identities{} · updated {} ago", w.miners.len(), scroll_hint, fmt_ago(now.saturating_sub(w.fetched)));
+    let block = card(&title, BLU);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let parts = Layout::vertical([Constraint::Length(head_h as u16), Constraint::Min(0)]).split(inner);
+    f.render_widget(Paragraph::new(Text::from(head)).wrap(Wrap { trim: false }), parts[0]);
+    let mut body = vec![col_header]; body.extend(shown);
+    f.render_widget(Paragraph::new(Text::from(body)), parts[1]);
+}
 fn lotto_lines(st: &Stats) -> Vec<Line<'static>> {
-    let eta = eta_to_block(st.net_nbits, st.hr_total);
+    let eta = net_eta(st, st.hr_total);
     let per_day = if eta.is_finite() && eta > 0.0 { 86_400.0 / eta } else { 0.0 };
     vec![
         Line::from(vec![dim("  how it pays  "), Span::styled("every winning share IS a block — the whole coinbase goes to your address", Style::new().fg(WHT))]),
@@ -1643,7 +1852,7 @@ fn carousel_lines(st: &Stats) -> Vec<Line<'static>> {
 // Expected BTC/day for a CHIRP member holding `pct`% of the split: syndicate blocks/day (mean, from its hashrate vs
 // the network target) × reward × slice × (1 − fee). An honest mean — real luck swings wildly around it.
 fn chirp_btc_per_day(st: &Stats, c: &ChirpInfo, pct: f64) -> f64 {
-    let eta = eta_to_block(st.net_nbits, c.hashrate_ths * 1e3);
+    let eta = net_eta(st, c.hashrate_ths * 1e3);
     if !eta.is_finite() || eta <= 0.0 || c.reward_sats == 0 { return 0.0; }
     (86_400.0 / eta) * (c.reward_sats as f64 / 1e8) * pct / 100.0 * c.keep()
 }
@@ -1745,6 +1954,11 @@ fn target_f64(t: &[u8; 32]) -> f64 { let mut v = 0f64; for b in t { v = v * 256.
 // expected seconds to find a block SOLO at `hr_ghs` GH/s against the network target (compact nbits).
 // expected hashes per block = 2^256 / target ; time = hashes / (hashes per second). Mean of a geometric —
 // real luck varies wildly around it, but it's the honest "your odds" number for a lottery miner.
+// expected seconds to a block from what we know about the network: a known difficulty (WAVICLES API) beats the job's nbits
+fn net_eta(st: &Stats, hr_ghs: f64) -> f64 {
+    if st.net_difficulty > 0.0 { if hr_ghs <= 0.0 { return f64::INFINITY; } return st.net_difficulty * 4_294_967_296.0 / (hr_ghs * 1e9); }
+    eta_to_block(st.net_nbits, hr_ghs)
+}
 fn eta_to_block(nbits: u32, hr_ghs: f64) -> f64 {
     if nbits == 0 || hr_ghs <= 0.0 { return f64::INFINITY; }
     let t = target_f64(&nbits_to_target(nbits));
@@ -1786,7 +2000,7 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
     let up = st.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     let total = st.accepted + st.rejected;
     let rej_rate = if total > 0 { st.rejected as f64 / total as f64 * 100.0 } else { 0.0 };
-    let eta = eta_to_block(st.net_nbits, st.hr_total);
+    let eta = net_eta(st, st.hr_total);
     let per_day = if eta.is_finite() && eta > 0.0 { 86_400.0 / eta } else { 0.0 };
     let kv = |k: &str, v: String, col: Color| Line::from(vec![
         Span::styled(format!("  {:<22}", k), Style::new().fg(MUT)), Span::styled(v, Style::new().fg(col))]);
@@ -1803,8 +2017,17 @@ fn render_data(f: &mut Frame, area: Rect, st: &Stats) {
         kv("hashrate donated", format!("{} blocks → PyBLØCK", st.donated), AMB),
     ];
     // CHIRP: the number that matters is not YOUR time-to-block but the syndicate's, times your slice
+    // WAVICLES: pool blocks/day × your window payout
+    if let (PoolMode::Wavicles, Some(w)) = (st.mode, st.wavicles.as_ref()) {
+        let p_eta = net_eta(st, w.pool_ghs);
+        let p_day = if p_eta.is_finite() && p_eta > 0.0 { 86_400.0 / p_eta } else { 0.0 };
+        lines.push(Line::from(""));
+        lines.push(kv("WAVICLES pool", format!("{} · ~{} per block · ~{:.3} blocks/day · window {:.1}% full", fmt_ths(w.pool_ghs / 1e3), fmt_dur(p_eta), p_day, w.fill_pct), BLU));
+        lines.push(kv("your share", w.me(&st.addr).map(|m| format!("{:.2}% of the window ≈ {} per block", m.share_pct, fmt_btc(m.payout_sats as f64 / 1e8))).unwrap_or_else(|| "not in the window".into()), BLU));
+        lines.push(kv("expected income", if w.me(&st.addr).is_some() { format!("≈ {} / day · ≈ {} / month  (mean — high variance)", fmt_btc(wav_btc_per_day(st, w)), fmt_btc(wav_btc_per_day(st, w) * 30.0)) } else { "—".into() }, BLU));
+    }
     if let (PoolMode::Chirp, Some(c)) = (st.mode, st.chirp.as_ref()) {
-        let s_eta = eta_to_block(st.net_nbits, c.hashrate_ths * 1e3);
+        let s_eta = net_eta(st, c.hashrate_ths * 1e3);
         let s_day = if s_eta.is_finite() && s_eta > 0.0 { 86_400.0 / s_eta } else { 0.0 };
         let pct = c.my_pct(&st.addr);
         lines.push(Line::from(""));
@@ -1842,6 +2065,7 @@ fn render_stratums(f: &mut Frame, area: Rect, app: &App) {
         items.push(ListItem::new(Text::from(vec![l1, l2, Line::from("")])));
     }
     let help = Line::from(vec![dim("  ↑↓ move · "), Span::styled("Enter", Style::new().fg(GRN)), dim(" switch LIVE (no restart) · "),
+        Span::styled("e", Style::new().fg(GRN)), dim(" edit address (WAVICLES: your gateway) · "),
         Span::styled("a", Style::new().fg(GRN)), dim(" add custom  name,host:port,network · "), Span::styled("d", Style::new().fg(GRN)), dim(" delete custom")]);
     let c = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
     f.render_widget(List::new(items).block(card("STRATUMS · same BLAKE2b chain, three ways to get paid", GRN)), c[0]);
@@ -1853,7 +2077,8 @@ fn info_page(app: &App) -> (String, Vec<Line<'static>>) {
         ("What is this?", vec![
             "pyblockMiner mines Bitcoin BLAKE2b — the Proof-of-Work change born in Bitcoin Knots PR #359, now LIVE on mainnet.",
             "You mine to YOUR OWN address, non-custodial — the pool never holds your coins. Three pools, one chain:",
-            "LOTTO (solo, keep 99.1%) · CHIRP (syndicate: every block split by weight, mining the suppliers' clean templates) · CAROUSEL (rotating templates, solo).",
+            "LOTTO (solo, keep 99.1%) · CHIRP (syndicate: every block split by weight, mining the suppliers' clean templates) · CAROUSEL (rotating templates, solo)",
+            "· WAVICLES (your own node + DATUM gateway: 99.6% of every block to the TIDES work window, split by share of work).",
             "",
             "It saturates your GPU (NVIDIA / AMD / Intel via OpenCL on Linux & Windows, Apple Silicon/Metal on macOS) and/or CPU cores, with live hashrate/blocks/difficulty.",
         ]),
@@ -1966,6 +2191,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("🎰 LOTTO :4445", &PoolMode::Lotto.payout()),
         l("🌌 CHIRP :5574", &PoolMode::Chirp.payout()),
         l("🎠 CAROUSEL :30110", &PoolMode::Carousel.payout()),
+        l("ᛞ WAVICLES", &PoolMode::Wavicles.payout()),
+        l("  how", "run a Knots BLAKE2b node + a DATUM gateway (pool b.pyblock.xyz:28915) · STRATUMS → WAVICLES → e → your gateway's host:port · MINE shows the TIDES window"),
+        l("  SHA-256 work", "if a stratum sends SHA-256 jobs (a regular pool, a SHA-256 gateway) the miner refuses them: ⛔ badge + alert, no wasted power"),
         l("coinbase panel", "MINE shows who the next block pays: CHIRP lists every eligible miner + share; CAROUSEL the live template"),
         Line::from(""),
         Line::from(Span::styled(" Troubleshooting", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
@@ -1998,7 +2226,7 @@ fn apply_target(app: &App, tgt: &Arc<Mutex<Target>>, stats: &Arc<Mutex<Stats>>) 
     { let mut st = stats.lock().unwrap(); st.endpoint = s.url.clone(); st.addr = addr; st.worker = worker; st.alerts = app.cfg.alerts.clone();
       st.network = s.network.clone(); st.donate = donate; st.balance_ok = false; st.net_ok = false;
       // pool mode drives the MINE/NETWORK panels; drop the old mode's data so the new one starts clean (poller refills within ~1s)
-      st.mode = pool_mode(&s.url, &s.name); st.chirp = None; st.carousel = None; }
+      st.mode = pool_mode(&s.url, &s.name); st.chirp = None; st.carousel = None; st.wavicles = None; st.net_difficulty = 0.0; }
 }
 
 // append a generated key to ~/.config/pyblockminer/keys.txt (0600). Returns the path on success.
@@ -2060,6 +2288,17 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                         app.msg = if app.cfg.worker.is_empty() { "worker cleared — mining as your bare address".into() }
                                   else { format!("worker saved — mining as {}", login(&app.addr(), &app.cfg.worker)) };
                     }
+                    Input::EditUrl => {
+                        let url = buf.trim().trim_start_matches("stratum+tcp://").to_string();
+                        if url.contains(':') && !url.contains(' ') {
+                            if let Some(s) = app.cfg.stratums.get_mut(app.strat_cur) {
+                                s.url = url; s.custom = true;   // a default with YOUR url is yours now (reconcile keeps its hands off)
+                                app.msg = format!("{} → {}", s.name, s.url);
+                            }
+                            save_config(&app.cfg);
+                            if app.strat_cur == app.cfg.selected { apply_target(app, tgt, stats); }
+                        } else { app.msg = "format: host:port".into(); }
+                    }
                     Input::EditTelegram => {
                         let parts: Vec<&str> = buf.split(',').map(|s| s.trim()).collect();
                         if buf.trim().is_empty() { app.cfg.alerts.telegram_token.clear(); app.cfg.alerts.telegram_chat.clear(); app.msg = "telegram alerts off".into(); }
@@ -2108,6 +2347,8 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
                     let s = &app.cfg.stratums[app.strat_cur];
                     app.msg = format!("switched to {} · {}", s.name, pool_mode(&s.url, &s.name).payout()); }
                 KeyCode::Char('a') => { app.input = Some(Input::AddStratum); app.buf.clear(); }
+                KeyCode::Char('e') => { app.input = Some(Input::EditUrl);
+                    app.buf = app.cfg.stratums.get(app.strat_cur).map(|s| if s.url == WAVICLES_PLACEHOLDER { String::new() } else { s.url.clone() }).unwrap_or_default(); }
                 KeyCode::Char('d') => {
                     if let Some(s) = app.cfg.stratums.get(app.strat_cur) { if s.custom {
                         app.cfg.stratums.remove(app.strat_cur);
@@ -2120,7 +2361,10 @@ fn handle_key(app: &mut App, code: KeyCode, tgt: &Arc<Mutex<Target>>, stats: &Ar
             },
             // CHIRP coinbase list: scroll through everyone in the draw (MINE panel + NETWORK full view)
             Tab::Mine | Tab::Network => {
-                let n = stats.lock().unwrap().chirp.as_ref().map(|c| c.members.len()).unwrap_or(0);
+                let n = { let st = stats.lock().unwrap(); match st.mode {
+                    PoolMode::Chirp => st.chirp.as_ref().map(|c| c.members.len()).unwrap_or(0),
+                    PoolMode::Wavicles => st.wavicles.as_ref().map(|w| w.miners.len()).unwrap_or(0),
+                    _ => 0 } };
                 match code {
                     KeyCode::Up => { app.list_scroll = app.list_scroll.saturating_sub(1); }
                     KeyCode::Down => { if app.list_scroll + 1 < n { app.list_scroll += 1; } }
@@ -2296,10 +2540,11 @@ fn main() {
         let mut last_mode: Option<PoolMode> = None; let mut last_poll = Instant::now();
         // your CHIRP state at the previous poll: (listed, eligible, stale>1h) — transitions become alerts
         let mut chirp_prev: Option<(bool, bool, bool)> = None;
+        let mut wav_prev: Option<bool> = None;   // WAVICLES: were you in the window at the previous poll?
         loop {
             let mode = stats.lock().unwrap().mode;
             if last_mode != Some(mode) || last_poll.elapsed() >= Duration::from_secs(15) {
-                if last_mode != Some(mode) { chirp_prev = None; }
+                if last_mode != Some(mode) { chirp_prev = None; wav_prev = None; }
                 last_mode = Some(mode); last_poll = Instant::now();
                 match mode {
                     PoolMode::Chirp => {
@@ -2328,6 +2573,21 @@ fn main() {
                         } }
                     }
                     PoolMode::Carousel => { let r = poll_carousel(); let mut st = stats.lock().unwrap(); if st.mode == PoolMode::Carousel && r.is_some() { st.carousel = r; } }
+                    PoolMode::Wavicles => {
+                        let r = poll_wavicles();
+                        let mut st = stats.lock().unwrap();
+                        if st.mode == PoolMode::Wavicles { if let Some(w) = r {
+                            // in/out of the TIDES window → alert on the transition (never on the first poll)
+                            let cur = w.me(&st.addr).is_some();
+                            if let Some(prev) = wav_prev { if prev != cur {
+                                if cur { let p = w.me(&st.addr).map(|m| m.share_pct).unwrap_or(0.0); alert(&mut st, "WAVICLES · you're in the window", &format!("your share of the next block: {:.2}%", p)); }
+                                else { alert(&mut st, "WAVICLES · out of the window", "no work from your identity in the TIDES window — check your gateway and miners"); }
+                            } }
+                            wav_prev = Some(cur);
+                            if w.difficulty > 0.0 { st.net_difficulty = w.difficulty; }   // the gateway's job nbits is the SHARE target, not the network's
+                            st.wavicles = Some(w);
+                        } }
+                    }
                     _ => {}
                 }
             }
@@ -2431,6 +2691,14 @@ mod tests {
     fn floor_pot_is_log2_floor() {
         assert_eq!(floor_pot(1.0), 0); assert_eq!(floor_pot(2.0), 1); assert_eq!(floor_pot(3.0), 1);
         assert_eq!(floor_pot(4096.0), 12); assert_eq!(floor_pot(0.5), 0);
+        // CONVOY/OCEAN gateways send Sia-style bdiff (n × 65535/65536): must land on the same bits as the integer
+        assert_eq!(norm_diff(4095.9375), 4096.0); assert_eq!(floor_pot(norm_diff(4095.9375)), 12);
+        assert_eq!(norm_diff(1.99997), 2.0); assert_eq!(floor_pot(norm_diff(1.99997)), 1);
+        assert_eq!(norm_diff(0.9999847412109375), 1.0); assert_eq!(norm_diff(16.0), 16.0); assert_eq!(norm_diff(65535.0), 65536.0);
+        assert!((norm_diff(1.5) - 1.5).abs() < 1e-9);   // a genuinely fractional diff is left alone
+        // difficulty → target round-trips with nbits (genesis 1d00ffff == difficulty 1)
+        assert_eq!(target_from_difficulty(1.0)[..8], nbits_to_target(0x1d00ffff)[..8]);
+        let t = target_from_difficulty(285_485_753.0); assert!(t[..4] == [0, 0, 0, 0] && t[4..8].iter().any(|&b| b != 0));
     }
     #[test]
     fn share_target_matches_difficulty() {
@@ -2463,6 +2731,19 @@ mod tests {
         assert_eq!(pool_mode("pool.pyblock.xyz:4445", "x"), PoolMode::Lotto);
         assert_eq!(pool_mode("10.0.0.5:3333", "my CHIRP relay"), PoolMode::Chirp);
         assert_eq!(pool_mode("10.0.0.5:3333", "home node"), PoolMode::Custom);
+        assert_eq!(pool_mode("your-gateway:port", "PyBLØCK · WAVICLES"), PoolMode::Wavicles);
+        // BLAKE2b job: 40-byte coinb1, empty coinb2, no merkle branches · SHA-256 job: full coinbase + branches
+        let b2b = json!(["j", "00".repeat(32), "00".repeat(40), "", [], "20000000", "190f0b50", "00000000", true]);
+        let sha = json!(["j", "00".repeat(32), "00".repeat(163), "00".repeat(559), ["ab"], "20000000", "1702355e", "00000000", true]);
+        assert!(!is_sha256_job(b2b.as_array().unwrap())); assert!(is_sha256_job(sha.as_array().unwrap()));
+        assert_eq!(pool_mode("192.168.1.9:5574", "my datum box"), PoolMode::Wavicles);   // name beats the port table
+    }
+    #[test]
+    fn wavicles_identity_matching() {
+        let w = WaviclesInfo { miners: vec![WavMiner { identity: "bc1qjd…5pw2".into(), share_pct: 40.0, payout_sats: 1000, ..Default::default() }], ..Default::default() };
+        assert!(w.me("bc1qjdqlvwfxum8dh4t5v9mvskdarjvlek2a9g5pw2").is_some());   // masked like the API
+        assert!(w.me("bc1qjd…5pw2").is_some()); assert!(w.me("bc1qzzzzzzzzzzzzzzzzzzzzzzzzzzzzz0000").is_none()); assert!(w.me("").is_none());
+        assert_eq!(w.to_window_sats(), 1000);
     }
     #[test]
     fn version_compare_is_semver() {

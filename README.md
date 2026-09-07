@@ -31,6 +31,9 @@ PyBLØCK  1·MINE  2·DATA  3·STRATUMS  4·LEARN  5·NETWORK  6·SETUP  7·HELP
 | 🎰 **LOTTO** | `4445` | solo lottery — every block you find pays **your** address · you keep 99.1% · fee 0.9% | your odds: expected time-to-block at your hashrate |
 | 🌌 **CHIRP** | `5574` | syndicate — every block is **split on-chain among ALL eligible miners** by weight (7-day loyalty) · the syndicate mines the **suppliers' clean templates** (CHIRP + CAROUSEL) · syndicate 98% · supplier 1% · PyBLØCK 1% | **everyone in the coinbase draw**: rank, address, tenure, power, share % and status, your row marked `▶ you`, your live slice + cut in BTC after fees, plus the **template being mined now** · `↑↓` scrolls |
 | 🎠 **CAROUSEL** | `30110` | rotating **clean templates** from independent suppliers — finder keeps 96% · supplier 3% · PyBLØCK 1% | the template being mined **right now**, the whole rotation, the recent trail |
+| ᛞ **WAVICLES** | *your gateway* · `b.pyblock.xyz:23114` (ASIC) | **bring your own node**: a Knots BLAKE2b node (≥ 29.4.1) + a DATUM gateway build the block; the pool (`b.pyblock.xyz:28915`, DATUM only, never for miners) dictates the split — **99.6% to the TIDES work window**, split by share of work · 0.4% fee · any block found by anyone in the window pays everyone in it | **the whole window**: every identity, share of work, what each would get if a block hit now, hashrate, last share, payable or not; your row marked `▶ you`, your expected BTC/day · `↑↓` scrolls |
+
+Two WAVICLES entries ship in STRATUMS. **`WAVICLES · your node (DATUM)`**: select it, press `e` and type your gateway's stratum `host:port` (CONVOY ≥ b9ea7dc, OCEAN forks or StartOS; `vardiff_min 1` for GPUs). Miners log in to the gateway with your **address** (a worker suffix is fine) — that's the identity the window pays. **`WAVICLES · via PyBLØCK's node (ASIC)`** is the house gateway on `:23114`: no node needed, but its vardiff floor is 4096, so a GPU would not submit a share for hours. If a stratum hands out **SHA-256 work** (a regular pool, or a SHA-256 DATUM gateway on the same box) the miner refuses it — `⛔ SHA-256 WORK` in the header, an alert, no wasted power. CONVOY/OCEAN gateways send Sia-style fractional difficulties and put the *share* target in the job's nbits; the miner normalizes the former and takes the network difficulty from the pool API, so shares land and the ETA is honest.
 
 The header, the network tiles and the panel all follow the selected stratum. **NETWORK** (`5`) shows the same mode panel full-height. Data comes from the pool's own APIs (`chirp_api.php?chain=blake2b`, `carousel.php?carrousel=1`), refreshed every 15 s.
 
@@ -136,7 +139,7 @@ Every log line is also appended, timestamped, to `~/.config/pyblockminer/miner.l
 | `p` | pause / resume mining from any tab |
 | MINE / NETWORK: `↑↓` `PgUp` `PgDn` `Home` `End` | scroll the CHIRP coinbase list (everyone in the draw) |
 | `q` / `Esc` | quit (`Esc` also cancels a text input) |
-| STRATUMS: `↑↓` `Enter` `a` `d` | move · **switch live** · add custom · delete custom |
+| STRATUMS: `↑↓` `Enter` `e` `a` `d` | move · **switch live** · edit address (WAVICLES: your gateway) · add custom · delete custom |
 | SETUP: `g` `e` `w` `c` `+/-` | generate address · edit/paste address · worker name · toggle CPU · donation |
 | SETUP: `b` `n` `t` `x` | bell · desktop notifications · Telegram `token,chat_id` · send a test alert |
 | LEARN: `←` `→` | previous / next info page |
