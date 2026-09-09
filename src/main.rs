@@ -188,7 +188,6 @@ struct WaviclesInfo {
     miners: Vec<WavMiner>,        // sorted by share desc (the API's order)
     pool_ghs: f64, gateways: u64, fill_pct: f64, identities: u64, window_multiple: u64, fee_bps: u64,
     height: u64, tip_age_s: u64, owed_sats: u64, blocks: u64, difficulty: f64, fetched: u64,
-    top_block: u64,   // highest height in the blocks list — the list may be capped, its length alone can plateau
 }
 impl WaviclesInfo {
     // the API masks identities like mask_addr (6…4) — match either form
@@ -1390,8 +1389,11 @@ fn get_json(url: &str, secs: u64) -> Option<Value> {
     serde_json::from_str(&body).ok()
 }
 fn now_unix() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
-fn poll_chirp() -> Option<ChirpInfo> {
-    let list = get_json(&format!("{}?mode=miners&chain=blake2b", CHIRP_API), 10)?;
+// `prev` is the last good reading. The pool's API is slow (6-9s per call) and any of these three requests can time
+// out on its own; without carrying the previous values over, a partial failure silently zeroed the pool numbers —
+// which made the CHIRP block counter read 21 → 0 → 21 and the miner announce blocks that never happened.
+fn poll_chirp(prev: Option<&ChirpInfo>) -> Option<ChirpInfo> {
+    let list = get_json(&format!("{}?mode=miners&chain=blake2b", CHIRP_API), 20)?;
     let mut members: Vec<ChirpMember> = list.as_array()?.iter().map(|m| ChirpMember {
         // addresses are base58/bech32 → anything else is noise (or an attempt to draw on the terminal)
         addr: m.get("address").and_then(|x| x.as_str()).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric()).take(90).collect(),
@@ -1404,32 +1406,72 @@ fn poll_chirp() -> Option<ChirpInfo> {
     let f = |a: f64, b: f64| b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal);
     members.sort_by(|a, b| b.eligible.cmp(&a.eligible).then(f(a.weight, b.weight)).then(f(a.days, b.days)));
     let mut info = ChirpInfo { members, fetched: now_unix(), min_days: 7.0, fee_bps: CHIRP_FEE_BPS, supplier_bps: CHIRP_SUPPLIER_BPS, ..Default::default() };
-    if let Some(p) = get_json(&format!("{}?mode=pool&chain=blake2b", CHIRP_API), 8) {
+    if let Some(p) = get_json(&format!("{}?mode=pool&chain=blake2b", CHIRP_API), 20) {
         info.candidates = p.get("candidates").and_then(|x| x.as_u64()).unwrap_or(0);
         info.workers = p.get("workers").and_then(|x| x.as_u64()).unwrap_or(0);
         info.blocks = p.get("blocks").and_then(|x| x.as_u64()).unwrap_or(0);
         info.hashrate_ths = p.get("hashrate").and_then(|x| x.as_f64()).unwrap_or(0.0);   // the site formats this as TH/s
         info.min_days = p.get("min_days").and_then(|x| x.as_f64()).unwrap_or(7.0);
         info.min_power = p.get("min_power").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    } else if let Some(o) = prev {   // keep the last good pool numbers rather than inventing zeros
+        info.candidates = o.candidates; info.workers = o.workers; info.blocks = o.blocks;
+        info.hashrate_ths = o.hashrate_ths; info.min_days = o.min_days; info.min_power = o.min_power;
     } else {
         info.candidates = info.members.iter().filter(|m| m.eligible).count() as u64;
     }
-    if let Some(c) = get_json(&format!("{}?mode=coinbase&chain=blake2b", CHIRP_API), 8) {
+    if let Some(c) = get_json(&format!("{}?mode=coinbase&chain=blake2b", CHIRP_API), 15) {
         info.reward_sats = c.get("reward_sats").and_then(|x| x.as_u64()).unwrap_or(0);
         info.height = c.get("height").and_then(|x| x.as_u64()).unwrap_or(0);
         // the API's split is trusted only once it describes the whole split (pool fee AND supplier cut); a lone
         // `fee_bps` is the pre-template-era value and would understate the fees
         let api_supplier = ["supplier_bps", "template_bps", "supplier_fee_bps"].iter().find_map(|k| c.get(*k).and_then(|x| x.as_u64()));
         if let (Some(s), Some(f)) = (api_supplier, c.get("fee_bps").and_then(|x| x.as_u64())) { info.supplier_bps = s; info.fee_bps = f; }
+    } else if let Some(o) = prev {
+        info.reward_sats = o.reward_sats; info.height = o.height; info.fee_bps = o.fee_bps; info.supplier_bps = o.supplier_bps;
     }
     Some(info)
+}
+
+// ── the pool's own block feed: the only source that says WHICH stratum found a block ──
+// Same feed the website's block list uses, so the miner can never disagree with it. `limit` returns the newest N,
+// newest first. A per-stratum counter elsewhere in the API is not enough: it says how many, never which.
+const BLOCKS_API: &str = "https://b.pyblock.xyz:8443/api.php?mode=blocks&chain=bip110&limit=40";
+struct PoolBlock { height: u64, stratum: String, reward: f64, finder: String }
+fn poll_pool_blocks() -> Option<Vec<PoolBlock>> {
+    let v = get_json(BLOCKS_API, 20)?;
+    Some(v.get("blocks")?.as_array()?.iter().filter_map(|b| Some(PoolBlock {
+        height: b.get("height")?.as_u64()?,
+        stratum: b.get("stratum").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase(),
+        reward: b.get("reward").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        finder: clean_label(b.get("finder_masked").and_then(|x| x.as_str()).unwrap_or("")),
+    })).collect())
+}
+impl PoolMode {
+    // the feed's `stratum` value for this mode — Some only for the modes whose blocks pay the whole group, which are
+    // the ones worth announcing. A LOTTO or CAROUSEL block belongs to whoever found it, not to you.
+    fn shared_stratum(self) -> Option<&'static str> {
+        match self { PoolMode::Chirp => Some("chirp"), PoolMode::Wavicles => Some("wavicles"), _ => None }
+    }
+}
+// Which of `blocks` are new for one stratum, oldest first, and the height to remember. `prev` None = never looked
+// before: take the high-water mark silently, so a start or a pool switch never replays history as fresh blocks.
+// Only a strictly higher height counts — a feed that momentarily comes back short can never invent a block.
+fn new_blocks<'a>(blocks: &'a [PoolBlock], stratum: &str, prev: Option<u64>) -> (Vec<&'a PoolBlock>, u64) {
+    let mine: Vec<&PoolBlock> = blocks.iter().filter(|b| b.stratum == stratum).collect();
+    let newest = mine.iter().map(|b| b.height).max().unwrap_or(0);
+    match prev {
+        Some(p) if newest > p => { let mut f: Vec<&PoolBlock> = mine.into_iter().filter(|b| b.height > p).collect();
+                                   f.sort_by_key(|b| b.height); (f, newest) }
+        Some(p) => (vec![], p.max(newest)),
+        None => (vec![], newest),
+    }
 }
 // Supplier names are typed by THIRD PARTIES on the pool → strip control chars / escape sequences and cap the length
 // before they reach the terminal. Printable Unicode (emoji, accents) stays.
 fn clean_label(s: &str) -> String { s.chars().filter(|c| !c.is_control()).take(40).collect::<String>().trim().to_string() }
 const WAVICLES_API: &str = "https://b.pyblock.xyz:8443/wavicles_api.php?mode=stats";
 fn poll_wavicles() -> Option<WaviclesInfo> {
-    let v = get_json(WAVICLES_API, 10)?;
+    let v = get_json(WAVICLES_API, 20)?;
     if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) { return None; }
     let f = |o: &Value, k: &str| o.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
     let u = |o: &Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1448,13 +1490,11 @@ fn poll_wavicles() -> Option<WaviclesInfo> {
         window_multiple: u(&pool, "window_multiple").max(1), fee_bps: pool.get("fee_bps").and_then(|x| x.as_u64()).unwrap_or(WAVICLES_FEE_BPS),
         height: u(&node, "height"), tip_age_s: u(&node, "tip_age_s"), owed_sats: u(&v, "owed"), difficulty: f(&node, "difficulty"),
         blocks: v.get("blocks").and_then(|x| x.as_array()).map(|a| a.len() as u64).unwrap_or(0),
-        top_block: v.get("blocks").and_then(|x| x.as_array()).map(|a| a.iter()
-            .filter_map(|b| ["height", "block_height", "h"].iter().find_map(|k| b.get(*k).and_then(|x| x.as_u64()))).max().unwrap_or(0)).unwrap_or(0),
         fetched: now_unix(),
     })
 }
 fn poll_carousel() -> Option<CarouselInfo> {
-    let v = get_json(CAROUSEL_API, 10)?;
+    let v = get_json(CAROUSEL_API, 15)?;
     let strs = |k: &str| -> Vec<String> { v.get(k).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|e| {
         // suppliers: ["name", …] · recent: [["name"], …] or [["name", ts], …]
         e.as_str().map(clean_label).or_else(|| e.as_array().and_then(|i| i.first()).and_then(|s| s.as_str()).map(clean_label))
@@ -2632,7 +2672,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         l("  how it works", "one stratum session per pool; a split worker alternates sweeps in proportion · MINE becomes a rig overview, g drills into a group · CLI: --gpu-pool 0=CHIRP,1=WAVICLES:70+LOTTO:30"),
         Line::from(""),
         Line::from(Span::styled(" Alerts · log · API", Style::new().fg(CYN).add_modifier(Modifier::BOLD))),
-        l("alerts", "YOUR block · your POOL's block (CHIRP syndicate / WAVICLES window — they pay everyone in it) · GPU down / back · pool unreachable / back · CHIRP & WAVICLES eligibility"),
+        l("alerts", "YOUR block · your POOL's block (CHIRP syndicate / WAVICLES window — they pay everyone in it; read from the pool's block feed, so the stratum is always the real one) · GPU down / back · pool unreachable / back · CHIRP & WAVICLES eligibility"),
         l("block sound", "a block chimes out loud (3 bells + a WAV through afplay/paplay/aplay/ffplay/mpv, PowerShell on Windows) · SETUP s toggles · x plays it · --sound off | --sound 'mpg123 -q /my/horn.mp3'"),
         l("channels", "terminal bell · desktop (notify-send / macOS) · Telegram (SETUP t, or --telegram token,chat) · --webhook <url> (POST JSON)"),
         l("log file", "every log line, timestamped → <config dir>/miner.log (rotates at 5 MB) · --no-log-file"),
@@ -3079,19 +3119,49 @@ fn main() {
         // your CHIRP state at the previous poll: (listed, eligible, stale>1h) — transitions become alerts
         let mut chirp_prev: Option<(bool, bool, bool)> = None;
         let mut wav_prev: Option<bool> = None;   // WAVICLES: were you in the window at the previous poll?
-        // blocks the pool had at the previous poll — on CHIRP and WAVICLES a block found by ANYONE pays everyone in
-        // the draw/window, so the pool finding one is your event too. None = first poll (never alert on startup).
-        let mut chirp_blocks: Option<u64> = None;              // CHIRP publishes a cumulative counter
-        let mut wav_blocks: Option<(u64, u64)> = None;         // WAVICLES: (list length, highest height seen)
+        // On CHIRP and WAVICLES a block found by ANYONE pays everyone in the draw/window, so the pool finding one is
+        // your event too. Which stratum found it comes from the pool's block feed and nowhere else — the per-pool
+        // counters can't say, and a counter that momentarily reads low invents blocks that never happened.
+        let mut top_block: HashMap<String, u64> = HashMap::new();   // stratum → highest height seen (empty = first poll)
+        let mut last_blocks_poll = Instant::now() - Duration::from_secs(60);
         loop {
             // every mode with a live GPU group gets polled (a rig can be on CHIRP and WAVICLES at once)
             let modes = stats.lock().unwrap().modes.clone();
             if modes != last_modes || last_poll.elapsed() >= Duration::from_secs(15) {
-                if modes != last_modes { chirp_prev = None; wav_prev = None; chirp_blocks = None; wav_blocks = None; }
+                if modes != last_modes { chirp_prev = None; wav_prev = None; }
                 last_modes = modes.clone(); last_poll = Instant::now();
+                // ── did any pool we mine find a block? (blocks are rare and the feed is the slow part → every 30s) ──
+                if last_blocks_poll.elapsed() >= Duration::from_secs(30) {
+                    let want: Vec<&str> = modes.iter().filter_map(|m| m.shared_stratum()).collect();
+                    if !want.is_empty() {
+                        if let Some(blocks) = poll_pool_blocks() {
+                            last_blocks_poll = Instant::now();
+                            for s in &want {
+                                let first = !top_block.contains_key(*s);
+                                let (fresh, mark) = new_blocks(&blocks, s, top_block.get(*s).copied());
+                                if mark > 0 { top_block.insert(s.to_string(), mark); }
+                                // say once that the watch is live, and from which block — a silent feed is indistinguishable from a broken one
+                                if first { stats.lock().unwrap().logline(format!("watching {} blocks · last one was {}", s.to_uppercase(), if mark > 0 { mark.to_string() } else { "none yet".into() })); }
+                                if fresh.is_empty() { continue; }
+                                let mut st = stats.lock().unwrap();
+                                for b in fresh {
+                                    let (who, yours) = match *s {
+                                        "chirp" => ("CHIRP", st.chirp.as_ref().and_then(|c| c.my_pct(&st.addr).map(|p| format!("your {:.2}% ≈ {}", p, fmt_btc(b.reward * p / 100.0 * c.keep()))))
+                                                        .unwrap_or_else(|| "you are not in the draw yet".into())),
+                                        _ => ("WAVICLES", st.wavicles.as_ref().and_then(|w| w.me(&st.addr).map(|m| format!("your {:.2}% ≈ {}", m.share_pct, fmt_btc(b.reward * m.share_pct / 100.0 * (1.0 - w.fee_bps as f64 / 10_000.0)))))
+                                                        .unwrap_or_else(|| "you were not in the window".into())),
+                                    };
+                                    let body = format!("block {} · {:.4} BTC · found by {} · {}", b.height, b.reward, if b.finder.is_empty() { "—" } else { &b.finder }, yours);
+                                    alert_block(&mut st, &format!("🎉 {} found a block", who), &body);
+                                }
+                            }
+                        }
+                    } else { last_blocks_poll = Instant::now(); }
+                }
                 for mode in modes { match mode {
                     PoolMode::Chirp => {
-                        let r = poll_chirp();
+                        let prev = stats.lock().unwrap().chirp.clone();
+                        let r = poll_chirp(prev.as_ref());
                         let k = poll_carousel();   // CHIRP mines the suppliers' templates too → show the live rotation
                         let mut st = stats.lock().unwrap();
                         if st.modes.contains(&PoolMode::Chirp) && k.is_some() { st.carousel = k; }
@@ -3112,14 +3182,6 @@ fn main() {
                                 }
                             } }
                             chirp_prev = Some(cur);
-                            // the syndicate found a block → it is split among everyone eligible, you included
-                            if let Some(prev) = chirp_blocks { if c.blocks > prev {
-                                let n = c.blocks - prev;
-                                let yours = c.my_pct(&st.addr).map(|p| format!("your {:.2}% ≈ {}", p, fmt_btc(c.reward_sats as f64 / 1e8 * p / 100.0 * c.keep())))
-                                    .unwrap_or_else(|| "you are not in the draw yet".into());
-                                alert_block(&mut st, "🎉 CHIRP found a block", &format!("the syndicate found {} block{} ({} total) · {}", n, if n > 1 { "s" } else { "" }, c.blocks, yours));
-                            } }
-                            chirp_blocks = Some(c.blocks);
                             st.chirp = Some(c);
                         } }
                     }
@@ -3135,15 +3197,6 @@ fn main() {
                                 else { alert(&mut st, "WAVICLES · out of the window", "no work from your identity in the TIDES window — check your gateway and miners"); }
                             } }
                             wav_prev = Some(cur);
-                            // a block found by any gateway pays the whole TIDES window, you included. The API's block
-                            // list may be capped, so a new block shows as MORE entries or as a HIGHER top height.
-                            if let Some((pn, ph)) = wav_blocks { if w.blocks > pn || w.top_block > ph {
-                                let yours = w.me(&st.addr).map(|m| format!("your {:.2}% ≈ {}", m.share_pct, fmt_btc(m.payout_sats as f64 / 1e8)))
-                                    .unwrap_or_else(|| "you were not in the window".into());
-                                let at = if w.top_block > 0 { format!("block {}", w.top_block) } else { "a block".to_string() };
-                                alert_block(&mut st, "🎉 WAVICLES found a block", &format!("the window found {} · {}", at, yours));
-                            } }
-                            wav_blocks = Some((w.blocks, w.top_block));
                             if w.difficulty > 0.0 { st.net_difficulty = w.difficulty; }   // the gateway's job nbits is the SHARE target, not the network's
                             st.wavicles = Some(w);
                         } }
@@ -3353,6 +3406,34 @@ mod tests {
         assert_eq!(clean_worker(&"x".repeat(40)).len(), 24);
         assert_eq!(login("bc1qabc", ""), "bc1qabc"); assert_eq!(login("bc1qabc", "rig1"), "bc1qabc.rig1");
         assert_eq!(fmt_btc(0.0), "—"); assert_eq!(fmt_btc(0.00005), "5000 sats"); assert_eq!(fmt_btc(0.0123), "0.01230 BTC");
+    }
+    #[test]
+    fn only_real_new_blocks_of_my_stratum_are_announced() {
+        let b = |h: u64, s: &str| PoolBlock { height: h, stratum: s.into(), reward: 3.125, finder: "x".into() };
+        let feed = vec![b(970267, "carousel"), b(970100, "chirp"), b(970050, "lotto"), b(969978, "chirp")];
+        // first sight takes the high-water mark silently — a restart must not replay history
+        let (f, mark) = new_blocks(&feed, "chirp", None);
+        assert!(f.is_empty()); assert_eq!(mark, 970100);
+        // a genuinely new CHIRP block, and only that one
+        let feed2 = { let mut v = feed.clone_blocks(); v.push(b(970300, "chirp")); v.push(b(970299, "carousel")); v };
+        let (f, mark) = new_blocks(&feed2, "chirp", Some(970100));
+        assert_eq!(f.len(), 1); assert_eq!(f[0].height, 970300); assert_eq!(mark, 970300);
+        // other strata never count as mine (this was the report: carousel blocks announced as CHIRP)
+        let (f, _) = new_blocks(&feed2, "wavicles", Some(0));
+        assert!(f.is_empty());
+        // several at once arrive oldest-first
+        let feed3 = { let mut v = feed2.clone_blocks(); v.push(b(970400, "chirp")); v };
+        let (f, _) = new_blocks(&feed3, "chirp", Some(970100));
+        assert_eq!(f.iter().map(|x| x.height).collect::<Vec<_>>(), vec![970300, 970400]);
+        // a short/stale feed can never invent a block, and never lowers the mark
+        let (f, mark) = new_blocks(&feed, "chirp", Some(970400));
+        assert!(f.is_empty()); assert_eq!(mark, 970400);
+        let (f, mark) = new_blocks(&[], "chirp", Some(970400));
+        assert!(f.is_empty()); assert_eq!(mark, 970400);
+    }
+    trait CloneBlocks { fn clone_blocks(&self) -> Vec<PoolBlock>; }
+    impl CloneBlocks for Vec<PoolBlock> {
+        fn clone_blocks(&self) -> Vec<PoolBlock> { self.iter().map(|b| PoolBlock { height: b.height, stratum: b.stratum.clone(), reward: b.reward, finder: b.finder.clone() }).collect() }
     }
     #[test]
     fn chirp_share_math() {
